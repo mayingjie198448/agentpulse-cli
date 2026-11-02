@@ -103,3 +103,19 @@ type Event struct {
 	Log       *LogEntry `json:"log,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// DispatchCommand represents a remote job dispatch instruction (docs/mqtt-protocol.md §4.4).
+type DispatchCommand struct {
+	CommandID      string            `json:"command_id"`
+	JobID          string            `json:"job_id"`
+	Engine         EngineType        `json:"engine"`
+	Cwd            string            `json:"cwd"`
+	Command        string            `json:"command"`
+	Args           []string          `json:"args"`
+	Title          string            `json:"title"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	Env            map[string]string `json:"env,omitempty"`
+	RequestedBy    string            `json:"requested_by"`
+	Timestamp      time.Time         `json:"timestamp"`
+}
+

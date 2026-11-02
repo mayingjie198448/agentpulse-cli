@@ -18,6 +18,7 @@ import (
 
 func newWrapCmd() *cobra.Command {
 	var (
+		machineFlag               string
 		machineID                 string
 		machineName               string
 		jobID                     string
@@ -29,6 +30,7 @@ func newWrapCmd() *cobra.Command {
 		promptFlag                string
 		dangerouslySkipPermissions bool
 		quiet                     bool
+		listen                    bool
 	)
 
 	wrapCmd := &cobra.Command{
@@ -58,6 +60,14 @@ Examples:
 		RunE: func(cmd *cobra.Command, rawArgs []string) error {
 			out := cmd.OutOrStdout()
 			errOut := cmd.OutOrStderr()
+
+			if machineID == "" && machineFlag != "" {
+				machineID = machineFlag
+			}
+
+			if listen {
+				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet)
+			}
 
 			// Resolve status file: flag > env > default
 			if statusFile == "" {
@@ -191,6 +201,7 @@ Examples:
 	// Disable interspersed flag parsing so flags for wrapped binary are preserved as positional arguments
 	wrapCmd.Flags().SetInterspersed(false)
 
+	wrapCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (alias for --machine-id)")
 	wrapCmd.Flags().StringVar(&machineID, "machine-id", "", "Machine ID override (or $AGENTPULSE_MACHINE_ID)")
 	wrapCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (or $AGENTPULSE_MACHINE_NAME)")
 	wrapCmd.Flags().StringVar(&jobID, "job-id", "", "Job ID override (or $AGENTPULSE_JOB_ID)")
@@ -202,6 +213,7 @@ Examples:
 	wrapCmd.Flags().StringVarP(&promptFlag, "prompt", "p", "", "Instruction/prompt for agent invocation")
 	wrapCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when wrapping agy")
 	wrapCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse wrapper header/footer banners")
+	wrapCmd.Flags().BoolVar(&listen, "listen", false, "Run thin wrapper in listen mode to receive and execute remote dispatch commands")
 
 	return wrapCmd
 }

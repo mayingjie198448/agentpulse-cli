@@ -33,6 +33,11 @@ func TestParseTopic(t *testing.T) {
 			machineID: "linux-box",
 			jobID:     "job-agy-05",
 		},
+		{
+			topic:     "agentpulse/v1/machines/mac-studio-m2/commands/dispatch",
+			wantType:  topicCommandDispatch,
+			machineID: "mac-studio-m2",
+		},
 		// Invalid topics
 		{
 			topic:    "agentpulse/v2/machines/ccdq/status",
@@ -73,5 +78,20 @@ func TestParseTopic(t *testing.T) {
 				t.Errorf("got jobID %q, want %q", parsed.jobID, tt.jobID)
 			}
 		})
+	}
+}
+
+func TestTopicHelpers(t *testing.T) {
+	if got := MachineDispatchTopic("node1"); got != "agentpulse/v1/machines/node1/commands/dispatch" {
+		t.Errorf("MachineDispatchTopic: got %s", got)
+	}
+	if got := MachineStatusTopic("node1"); got != "agentpulse/v1/machines/node1/status" {
+		t.Errorf("MachineStatusTopic: got %s", got)
+	}
+	if got := JobStatusTopic("node1", "job-1"); got != "agentpulse/v1/machines/node1/jobs/job-1/status" {
+		t.Errorf("JobStatusTopic: got %s", got)
+	}
+	if got := JobLogsTopic("node1", "job-1"); got != "agentpulse/v1/machines/node1/jobs/job-1/logs" {
+		t.Errorf("JobLogsTopic: got %s", got)
 	}
 }

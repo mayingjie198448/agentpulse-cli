@@ -132,6 +132,19 @@ func (m *mockMQTTClient) GetPublished() []publishedMsg {
 	return res
 }
 
+func (m *mockMQTTClient) HasSubscription(topic string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, exists := m.subscriptions[topic]
+	return exists
+}
+
+func (m *mockMQTTClient) ClearSubscriptions() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.subscriptions = make(map[string]paho.MessageHandler)
+}
+
 type mockPahoMessage struct {
 	topic    string
 	payload  []byte

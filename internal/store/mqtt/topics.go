@@ -1,6 +1,9 @@
 package mqtt
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	// TopicRoot is the common namespace prefix for all AgentPulse v1 topics.
@@ -14,7 +17,30 @@ const (
 
 	// TopicJobsLogs subscribes to real-time stdout/stderr log streams of jobs.
 	TopicJobsLogs = "agentpulse/v1/machines/+/jobs/+/logs"
+
+	// TopicMachinesDispatch subscribes to all job dispatch commands across machines.
+	TopicMachinesDispatch = "agentpulse/v1/machines/+/commands/dispatch"
 )
+
+// MachineDispatchTopic returns the dispatch command topic for a specific machine.
+func MachineDispatchTopic(machineID string) string {
+	return fmt.Sprintf("agentpulse/v1/machines/%s/commands/dispatch", machineID)
+}
+
+// MachineStatusTopic returns the status topic for a specific machine.
+func MachineStatusTopic(machineID string) string {
+	return fmt.Sprintf("agentpulse/v1/machines/%s/status", machineID)
+}
+
+// JobStatusTopic returns the status topic for a specific job on a machine.
+func JobStatusTopic(machineID, jobID string) string {
+	return fmt.Sprintf("agentpulse/v1/machines/%s/jobs/%s/status", machineID, jobID)
+}
+
+// JobLogsTopic returns the logs topic for a specific job on a machine.
+func JobLogsTopic(machineID, jobID string) string {
+	return fmt.Sprintf("agentpulse/v1/machines/%s/jobs/%s/logs", machineID, jobID)
+}
 
 type topicType int
 
@@ -23,6 +49,7 @@ const (
 	topicMachineStatus
 	topicJobStatus
 	topicJobLog
+	topicCommandDispatch
 )
 
 type parsedTopic struct {
@@ -53,6 +80,13 @@ func parseTopic(topic string) parsedTopic {
 		}
 	}
 
+	if len(parts) == 6 && parts[4] == "commands" && parts[5] == "dispatch" {
+		return parsedTopic{
+			typ:       topicCommandDispatch,
+			machineID: machineID,
+		}
+	}
+
 	if len(parts) == 7 && parts[4] == "jobs" {
 		jobID := parts[5]
 		if jobID == "" {
@@ -76,3 +110,4 @@ func parseTopic(topic string) parsedTopic {
 
 	return parsedTopic{typ: topicUnknown}
 }
+
