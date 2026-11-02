@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
 	"github.com/spf13/cobra"
@@ -18,45 +19,66 @@ func newDoctorCmd() *cobra.Command {
 		Long: `Validates local terminal environment, CLI capabilities, and checks
 availability of engine CLI binaries (agy, opencode) and future network adapters.`,
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("AgentPulse Diagnostics:")
-			fmt.Println("----------------------------------------")
+			out := cmd.OutOrStdout()
+			fmt.Fprintln(out, "AgentPulse Diagnostics:")
+			fmt.Fprintln(out, "----------------------------------------")
 
 			// 1. Runtime & OS
-			fmt.Printf("[OK] Runtime: Go %s on %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			fmt.Fprintf(out, "[OK] Runtime: Go %s on %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 
 			// 2. Terminal
 			isTTY := termutil.IsTerminal(os.Stdout)
 			if isTTY {
 				w, h, err := term.GetSize(int(os.Stdout.Fd()))
 				if err == nil {
-					fmt.Printf("[OK] Terminal: Interactive TTY detected (Dimensions: %dx%d)\n", w, h)
+					fmt.Fprintf(out, "[OK] Terminal: Interactive TTY detected (Dimensions: %dx%d)\n", w, h)
 				} else {
-					fmt.Printf("[OK] Terminal: Interactive TTY detected\n")
+					fmt.Fprintln(out, "[OK] Terminal: Interactive TTY detected")
 				}
 			} else {
-				fmt.Println("[INFO] Terminal: Non-interactive TTY / pipe (will fallback to plain text)")
+				fmt.Fprintln(out, "[INFO] Terminal: Non-interactive TTY / pipe (will fallback to plain text)")
 			}
 
 			// 3. Engine CLI availability
 			if p, err := exec.LookPath("agy"); err == nil {
-				fmt.Printf("[OK] Engine 'agy': Detected at %s\n", p)
+				fmt.Fprintf(out, "[OK] Engine 'agy': Detected at %s\n", p)
 			} else {
-				fmt.Println("[INFO] Engine 'agy': Not found in PATH (Local jobs will use simulated adapter)")
+				fmt.Fprintln(out, "[INFO] Engine 'agy': Not found in PATH (Local jobs will use simulated adapter)")
 			}
 
 			if p, err := exec.LookPath("opencode"); err == nil {
-				fmt.Printf("[OK] Engine 'OpenCode': Detected at %s\n", p)
+				fmt.Fprintf(out, "[OK] Engine 'OpenCode': Detected at %s\n", p)
 			} else {
-				fmt.Println("[INFO] Engine 'OpenCode': Not found in PATH (Local jobs will use simulated adapter)")
+				fmt.Fprintln(out, "[INFO] Engine 'OpenCode': Not found in PATH (Local jobs will use simulated adapter)")
 			}
 
 			// 4. Data & Network Adapters
-			fmt.Println("[OK] Data Layer: In-memory simulation store active")
-			fmt.Println("[INFO] MQTT Transport: Stubbed for Phase 2 (Cross-machine broker adapter)")
-			fmt.Println("[INFO] Sidecar Agent: Stubbed for Phase 2 (Node telemetry daemon)")
+			stType, err := determineStoreType(cmd)
+			if err != nil {
+				fmt.Fprintf(out, "[ERROR] Store Configuration: %v\n", err)
+			} else if stType == "mqtt" {
+				cfg := resolveMQTTConfig(cmd)
+				authInfo := "anonymous"
+				if cfg.Username != "" {
+					authInfo = fmt.Sprintf("username %q", cfg.Username)
+				}
+				fmt.Fprintf(out, "[OK] Data Layer: MQTT Store configured (Target: %s)\n", cfg.BrokerURL)
+				fmt.Fprintf(out, "[INFO] MQTT Config: client_id=%s, auth=%s, settle=%v\n", cfg.ClientID, authInfo, cfg.SettleTimeout)
+				fmt.Fprintf(out, "[...] MQTT Broker: Checking connectivity to %s (timeout: 2s)...\n", cfg.BrokerURL)
+				if err := testMQTTConnection(cfg, 2*time.Second); err != nil {
+					fmt.Fprintf(out, "[WARN] MQTT Broker: Connectivity check failed (%v)\n", err)
+				} else {
+					fmt.Fprintln(out, "[OK] MQTT Broker: Connected successfully")
+				}
+				fmt.Fprintln(out, "[INFO] Sidecar Agent: Awaiting remote wrapper heartbeats")
+			} else {
+				fmt.Fprintln(out, "[OK] Data Layer: In-memory simulation store active (default)")
+				fmt.Fprintln(out, "[INFO] MQTT Transport: Ready for connection (pass --mqtt-url or set AGENTPULSE_MQTT_URL)")
+				fmt.Fprintln(out, "[INFO] Sidecar Agent: Stubbed for Phase 2 (Node telemetry daemon)")
+			}
 
-			fmt.Println("----------------------------------------")
-			fmt.Println("Status: All systems ready for Phase 1 Mock TUI.")
+			fmt.Fprintln(out, "----------------------------------------")
+			fmt.Fprintln(out, "Status: All systems ready.")
 		},
 	}
 }

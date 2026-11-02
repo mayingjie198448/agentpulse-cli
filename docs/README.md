@@ -4,4 +4,4 @@
 
 ## 文档目录
 
-- [MQTT 传输协议规范 (v1)](mqtt-protocol.md)：跨机通信主题树、QoS/保留消息约定、消息 Payload 契约、`store.Store` 映射指南、安全与运维设计（**协议草案，实现后置**）。
+- [MQTT 传输协议规范 (v1)](mqtt-protocol.md)：跨机通信主题树、QoS/保留消息约定、消息 Payload 契约、`store.Store` 映射指南、安全与运维设计（v0.2.0 已落地 MQTT Store 驱动）。

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
 	"github.com/mayingjie198448/agentpulse-cli/internal/tui"
 	"github.com/spf13/cobra"
@@ -28,7 +28,10 @@ machines, live jobs (agy & OpenCode), progress bars, and scrolling logs.
 When running in non-TTY environments (or when passing --plain), watch outputs
 a plain text stream of status updates suitable for piping and logging.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			st := mock.NewMockStore()
+			st, err := getStore(cmd)
+			if err != nil {
+				return err
+			}
 			defer st.Close()
 
 			if termutil.ShouldUsePlain(plainOutput) {
@@ -37,7 +40,7 @@ a plain text stream of status updates suitable for piping and logging.`,
 
 			// Interactive TUI mode with Bubble Tea
 			p := tea.NewProgram(tui.NewModel(st), tea.WithAltScreen(), tea.WithMouseCellMotion())
-			_, err := p.Run()
+			_, err = p.Run()
 			return err
 		},
 	}
@@ -47,7 +50,7 @@ a plain text stream of status updates suitable for piping and logging.`,
 }
 
 // runPlainWatch prints periodic status snapshots in non-interactive/piped environments
-func runPlainWatch(ctx context.Context, st *mock.MockStore, interval time.Duration) error {
+func runPlainWatch(ctx context.Context, st store.Store, interval time.Duration) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 

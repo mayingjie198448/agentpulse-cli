@@ -26,6 +26,7 @@ engine simulating multi-node agent orchestration and telemetry.`,
 	}
 
 	rootCmd.PersistentFlags().BoolVar(&plainOutput, "plain", false, "Force plain text output (disables interactive TUI)")
+	registerStoreFlags(rootCmd)
 
 	rootCmd.AddCommand(newWatchCmd())
 	rootCmd.AddCommand(newListCmd())
