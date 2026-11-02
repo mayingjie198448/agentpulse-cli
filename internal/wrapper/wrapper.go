@@ -72,6 +72,7 @@ type Config struct {
 type Wrapper struct {
 	cfg        Config
 	mu         sync.Mutex
+	writeMu    sync.Mutex
 	machine    model.Machine
 	job        model.Job
 	pid        int
@@ -79,8 +80,9 @@ type Wrapper struct {
 	mqttClient paho.Client
 	ownsMQTT   bool
 
-	stopHeartbeat chan struct{}
-	heartbeatDone chan struct{}
+	heartbeatRunning bool
+	stopHeartbeat    chan struct{}
+	heartbeatDone    chan struct{}
 }
 
 // New creates and initializes a Wrapper instance.
@@ -226,8 +228,10 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 	if w.mqttClient != nil && w.mqttClient.IsConnected() {
 		w.publishMachineStatus()
 		w.publishJobStatus()
-		go w.heartbeatLoop()
 	}
+
+	// Start heartbeat loop (refreshes local status periodically, and publishes MQTT heartbeat if connected)
+	w.startHeartbeatLoop()
 
 	if w.cfg.OnExecute != nil {
 		if w.cfg.Stub {
@@ -311,6 +315,18 @@ func (w *Wrapper) setupMQTT() error {
 	return nil
 }
 
+func (w *Wrapper) startHeartbeatLoop() {
+	w.mu.Lock()
+	if w.heartbeatRunning {
+		w.mu.Unlock()
+		return
+	}
+	w.heartbeatRunning = true
+	w.mu.Unlock()
+
+	go w.heartbeatLoop()
+}
+
 // heartbeatLoop sends periodic heartbeats and refreshes the local status file.
 func (w *Wrapper) heartbeatLoop() {
 	defer close(w.heartbeatDone)
@@ -322,8 +338,10 @@ func (w *Wrapper) heartbeatLoop() {
 		case <-w.stopHeartbeat:
 			return
 		case <-ticker.C:
+			now := time.Now().UTC()
 			w.mu.Lock()
-			w.machine.LastHeartbeat = time.Now().UTC()
+			w.machine.LastHeartbeat = now
+			w.job.UpdatedAt = now
 			w.mu.Unlock()
 
 			w.publishMachineStatus()
@@ -333,17 +351,23 @@ func (w *Wrapper) heartbeatLoop() {
 }
 
 func (w *Wrapper) stopHeartbeatLoop() {
+	w.mu.Lock()
+	if !w.heartbeatRunning {
+		w.mu.Unlock()
+		return
+	}
+	w.heartbeatRunning = false
+	w.mu.Unlock()
+
 	select {
 	case <-w.stopHeartbeat:
-		// already closed
 	default:
 		close(w.stopHeartbeat)
 	}
-	if w.mqttClient != nil && w.mqttClient.IsConnected() {
-		select {
-		case <-w.heartbeatDone:
-		case <-time.After(1 * time.Second):
-		}
+
+	select {
+	case <-w.heartbeatDone:
+	case <-time.After(1 * time.Second):
 	}
 }
 
@@ -559,6 +583,9 @@ func (w *Wrapper) writeStatusFile() error {
 	if w.cfg.StatusFile == "" {
 		return nil
 	}
+
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
 
 	w.mu.Lock()
 	st := LocalStatus{

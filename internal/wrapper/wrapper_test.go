@@ -384,6 +384,124 @@ func TestWrapper_ExplicitStub_WithMissingBinary_Succeeds(t *testing.T) {
 	}
 }
 
+func TestWrapper_LocalMode_HeartbeatRefresh(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "local-hb-status.json")
+
+	// Heartbeat every 25ms, running a stub that takes ~170ms without any MQTT configured.
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:         "local-hb-node",
+		JobID:             "job-local-hb-01",
+		Engine:            model.EngineAgy,
+		Title:             "Local heartbeat refresh test",
+		Stub:              true,
+		StatusFile:        statusFile,
+		HeartbeatInterval: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- w.Run(ctx)
+	}()
+
+	// Wait 75ms to allow at least 2 heartbeat cycles during execution
+	time.Sleep(75 * time.Millisecond)
+
+	st, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read running status file: %v", err)
+	}
+
+	// Status file must have been updated during local execution
+	if st.Job.Status != model.StatusRunning {
+		t.Errorf("expected status running while active, got %s", st.Job.Status)
+	}
+	if !st.Machine.Online {
+		t.Errorf("expected machine online while running")
+	}
+	if st.Machine.JobCount != 1 {
+		t.Errorf("expected job count 1 while running, got %d", st.Machine.JobCount)
+	}
+
+	// The heartbeat should have refreshed last_heartbeat after started_at
+	if st.Machine.LastHeartbeat.Before(st.Job.StartedAt) {
+		t.Errorf("expected last_heartbeat (%v) to be >= started_at (%v)", st.Machine.LastHeartbeat, st.Job.StartedAt)
+	}
+
+	if err := <-runErrCh; err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	// Verify final status after clean completion
+	finalSt, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read final status file: %v", err)
+	}
+	if finalSt.Job.Status != model.StatusDone {
+		t.Errorf("expected final status done, got %s", finalSt.Job.Status)
+	}
+	if finalSt.Machine.Online {
+		t.Errorf("expected machine offline on completion")
+	}
+	if finalSt.Machine.JobCount != 0 {
+		t.Errorf("expected final job count 0, got %d", finalSt.Machine.JobCount)
+	}
+}
+
+func TestWrapper_LocalMode_HeartbeatRefresh_Command(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "local-hb-cmd-status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:         "local-hb-cmd-node",
+		JobID:             "job-local-hb-cmd-01",
+		Engine:            model.EngineAgy,
+		Title:             "Local command heartbeat refresh test",
+		Args:              []string{"sleep", "0.1"},
+		StatusFile:        statusFile,
+		HeartbeatInterval: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- w.Run(ctx)
+	}()
+
+	time.Sleep(60 * time.Millisecond)
+
+	st, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read running status file: %v", err)
+	}
+	if st.Job.Status != model.StatusRunning {
+		t.Errorf("expected status running while command active, got %s", st.Job.Status)
+	}
+
+	if err := <-runErrCh; err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	finalSt, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read final status: %v", err)
+	}
+	if finalSt.Job.Status != model.StatusDone {
+		t.Errorf("expected done status, got %s", finalSt.Job.Status)
+	}
+}
+
 func TestWrapper_StubExecution(t *testing.T) {
 	tmpDir := t.TempDir()
 	statusFile := filepath.Join(tmpDir, "stub-status.json")
