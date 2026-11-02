@@ -3,6 +3,7 @@ package mqtt_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -406,5 +407,160 @@ func TestMQTTStore_HeartbeatTimeout(t *testing.T) {
 	}
 	if m.Online {
 		t.Errorf("expected machine to be marked offline after heartbeat timeout, but online is true")
+	}
+}
+
+// TestMQTTStore_NoSharedPointersRaceRegression tests that broadcast events never share
+// pointers with internal store maps and that checkStaleMachines / updates do not mutate
+// objects concurrently being read by event subscribers under -race.
+func TestMQTTStore_NoSharedPointersRaceRegression(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.HeartbeatTimeout = 20 * time.Millisecond
+	cfg.SettleTimeout = 0 // Instant start for this test
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// 1. Deliver Machine status
+	oldTime := time.Now().Add(-50 * time.Millisecond).Format(time.RFC3339)
+	machinePayload := fmt.Sprintf(`{"id":"race-node","name":"Race Node","online":true,"platform":"linux/amd64","job_count":1,"last_heartbeat":"%s"}`, oldTime)
+	fakeClient.Deliver("agentpulse/v1/machines/race-node/status", []byte(machinePayload), false)
+
+	var macEv model.Event
+	select {
+	case macEv = <-eventCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for machine event")
+	}
+
+	if macEv.Machine == nil {
+		t.Fatal("expected machine event to have non-nil Machine")
+	}
+
+	// Assert pointer isolation: Event Machine pointer must NOT equal store map pointer
+	mapMachinePtr := st.RawMachinePointer("race-node")
+	if mapMachinePtr == nil {
+		t.Fatal("expected store to contain machine race-node")
+	}
+	if macEv.Machine == mapMachinePtr {
+		t.Fatalf("data race blocker: Event.Machine (%p) aliases store map-owned pointer (%p)", macEv.Machine, mapMachinePtr)
+	}
+
+	// 2. Deliver Job status
+	jobPayload := `{"id":"race-job-01","machine_id":"race-node","engine":"agy","status":"running","progress":15.0}`
+	fakeClient.Deliver("agentpulse/v1/machines/race-node/jobs/race-job-01/status", []byte(jobPayload), false)
+
+	var jobEv model.Event
+	select {
+	case jobEv = <-eventCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for job event")
+	}
+
+	if jobEv.Job == nil {
+		t.Fatal("expected job event to have non-nil Job")
+	}
+
+	// Assert pointer isolation: Event Job pointer must NOT equal store map pointer
+	mapJobPtr := st.RawJobPointer("race-job-01")
+	if mapJobPtr == nil {
+		t.Fatal("expected store to contain job race-job-01")
+	}
+	if jobEv.Job == mapJobPtr {
+		t.Fatalf("data race blocker: Event.Job (%p) aliases store map-owned pointer (%p)", jobEv.Job, mapJobPtr)
+	}
+
+	// 3. Concurrent read vs mutate test (will trigger -race if pointers alias)
+	stopReaders := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Subscriber reader 1: continuously reads the broadcast Machine
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				_ = macEv.Machine.Online
+				_ = macEv.Machine.Name
+				_ = macEv.Machine.JobCount
+				_ = macEv.Machine.LastHeartbeat
+				_ = macEv.Machine.Platform
+			}
+		}
+	}()
+
+	// Subscriber reader 2: continuously reads the broadcast Job
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopReaders:
+				return
+			default:
+				_ = jobEv.Job.Status
+				_ = jobEv.Job.Progress
+				_ = jobEv.Job.UpdatedAt
+				_ = jobEv.Job.Command
+			}
+		}
+	}()
+
+	// Store writer: concurrently trigger checkStaleMachines on the exact machine delivered,
+	// plus incoming status updates to both machine and job.
+	for i := 0; i < 300; i++ {
+		// Mutate map in checkStaleMachines
+		st.CheckStaleMachines()
+
+		// Deliver job update (would race if jobEv.Job aliased map)
+		updatedJob := fmt.Sprintf(`{"id":"race-job-01","machine_id":"race-node","engine":"agy","status":"running","progress":%f}`, float64(i))
+		fakeClient.Deliver("agentpulse/v1/machines/race-node/jobs/race-job-01/status", []byte(updatedJob), false)
+	}
+
+	close(stopReaders)
+	wg.Wait()
+}
+
+func TestMQTTStore_ColdStartRetainedSettle(t *testing.T) {
+	// Verify default settle duration
+	cfg := mqttstore.DefaultConfig()
+	if cfg.SettleTimeout != 200*time.Millisecond {
+		t.Fatalf("expected DefaultConfig SettleTimeout 200ms, got %v", cfg.SettleTimeout)
+	}
+
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg.SettleTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("expected NewWithClient to settle for at least ~40ms, got %v", elapsed)
+	}
+
+	// Verify explicit Settle helper
+	settleStart := time.Now()
+	st.Settle(30 * time.Millisecond)
+	if time.Since(settleStart) < 25*time.Millisecond {
+		t.Fatalf("expected st.Settle to wait for duration")
 	}
 }

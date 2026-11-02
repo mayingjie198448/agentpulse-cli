@@ -119,4 +119,43 @@ func TestCLI_StoreSelection(t *testing.T) {
 			t.Fatalf("expected mock to run successfully despite env var: %v", err)
 		}
 	})
+
+	// 4. Settle timeout flag in doctor output
+	t.Run("mqtt settle timeout flag", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--mqtt-url", "tcp://127.0.0.1:18833", "--mqtt-settle-timeout", "350ms"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "settle=350ms") {
+			t.Errorf("expected doctor output to show settle=350ms, got: %s", out)
+		}
+	})
+
+	// 5. Settle timeout env in doctor output
+	t.Run("mqtt settle timeout env", func(t *testing.T) {
+		os.Setenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT", "450ms")
+		defer os.Unsetenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--mqtt-url", "tcp://127.0.0.1:18833"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "settle=450ms") {
+			t.Errorf("expected doctor output to show settle=450ms, got: %s", out)
+		}
+	})
 }

@@ -63,7 +63,7 @@ availability of engine CLI binaries (agy, opencode) and future network adapters.
 					authInfo = fmt.Sprintf("username %q", cfg.Username)
 				}
 				fmt.Fprintf(out, "[OK] Data Layer: MQTT Store configured (Target: %s)\n", cfg.BrokerURL)
-				fmt.Fprintf(out, "[INFO] MQTT Config: client_id=%s, auth=%s\n", cfg.ClientID, authInfo)
+				fmt.Fprintf(out, "[INFO] MQTT Config: client_id=%s, auth=%s, settle=%v\n", cfg.ClientID, authInfo, cfg.SettleTimeout)
 				fmt.Fprintf(out, "[...] MQTT Broker: Checking connectivity to %s (timeout: 2s)...\n", cfg.BrokerURL)
 				if err := testMQTTConnection(cfg, 2*time.Second); err != nil {
 					fmt.Fprintf(out, "[WARN] MQTT Broker: Connectivity check failed (%v)\n", err)

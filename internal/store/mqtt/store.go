@@ -99,6 +99,13 @@ func New(cfg Config) (*Store, error) {
 
 	go s.runHeartbeatChecker()
 
+	// Cold-start retained settle per docs/mqtt-protocol.md §5.1:
+	// Wait briefly for retained messages from broker to settle so one-shot queries (list/logs)
+	// are not falsely empty immediately after connect.
+	if cfg.SettleTimeout > 0 {
+		time.Sleep(cfg.SettleTimeout)
+	}
+
 	return s, nil
 }
 
@@ -135,6 +142,10 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 	}
 
 	go s.runHeartbeatChecker()
+
+	if cfg.SettleTimeout > 0 {
+		time.Sleep(cfg.SettleTimeout)
+	}
 
 	return s, nil
 }
@@ -181,12 +192,14 @@ func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
 		s.mu.Unlock()
 		return
 	}
-	s.machines[m.ID] = &m
+	stored := m
+	s.machines[m.ID] = &stored
 	s.mu.Unlock()
 
+	broadcastMachine := m
 	s.broadcast(model.Event{
 		Type:      model.EventMachineUpdated,
-		Machine:   &m,
+		Machine:   &broadcastMachine,
 		Timestamp: time.Now(),
 	})
 }
@@ -214,12 +227,14 @@ func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
 		s.mu.Unlock()
 		return
 	}
-	s.jobs[j.ID] = &j
+	stored := j
+	s.jobs[j.ID] = &stored
 	s.mu.Unlock()
 
+	broadcastJob := j
 	s.broadcast(model.Event{
 		Type:      model.EventJobUpdated,
-		Job:       &j,
+		Job:       &broadcastJob,
 		Timestamp: time.Now(),
 	})
 }
@@ -270,9 +285,10 @@ func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
 	rb.Append(entry)
 	s.mu.Unlock()
 
+	broadcastLog := entry
 	s.broadcast(model.Event{
 		Type:      model.EventLogAdded,
-		Log:       &entry,
+		Log:       &broadcastLog,
 		Timestamp: time.Now(),
 	})
 }
@@ -401,6 +417,7 @@ func (s *Store) Subscribe(ctx context.Context) (<-chan model.Event, error) {
 }
 
 // broadcast dispatches an event to all subscribers with non-blocking backpressure mitigation.
+// It deep-copies event pointers so subscribers never alias map-owned objects or each other.
 func (s *Store) broadcast(ev model.Event) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -410,19 +427,34 @@ func (s *Store) broadcast(ev model.Event) {
 	}
 
 	for ch := range s.subscribers {
+		// Deep-copy event payload (value copy then take address) for each subscriber
+		eventCopy := ev
+		if ev.Machine != nil {
+			mCopy := *ev.Machine
+			eventCopy.Machine = &mCopy
+		}
+		if ev.Job != nil {
+			jCopy := *ev.Job
+			eventCopy.Job = &jCopy
+		}
+		if ev.Log != nil {
+			lCopy := *ev.Log
+			eventCopy.Log = &lCopy
+		}
+
 		select {
-		case ch <- ev:
+		case ch <- eventCopy:
 		default:
 			// Backpressure policy per docs/mqtt-protocol.md §6.3:
 			// For high-frequency log events: drop when consumer buffer is full.
 			// For critical state updates (machine/job): evict an older item and enqueue state change.
-			if ev.Type == model.EventMachineUpdated || ev.Type == model.EventJobUpdated {
+			if eventCopy.Type == model.EventMachineUpdated || eventCopy.Type == model.EventJobUpdated {
 				select {
 				case <-ch: // evict one old event
 				default:
 				}
 				select {
-				case ch <- ev:
+				case ch <- eventCopy:
 				default:
 				}
 			}
@@ -470,6 +502,7 @@ func (s *Store) runHeartbeatChecker() {
 }
 
 // checkStaleMachines marks machines offline if heartbeat exceeds timeout per §6.4.
+// It avoids in-place mutation of *m so earlier broadcast pointers are never raced on.
 func (s *Store) checkStaleMachines() {
 	var expired []*model.Machine
 	now := time.Now()
@@ -479,11 +512,17 @@ func (s *Store) checkStaleMachines() {
 		s.mu.Unlock()
 		return
 	}
-	for _, m := range s.machines {
+	for id, m := range s.machines {
 		if m.Online && now.Sub(m.LastHeartbeat) > s.cfg.HeartbeatTimeout {
-			m.Online = false
-			cp := *m
-			expired = append(expired, &cp)
+			// Do not mutate *m in place as it may still be referenced by an earlier Event pointer.
+			// Update via copy into the map.
+			updated := *m
+			updated.Online = false
+			s.machines[id] = &updated
+
+			// Prepare a fresh copy for broadcast
+			fresh := updated
+			expired = append(expired, &fresh)
 		}
 	}
 	s.mu.Unlock()
@@ -495,4 +534,33 @@ func (s *Store) checkStaleMachines() {
 			Timestamp: now,
 		})
 	}
+}
+
+// CheckStaleMachines explicitly runs stale machine inspection (exported for testing).
+func (s *Store) CheckStaleMachines() {
+	s.checkStaleMachines()
+}
+
+// Settle pauses the caller for the configured duration (or default) to allow retained messages to settle.
+func (s *Store) Settle(d time.Duration) {
+	if d <= 0 {
+		d = s.cfg.SettleTimeout
+	}
+	if d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// RawMachinePointer returns the pointer stored in the machines map for pointer-aliasing verification in tests.
+func (s *Store) RawMachinePointer(id string) *model.Machine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.machines[id]
+}
+
+// RawJobPointer returns the pointer stored in the jobs map for pointer-aliasing verification in tests.
+func (s *Store) RawJobPointer(id string) *model.Job {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.jobs[id]
 }

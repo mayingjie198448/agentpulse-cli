@@ -19,6 +19,7 @@ type Config struct {
 	BufferCap              int           // Buffer capacity for event subscribers (default: 1024)
 	HeartbeatTimeout       time.Duration // Max duration before marking node offline (default: 45s)
 	HeartbeatCheckInterval time.Duration // Interval to run offline checker (default: 10s)
+	SettleTimeout          time.Duration // Wait duration after initial subscription for retained messages to settle (default: 200ms)
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -32,6 +33,7 @@ func DefaultConfig() Config {
 		BufferCap:              1024,
 		HeartbeatTimeout:       45 * time.Second,
 		HeartbeatCheckInterval: 10 * time.Second,
+		SettleTimeout:          200 * time.Millisecond,
 	}
 }
 
@@ -60,6 +62,11 @@ func (c *Config) Validate() error {
 	}
 	if c.HeartbeatCheckInterval <= 0 {
 		c.HeartbeatCheckInterval = 10 * time.Second
+	}
+	if c.SettleTimeout < 0 {
+		c.SettleTimeout = 0
+	} else if c.SettleTimeout == 0 {
+		c.SettleTimeout = 200 * time.Millisecond
 	}
 	return nil
 }

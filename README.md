@@ -7,9 +7,9 @@ Licensed under the [MIT License](LICENSE).
 ---
 
 > [!IMPORTANT]
-> **Dual Backend Architecture: Mock (Default) & MQTT Store**
+> **Dual Backend Architecture: Mock (Default) & MQTT Store (v0.2.0)**
 > AgentPulse runs out-of-the-box with an internal in-memory simulation engine (`internal/mock`).
-> To connect to a live Mosquitto / MQTT broker, specify `--mqtt-url` or set `AGENTPULSE_MQTT_URL`.
+> To connect to a live Mosquitto / MQTT broker (lands in release/0.2.0), specify `--mqtt-url` or set `AGENTPULSE_MQTT_URL`.
 
 ---
 
@@ -42,10 +42,11 @@ Licensed under the [MIT License](LICENSE).
   - `internal/mock.MockStore` implements `store.Store` and simulates 4 distributed nodes (`ccdq`, `mac-mini`, `home-pc`, `macbook`).
   - Running, done, and failed jobs across both `agy` and `OpenCode`.
   - Realistic agent logs, subagent invocations, tool outputs, and progress bar ticks.
-- **MQTT Store**:
+- **MQTT Store (New in v0.2.0)**:
   - `internal/store/mqtt.Store` connects to a remote MQTT broker (e.g. iStoreOS Mosquitto over Tailscale).
   - Subscribes to `agentpulse/v1/machines/+/status`, `.../jobs/+/status`, and `.../jobs/+/logs`.
   - In-memory aggregation with active job log ring buffer (~500 lines) and bounded event streaming (1024 cap) with non-blocking backpressure mitigation.
+  - Automatic cold-start settle (~200ms configurable via `--mqtt-settle-timeout`) ensuring retained node and job states are populated on one-shot CLI commands (`list`, `logs`).
 
 ---
 
@@ -150,12 +151,13 @@ All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling
 ```bash
 # 1. Run against a live MQTT broker via CLI flag:
 ./agentpulse watch --mqtt-url tcp://100.98.0.1:1883
-./agentpulse list --mqtt-url tcp://100.98.0.1:1883
+./agentpulse list --mqtt-url tcp://100.98.0.1:1883 --mqtt-settle-timeout 200ms
 
 # 2. Or configure via environment variables:
 export AGENTPULSE_MQTT_URL="tcp://100.98.0.1:1883"
-export AGENTPULSE_MQTT_USERNAME="agentpulse_user" # optional
-export AGENTPULSE_MQTT_PASSWORD="secret"          # optional
+export AGENTPULSE_MQTT_USERNAME="agentpulse_user"          # optional
+export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional
+export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained settle window
 ./agentpulse watch
 
 # 3. Explicit fallback to mock (overriding env vars):

@@ -1,7 +1,7 @@
 # AgentPulse MQTT 协议设计规范 (v1)
 
 > **状态**：协议规范已落于 `internal/store/mqtt` (Store 实现已落，Wrapper/Dispatch 后续演进)  
-> **适用版本**：AgentPulse CLI v0.1+  
+> **适用版本**：AgentPulse CLI v0.2+  
 > **目标对齐**：`internal/model` 数据模型与 `internal/store.Store` 接口抽象
 
 ---
@@ -335,7 +335,7 @@ flowchart TD
 
 ## 5. MockStore 到 MQTT Store 的映射实现指南
 
-> **实现进度**：`internal/store/mqtt.Store` 已在 v0.1.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。
+> **实现进度**：`internal/store/mqtt.Store` 已在 v0.2.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。
 
 当前 CLI 依赖 `internal/store.Store` 接口，默认由 `internal/mock.MockStore` 支撑交互测试。落地 MQTT 驱动（`internal/store/mqtt.Store`）后，该接口方法的映射关系如下：
 
@@ -376,13 +376,19 @@ flowchart LR
 
 | `store.Store` 接口方法 | 对应 MQTT 机制与订阅主题 | 行为实现逻辑 |
 | :--- | :--- | :--- |
-| `ListMachines(ctx)` | `agentpulse/v1/machines/+/status` | 客户端连接建立后订阅上述主题；依托 Broker 保留消息（Retained Messages），MQTT Store 在内存字典维护 `machines map[string]model.Machine`；调用此方法直接返回字典快照。 |
-| `GetMachine(ctx, id)` | `agentpulse/v1/machines/{id}/status` | 直接查询内存字典；若初次启动未缓存，可等待短暂超时（如 200ms）或直接返回未找到。 |
+| `ListMachines(ctx)` | `agentpulse/v1/machines/+/status` | 客户端连接建立后订阅上述主题；依托 Broker 保留消息（Retained Messages），MQTT Store 在内存字典维护 `machines map[string]model.Machine`；调用此方法直接返回字典快照。配合冷启动静默收敛窗口（`SettleTimeout`）确保初次拉取不为空。 |
+| `GetMachine(ctx, id)` | `agentpulse/v1/machines/{id}/status` | 直接查询内存字典；经由 `mqtt.New()` 订阅后短暂保留消息收敛等待（默认 200ms）后，若初次启动未缓存直接返回未找到错误。 |
 | `ListJobs(ctx)` | `agentpulse/v1/machines/+/jobs/+/status` | 客户端订阅通配主题；根据收到的保留消息在内存维护 `jobs map[string]model.Job`，按需过滤或排序后返回。 |
 | `GetJob(ctx, id)` | `agentpulse/v1/machines/+/jobs/{id}/status` | 从内存中的作业索引表按 `id` 检索返回。 |
 | `GetLogs(ctx, jobID, limit)` | `agentpulse/v1/machines/+/jobs/{jobID}/logs` | **特别设计**：MQTT 协议本身只保留单条最新 Retained 消息，不具备历史时序数据库能力。实现策略分为两级：<br/>1. **内存环形缓冲区**：MQTT Store 为活跃作业保留最近 N 条（如 500 条）内存日志缓冲区，随到随存；<br/>2. **可选历史回溯协议**：如需冷查询已离线或历史日志，可向主题 `.../jobs/{job_id}/logs/query` 发送请求，Thin Wrapper 抓取本地日志后通过短周期临时主题应答回传。当前阶段优先以内存环形缓冲区满足 TUI 呈现。 |
-| `Subscribe(ctx)` | 多通配主题转译为 Go Channel | 将订阅到的三类主题消息解析后打包为 `model.Event`：<br/>- 机器心跳变更 → `EventMachineUpdated`<br/>- Job 状态变更 → `EventJobUpdated`<br/>- 日志流产生 → `EventLogAdded`<br/>向订阅者输出 `<-chan model.Event`。 |
+| `Subscribe(ctx)` | 多通配主题转译为 Go Channel | 将订阅到的三类主题消息解析后打包为 `model.Event`：<br/>- 机器心跳变更 → `EventMachineUpdated`<br/>- Job 状态变更 → `EventJobUpdated`<br/>- 日志流产生 → `EventLogAdded`<br/>向订阅者输出 `<-chan model.Event`。广播时执行结构体深拷贝（值拷贝并取地址），杜绝事件与底层字典指针别名冲突。 |
 | `Close()` | MQTT 断开与资源回收 | 取消所有 MQTT 主题订阅，向 Broker 发送 DISCONNECT 包优雅断开，关闭内部 Event Channel。 |
+
+#### 冷启动保留消息静默收敛窗口 (Cold-Start Retained Settle)
+在 MQTT 规范中，客户端完成 `SubscribeMultiple` 握手（SUBACK）仅代表订阅意图确认；Broker 托管的 Retained 保留消息（如机器状态与作业状态）需在网络层异步发送至客户端。
+为了避免一次性查询命令（如 `agentpulse list`、`agentpulse logs`）在刚建立连接后因保留消息飞行延迟而得到空结果，`mqtt.New()` 在订阅成功后默认执行短暂可配置的静默等待：
+- **默认时长**：`SettleTimeout = 200ms`（可通过配置或 `--mqtt-settle-timeout` / `AGENTPULSE_MQTT_SETTLE_TIMEOUT` 调整）。
+- **收益**：避免冷启动初次 `ListMachines` / `ListJobs` 假空，同时维持极低的 CLI 响应延迟。
 
 ---
 
@@ -458,7 +464,7 @@ flowchart LR
 
 - **第一阶段（已完成）**：建立 `model` 核心类型与 `store.Store` 接口抽象，完成 `internal/mock` 驱动与交互式 Bubble Tea TUI 界面验证。
 - **第二阶段（已完成）**：确立 MQTT 协议契约、主题层级、QoS 策略与安全运维边界（PR #2）。
-- **第三阶段（进行中）**：
-  1. 在 `internal/store/mqtt` 实现基于 `paho.mqtt.golang` 的生产级驱动（**已落地**）；
+- **第三阶段（进行中，v0.2.0）**：
+  1. 在 `internal/store/mqtt` 实现基于 `paho.mqtt.golang` 的生产级驱动（**已落地于 v0.2.0**）；
   2. 实现可在 Mac/Linux 一键运行的边缘极轻守护进程（Thin Wrapper，后续规划）；
   3. 实现基于 `agentpulse/v1/notifications/alerts` 的轻量邮件发送插件（后续规划）。

@@ -19,6 +19,7 @@ func registerStoreFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().String("mqtt-client-id", "", "MQTT client ID (or $AGENTPULSE_MQTT_CLIENT_ID)")
 	cmd.PersistentFlags().String("mqtt-username", "", "MQTT username (or $AGENTPULSE_MQTT_USERNAME)")
 	cmd.PersistentFlags().String("mqtt-password", "", "MQTT password (or $AGENTPULSE_MQTT_PASSWORD)")
+	cmd.PersistentFlags().Duration("mqtt-settle-timeout", 200*time.Millisecond, "Duration to wait after subscription for retained messages to settle (or $AGENTPULSE_MQTT_SETTLE_TIMEOUT)")
 }
 
 // resolveMQTTConfig aggregates MQTT options from CLI flags and environment variables.
@@ -37,6 +38,9 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 		}
 		if val, err := cmd.Flags().GetString("mqtt-password"); err == nil && val != "" {
 			cfg.Password = val
+		}
+		if val, err := cmd.Flags().GetDuration("mqtt-settle-timeout"); err == nil && cmd.Flags().Changed("mqtt-settle-timeout") {
+			cfg.SettleTimeout = val
 		}
 	}
 
@@ -57,6 +61,11 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 	if cfg.Password == "" {
 		if env := os.Getenv("AGENTPULSE_MQTT_PASSWORD"); env != "" {
 			cfg.Password = env
+		}
+	}
+	if env := os.Getenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-settle-timeout")) {
+		if d, err := time.ParseDuration(env); err == nil {
+			cfg.SettleTimeout = d
 		}
 	}
 
