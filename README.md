@@ -7,13 +7,13 @@ Licensed under the [MIT License](LICENSE).
 ---
 
 > [!IMPORTANT]
-> **Phase 1 Release (First Slice): Interactive Mock Only**
-> This repository currently implements Phase 1 of AgentPulse. All machine states, agent jobs, heartbeats, and streaming logs are driven by an internal in-memory simulation engine (`internal/mock`).
-> **No live MQTT broker, agy sidecar, or OpenCode network daemon is connected in this release.**
+> **Dual Backend Architecture: Mock (Default) & MQTT Store**
+> AgentPulse runs out-of-the-box with an internal in-memory simulation engine (`internal/mock`).
+> To connect to a live Mosquitto / MQTT broker, specify `--mqtt-url` or set `AGENTPULSE_MQTT_URL`.
 
 ---
 
-## ⚡ Architecture: Mock vs. Future Real Path
+## ⚡ Architecture: Mock vs. MQTT Store
 
 ```
                     ┌────────────────────────────┐
@@ -27,8 +27,8 @@ Licensed under the [MIT License](LICENSE).
                     └──────┬──────────────┬──────┘
                            │              │
         ┌──────────────────┴──┐        ┌──┴──────────────────┐
-        │  [Phase 1: Active]  │        │ [Phase 2: Planned]  │
-        │ internal/mock.Store │        │  MQTT Store Adapter │
+        │  [Default: Mock]    │        │  [Active: MQTT]     │
+        │ internal/mock.Store │        │ internal/store/mqtt │
         └─────────────────────┘        └──────────┬──────────┘
                                                   │
                                                   ▼
@@ -38,13 +38,14 @@ Licensed under the [MIT License](LICENSE).
                                        └─────────────────────┘
 ```
 
-- **Phase 1 (Current)**:
+- **Mock Store (Default)**:
   - `internal/mock.MockStore` implements `store.Store` and simulates 4 distributed nodes (`ccdq`, `mac-mini`, `home-pc`, `macbook`).
   - Running, done, and failed jobs across both `agy` and `OpenCode`.
   - Realistic agent logs, subagent invocations, tool outputs, and progress bar ticks.
-- **Phase 2 (Future Road)**:
-  - Retains identical CLI commands and TUI components.
-  - Implement real `store.Store` backend connecting to remote agent runners via lightweight MQTT topics (e.g. `agentpulse/nodes/+/heartbeat`, `agentpulse/jobs/+/logs`).
+- **MQTT Store**:
+  - `internal/store/mqtt.Store` connects to a remote MQTT broker (e.g. iStoreOS Mosquitto over Tailscale).
+  - Subscribes to `agentpulse/v1/machines/+/status`, `.../jobs/+/status`, and `.../jobs/+/logs`.
+  - In-memory aggregation with active job log ring buffer (~500 lines) and bounded event streaming (1024 cap) with non-blocking backpressure mitigation.
 
 ---
 
@@ -135,13 +136,37 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 
 ```bash
 ./agentpulse doctor
+
+# Check connection intent to a live MQTT broker:
+./agentpulse doctor --mqtt-url tcp://100.98.0.1:1883
+```
+
+---
+
+### 5. Switching Backend (Mock ↔ MQTT)
+
+All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling between mock simulation and a live MQTT broker:
+
+```bash
+# 1. Run against a live MQTT broker via CLI flag:
+./agentpulse watch --mqtt-url tcp://100.98.0.1:1883
+./agentpulse list --mqtt-url tcp://100.98.0.1:1883
+
+# 2. Or configure via environment variables:
+export AGENTPULSE_MQTT_URL="tcp://100.98.0.1:1883"
+export AGENTPULSE_MQTT_USERNAME="agentpulse_user" # optional
+export AGENTPULSE_MQTT_PASSWORD="secret"          # optional
+./agentpulse watch
+
+# 3. Explicit fallback to mock (overriding env vars):
+./agentpulse watch --store=mock
 ```
 
 ---
 
 ## 📚 文档
 
-- [AgentPulse MQTT 协议设计规范 (v1)](docs/mqtt-protocol.md)（**协议草案，实现后置**）：主题树、QoS、消息 JSON 契约、`store.Store` 映射与安全运维约定。
+- [AgentPulse MQTT 协议设计规范 (v1)](docs/mqtt-protocol.md)：主题树、QoS、消息 JSON 契约、`store.Store` 映射与安全运维约定。
 - [文档索引](docs/README.md)
 
 ## 🧪 Testing

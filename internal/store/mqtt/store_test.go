@@ -1,0 +1,410 @@
+package mqtt_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	mqttstore "github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
+)
+
+func TestMQTTStore_RetainedMachines(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Initial check: empty
+	machines, err := st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(machines) != 0 {
+		t.Fatalf("expected 0 machines, got %d", len(machines))
+	}
+
+	// 1. Deliver retained message for mac-studio-m2 (online)
+	macPayload := `{"id":"mac-studio-m2","name":"Mac Studio M2 Max","online":true,"platform":"darwin/arm64","job_count":2,"ip":"100.98.12.34"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/status", []byte(macPayload), true)
+
+	machines, err = st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	if len(machines) != 1 {
+		t.Fatalf("expected 1 machine, got %d", len(machines))
+	}
+	if machines[0].ID != "mac-studio-m2" || !machines[0].Online || machines[0].JobCount != 2 {
+		t.Errorf("unexpected machine data: %+v", machines[0])
+	}
+
+	// GetMachine
+	m, err := st.GetMachine(ctx, "mac-studio-m2")
+	if err != nil {
+		t.Fatalf("GetMachine error: %v", err)
+	}
+	if m.Name != "Mac Studio M2 Max" {
+		t.Errorf("expected name 'Mac Studio M2 Max', got %q", m.Name)
+	}
+
+	// Non-existent machine
+	_, err = st.GetMachine(ctx, "unknown-node")
+	if err == nil {
+		t.Fatalf("expected error for unknown machine, got nil")
+	}
+
+	// 2. Deliver offline machine ccdq
+	ccdqPayload := `{"id":"ccdq","name":"ccdq-server","online":false,"platform":"linux/amd64","job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/status", []byte(ccdqPayload), true)
+
+	machines, err = st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	if len(machines) != 2 {
+		t.Fatalf("expected 2 machines, got %d", len(machines))
+	}
+	// Verify sort order: online nodes first
+	if machines[0].ID != "mac-studio-m2" || machines[1].ID != "ccdq" {
+		t.Errorf("expected online machine first, got order: %s, %s", machines[0].ID, machines[1].ID)
+	}
+}
+
+func TestMQTTStore_RetainedJobs(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Deliver 2 jobs: one done, one running
+	doneJob := `{"id":"job-done-01","machine_id":"ccdq","engine":"opencode","status":"done","progress":100.0,"title":"OpenCode Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-done-01/status", []byte(doneJob), true)
+
+	runningJob := `{"id":"job-run-02","machine_id":"mac-studio-m2","engine":"agy","status":"running","progress":45.0,"title":"Agy Refactor"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/jobs/job-run-02/status", []byte(runningJob), true)
+
+	jobs, err := st.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
+	}
+
+	// Verify sort order: running job appears before done job
+	if jobs[0].ID != "job-run-02" || jobs[1].ID != "job-done-01" {
+		t.Errorf("expected running job first, got: %s, %s", jobs[0].ID, jobs[1].ID)
+	}
+
+	// GetJob
+	j, err := st.GetJob(ctx, "job-run-02")
+	if err != nil {
+		t.Fatalf("GetJob error: %v", err)
+	}
+	if j.Engine != model.EngineAgy || j.Progress != 45.0 {
+		t.Errorf("unexpected job: %+v", j)
+	}
+
+	// Non-existent job
+	_, err = st.GetJob(ctx, "job-non-existent")
+	if err == nil {
+		t.Fatalf("expected error for non-existent job, got nil")
+	}
+}
+
+func TestMQTTStore_LogsAndRingBuffer(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.LogCap = 10 // small cap for testing ring truncation
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Initial GetLogs on non-existent job -> error
+	_, err = st.GetLogs(ctx, "job-logs-01", 10)
+	if err == nil {
+		t.Fatalf("expected error for job with no logs or record, got nil")
+	}
+
+	// Create job
+	jobPayload := `{"id":"job-logs-01","machine_id":"mac-studio-m2","engine":"agy","status":"running"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/jobs/job-logs-01/status", []byte(jobPayload), true)
+
+	// Now job exists, 0 logs -> empty slice
+	emptyLogs, err := st.GetLogs(ctx, "job-logs-01", 10)
+	if err != nil {
+		t.Fatalf("unexpected error for job with 0 logs: %v", err)
+	}
+	if len(emptyLogs) != 0 {
+		t.Fatalf("expected 0 logs, got %d", len(emptyLogs))
+	}
+
+	// Inject 25 logs
+	for i := 1; i <= 25; i++ {
+		logPayload := fmt.Sprintf(`{"timestamp":"2026-11-02T13:30:%02dZ","job_id":"job-logs-01","machine_id":"mac-studio-m2","engine":"agy","level":"AGENT","message":"step-%d"}`, i, i)
+		fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/jobs/job-logs-01/logs", []byte(logPayload), false)
+	}
+
+	// Verify ring buffer capped at 10
+	logs, err := st.GetLogs(ctx, "job-logs-01", 0)
+	if err != nil {
+		t.Fatalf("GetLogs error: %v", err)
+	}
+	if len(logs) != 10 {
+		t.Fatalf("expected exactly 10 logs (ring cap), got %d", len(logs))
+	}
+	// Oldest kept should be step-16, newest should be step-25
+	if logs[0].Message != "step-16" {
+		t.Errorf("expected first log to be step-16, got %q", logs[0].Message)
+	}
+	if logs[9].Message != "step-25" {
+		t.Errorf("expected last log to be step-25, got %q", logs[9].Message)
+	}
+
+	// Test limit
+	limitLogs, err := st.GetLogs(ctx, "job-logs-01", 3)
+	if err != nil {
+		t.Fatalf("GetLogs with limit error: %v", err)
+	}
+	if len(limitLogs) != 3 {
+		t.Fatalf("expected 3 logs, got %d", len(limitLogs))
+	}
+	if limitLogs[0].Message != "step-23" || limitLogs[2].Message != "step-25" {
+		t.Errorf("unexpected logs with limit 3: %+v", limitLogs)
+	}
+
+	// Raw string log fallback
+	fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/jobs/job-logs-01/logs", []byte("plain text raw log message"), false)
+	rawLogs, err := st.GetLogs(ctx, "job-logs-01", 1)
+	if err != nil {
+		t.Fatalf("GetLogs error: %v", err)
+	}
+	if len(rawLogs) != 1 || rawLogs[0].Message != "plain text raw log message" {
+		t.Errorf("unexpected raw fallback log: %+v", rawLogs)
+	}
+}
+
+func TestMQTTStore_SubscribeAndEvents(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// 1. Deliver Machine Status -> Expect EventMachineUpdated
+	macPayload := `{"id":"ccdq","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/status", []byte(macPayload), false)
+
+	select {
+	case ev := <-eventCh:
+		if ev.Type != model.EventMachineUpdated || ev.Machine == nil || ev.Machine.ID != "ccdq" {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for EventMachineUpdated")
+	}
+
+	// 2. Deliver Job Status -> Expect EventJobUpdated
+	jobPayload := `{"id":"job-test-99","status":"running","progress":50.0}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-test-99/status", []byte(jobPayload), false)
+
+	select {
+	case ev := <-eventCh:
+		if ev.Type != model.EventJobUpdated || ev.Job == nil || ev.Job.ID != "job-test-99" {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for EventJobUpdated")
+	}
+
+	// 3. Deliver Job Log -> Expect EventLogAdded
+	logPayload := `{"message":"compilation started","level":"INFO"}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-test-99/logs", []byte(logPayload), false)
+
+	select {
+	case ev := <-eventCh:
+		if ev.Type != model.EventLogAdded || ev.Log == nil || ev.Log.Message != "compilation started" {
+			t.Fatalf("unexpected event: %+v", ev)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for EventLogAdded")
+	}
+
+	// 4. Cancel Context -> Expect channel closed
+	cancel()
+	select {
+	case _, ok := <-eventCh:
+		if ok {
+			// Might drain previous event, but eventually closes
+			for ok {
+				_, ok = <-eventCh
+			}
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected subscriber channel to close on context cancellation")
+	}
+}
+
+func TestMQTTStore_Backpressure(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.BufferCap = 2 // Small buffer to test backpressure
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	eventCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Fill buffer with 2 logs
+	fakeClient.Deliver("agentpulse/v1/machines/m1/jobs/j1/logs", []byte(`{"message":"log 1"}`), false)
+	fakeClient.Deliver("agentpulse/v1/machines/m1/jobs/j1/logs", []byte(`{"message":"log 2"}`), false)
+
+	// Buffer is now full (cap 2). Send 3rd log (should be silently dropped without blocking)
+	fakeClient.Deliver("agentpulse/v1/machines/m1/jobs/j1/logs", []byte(`{"message":"log 3"}`), false)
+
+	// Now deliver a critical machine update (should evict an older event to make room)
+	fakeClient.Deliver("agentpulse/v1/machines/m1/status", []byte(`{"id":"m1","online":true}`), false)
+
+	// Read events from channel
+	var received []model.Event
+	drainDone := false
+	for !drainDone {
+		select {
+		case ev := <-eventCh:
+			received = append(received, ev)
+		default:
+			drainDone = true
+		}
+	}
+
+	if len(received) == 0 {
+		t.Fatalf("expected to receive events, got 0")
+	}
+
+	// Ensure critical machine update is received in the bounded channel
+	hasMachineUpdate := false
+	for _, ev := range received {
+		if ev.Type == model.EventMachineUpdated && ev.Machine != nil && ev.Machine.ID == "m1" {
+			hasMachineUpdate = true
+			break
+		}
+	}
+	if !hasMachineUpdate {
+		t.Errorf("expected critical machine update to be preserved despite full buffer, received: %+v", received)
+	}
+}
+
+func TestMQTTStore_Close(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	ctx := context.Background()
+	eventCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Close store
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	// Client should be disconnected
+	if fakeClient.IsConnected() {
+		t.Errorf("expected client to be disconnected")
+	}
+
+	// Subscriber channel should be closed
+	select {
+	case _, ok := <-eventCh:
+		if ok {
+			t.Errorf("expected subscriber channel to be closed")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("timed out waiting for event channel to close on store shutdown")
+	}
+
+	// Further call to Subscribe should fail
+	_, err = st.Subscribe(ctx)
+	if err == nil {
+		t.Errorf("expected error subscribing to closed store, got nil")
+	}
+
+	// Double close should be idempotent
+	if err := st.Close(); err != nil {
+		t.Errorf("expected idempotent Close, got error: %v", err)
+	}
+}
+
+func TestMQTTStore_HeartbeatTimeout(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.HeartbeatTimeout = 40 * time.Millisecond
+	cfg.HeartbeatCheckInterval = 20 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Deliver machine with heartbeat 100ms in the past
+	oldTime := time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339)
+	payload := fmt.Sprintf(`{"id":"stale-node","name":"Stale Node","online":true,"last_heartbeat":"%s"}`, oldTime)
+	fakeClient.Deliver("agentpulse/v1/machines/stale-node/status", []byte(payload), true)
+
+	// Wait for heartbeat checker to run
+	time.Sleep(60 * time.Millisecond)
+
+	m, err := st.GetMachine(ctx, "stale-node")
+	if err != nil {
+		t.Fatalf("GetMachine error: %v", err)
+	}
+	if m.Online {
+		t.Errorf("expected machine to be marked offline after heartbeat timeout, but online is true")
+	}
+}

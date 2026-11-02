@@ -1,6 +1,6 @@
 # AgentPulse MQTT 协议设计规范 (v1)
 
-> **状态**：协议草案，实现后置 (Draft, Implementation Deferred)  
+> **状态**：协议规范已落于 `internal/store/mqtt` (Store 实现已落，Wrapper/Dispatch 后续演进)  
 > **适用版本**：AgentPulse CLI v0.1+  
 > **目标对齐**：`internal/model` 数据模型与 `internal/store.Store` 接口抽象
 
@@ -335,7 +335,9 @@ flowchart TD
 
 ## 5. MockStore 到 MQTT Store 的映射实现指南
 
-当前 CLI 依赖 `internal/store.Store` 接口与 `internal/mock.MockStore` 进行 TUI 渲染与交互测试。后续落地 MQTT 驱动（如 `internal/store/mqtt.Store`）时，该接口方法的映射关系如下：
+> **实现进度**：`internal/store/mqtt.Store` 已在 v0.1.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。
+
+当前 CLI 依赖 `internal/store.Store` 接口，默认由 `internal/mock.MockStore` 支撑交互测试。落地 MQTT 驱动（`internal/store/mqtt.Store`）后，该接口方法的映射关系如下：
 
 ### 5.1 接口方法与 MQTT 主题映射表
 
@@ -455,8 +457,8 @@ flowchart LR
 ## 7. 演进与落地路线 (Roadmap)
 
 - **第一阶段（已完成）**：建立 `model` 核心类型与 `store.Store` 接口抽象，完成 `internal/mock` 驱动与交互式 Bubble Tea TUI 界面验证。
-- **第二阶段（当前文档）**：确立 MQTT 协议契约、主题层级、QoS 策略与安全运维边界（**协议草案，实现后置**）。
-- **第三阶段（后续演进）**：
-  1. 在 `internal/store/mqtt` 实现基于 `paho.mqtt.golang` 的生产级驱动；
-  2. 实现可在 Mac/Linux 一键运行的边缘极轻守护进程（Thin Wrapper）；
-  3. 实现基于 `agentpulse/v1/notifications/alerts` 的轻量邮件发送插件。
+- **第二阶段（已完成）**：确立 MQTT 协议契约、主题层级、QoS 策略与安全运维边界（PR #2）。
+- **第三阶段（进行中）**：
+  1. 在 `internal/store/mqtt` 实现基于 `paho.mqtt.golang` 的生产级驱动（**已落地**）；
+  2. 实现可在 Mac/Linux 一键运行的边缘极轻守护进程（Thin Wrapper，后续规划）；
+  3. 实现基于 `agentpulse/v1/notifications/alerts` 的轻量邮件发送插件（后续规划）。
