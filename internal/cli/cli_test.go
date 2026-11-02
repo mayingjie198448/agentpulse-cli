@@ -230,6 +230,55 @@ func TestWrapCommand(t *testing.T) {
 			t.Errorf("expected done status: %s", string(data))
 		}
 	})
+
+	// 4. Missing binary failure (never silent stub)
+	t.Run("missing binary failure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		statusFile := filepath.Join(tmpDir, "missing-bin-cli-status.json")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"wrap", "--status-file", statusFile, "--quiet", "nonexistent-cli-bin-99999"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error from missing binary, got nil")
+		}
+
+		data, err := os.ReadFile(statusFile)
+		if err != nil {
+			t.Fatalf("failed to read status file: %v", err)
+		}
+		if !strings.Contains(string(data), `"failed"`) {
+			t.Errorf("expected status 'failed' in status file: %s", string(data))
+		}
+	})
+
+	// 5. Explicit stub with missing binary succeeds
+	t.Run("explicit stub with missing binary succeeds", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		statusFile := filepath.Join(tmpDir, "explicit-stub-cli-status.json")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"wrap", "--stub", "--status-file", statusFile, "--quiet", "nonexistent-cli-bin-99999"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("expected explicit stub to succeed: %v", err)
+		}
+
+		data, err := os.ReadFile(statusFile)
+		if err != nil {
+			t.Fatalf("failed to read status file: %v", err)
+		}
+		if !strings.Contains(string(data), `"done"`) {
+			t.Errorf("expected status 'done' in status file: %s", string(data))
+		}
+	})
 }
 
 func TestStatusCommand(t *testing.T) {

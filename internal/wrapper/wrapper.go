@@ -191,7 +191,7 @@ func (w *Wrapper) Run(ctx context.Context) error {
 
 	// Execute command or stub
 	var execErr error
-	if w.cfg.Stub || shouldStub(w.cfg) {
+	if w.cfg.Stub {
 		execErr = w.runStub(ctx)
 	} else {
 		execErr = w.runProcess(ctx)
@@ -334,7 +334,12 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 		return fmt.Errorf("no command provided to wrap")
 	}
 
-	cmd := exec.CommandContext(ctx, w.cfg.Args[0], w.cfg.Args[1:]...)
+	bin := w.cfg.Args[0]
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("command binary %q not found: %w", bin, err)
+	}
+
+	cmd := exec.CommandContext(ctx, bin, w.cfg.Args[1:]...)
 	cmd.Dir = w.cfg.Cwd
 
 	stdoutWriter := newLineWriter(func(line string) {
@@ -765,15 +770,4 @@ func detectLocalIP() string {
 		}
 	}
 	return "127.0.0.1"
-}
-
-func shouldStub(cfg Config) bool {
-	if len(cfg.Args) == 0 {
-		return true
-	}
-	if _, err := exec.LookPath(cfg.Args[0]); err != nil {
-		// Binary not found in PATH: fallback to stub for seamless demo/testing
-		return true
-	}
-	return false
 }

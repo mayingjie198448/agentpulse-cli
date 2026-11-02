@@ -300,6 +300,90 @@ func TestWrapper_LocalExecution_Failure(t *testing.T) {
 	}
 }
 
+func TestWrapper_MissingBinary_Fails(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "missing-bin-status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "test-missing-bin-node",
+		JobID:      "job-missing-bin-01",
+		Engine:     model.EngineAgy,
+		Title:      "Missing binary test",
+		Args:       []string{"nonexistent-agentpulse-bin-12345"},
+		StatusFile: statusFile,
+		Stub:       false,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = w.Run(ctx)
+	if err == nil {
+		t.Fatalf("expected error from missing binary, got nil")
+	}
+	if !strings.Contains(err.Error(), "command binary") || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected clear missing binary error, got: %v", err)
+	}
+
+	// Verify job status failed (never done)
+	job := w.Job()
+	if job.Status != model.StatusFailed {
+		t.Errorf("expected job status failed, got %s", job.Status)
+	}
+	if job.Error == "" {
+		t.Errorf("expected non-empty error in job")
+	}
+
+	// Verify status file recorded failure
+	st, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read status file: %v", err)
+	}
+	if st.Job.Status != model.StatusFailed {
+		t.Errorf("expected status file status failed, got %s", st.Job.Status)
+	}
+	if !strings.Contains(st.Job.Error, "nonexistent-agentpulse-bin-12345") {
+		t.Errorf("expected status file error to mention missing binary, got: %s", st.Job.Error)
+	}
+}
+
+func TestWrapper_ExplicitStub_WithMissingBinary_Succeeds(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "stub-missing-bin-status.json")
+
+	// When Stub is explicitly true, missing binary is bypassed and stub workflow executes
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "stub-node",
+		JobID:      "job-explicit-stub-01",
+		Engine:     model.EngineOpenCode,
+		Title:      "Stub OpenCode Workflow with missing binary",
+		Args:       []string{"nonexistent-agentpulse-bin-12345"},
+		Stub:       true,
+		StatusFile: statusFile,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("explicit stub run failed: %v", err)
+	}
+
+	job := w.Job()
+	if job.Status != model.StatusDone {
+		t.Errorf("expected stub job status done, got %s", job.Status)
+	}
+	if job.Progress != 100.0 {
+		t.Errorf("expected stub job progress 100, got %f", job.Progress)
+	}
+}
+
 func TestWrapper_StubExecution(t *testing.T) {
 	tmpDir := t.TempDir()
 	statusFile := filepath.Join(tmpDir, "stub-status.json")
