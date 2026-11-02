@@ -17,17 +17,18 @@ import (
 
 // Config configures a job dispatch invocation.
 type Config struct {
-	MachineID      string
-	JobID          string
-	CommandID      string
-	Engine         model.EngineType
-	Cwd            string
-	Command        string
-	Args           []string
-	Title          string
-	TimeoutSeconds int
-	Env            map[string]string
-	RequestedBy    string
+	MachineID          string
+	JobID              string
+	CommandID          string
+	Engine             model.EngineType
+	Cwd                string
+	Command            string
+	Args               []string
+	Title              string
+	TimeoutSeconds     int // Constrains remote job execution timeout (passed in payload)
+	WaitTimeoutSeconds int // Local wait wall-clock timeout in seconds (0 = unlimited)
+	Env                map[string]string
+	RequestedBy        string
 
 	Wait   bool
 	Follow bool
@@ -155,6 +156,8 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		defer client.Disconnect(100)
 	}
 
+	dispatchStartTime := time.Now().UTC()
+
 	// Setup wait / follow subscriptions BEFORE publishing dispatch command
 	var statusCh chan model.Job
 	var logCh chan model.LogEntry
@@ -166,10 +169,31 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		statusTopic := mqtt.JobStatusTopic(cfg.MachineID, cfg.JobID)
 		subToken := client.Subscribe(statusTopic, 1, func(_ paho.Client, msg paho.Message) {
 			var j model.Job
-			if err := json.Unmarshal(msg.Payload(), &j); err == nil && j.ID == cfg.JobID {
+			if err := json.Unmarshal(msg.Payload(), &j); err != nil || j.ID != cfg.JobID {
+				return
+			}
+
+			// C1: Ignore stale retained status from an earlier run before this dispatch
+			ts := j.UpdatedAt
+			if ts.IsZero() {
+				ts = j.StartedAt
+			}
+			if !ts.IsZero() && ts.Before(dispatchStartTime) {
+				return
+			}
+
+			// Important #2: Deliver to statusCh keeping latest and never silently dropping terminal states
+			for {
 				select {
 				case statusCh <- j:
+					return
+				case <-ctx.Done():
+					return
 				default:
+					select {
+					case <-statusCh:
+					default:
+					}
 				}
 			}
 		})
@@ -188,6 +212,14 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 					select {
 					case logCh <- l:
 					default:
+						select {
+						case <-logCh:
+						default:
+						}
+						select {
+						case logCh <- l:
+						default:
+						}
 					}
 				}
 			})
@@ -216,7 +248,7 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		TimeoutSeconds: cfg.TimeoutSeconds,
 		Env:            cfg.Env,
 		RequestedBy:    cfg.RequestedBy,
-		Timestamp:      time.Now().UTC(),
+		Timestamp:      dispatchStartTime,
 	}
 
 	payload, err := json.Marshal(dispatchMsg)
@@ -252,8 +284,8 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 
 	var timeoutTimer *time.Timer
 	var timeoutCh <-chan time.Time
-	if cfg.TimeoutSeconds > 0 {
-		timeoutTimer = time.NewTimer(time.Duration(cfg.TimeoutSeconds) * time.Second)
+	if cfg.WaitTimeoutSeconds > 0 {
+		timeoutTimer = time.NewTimer(time.Duration(cfg.WaitTimeoutSeconds) * time.Second)
 		defer timeoutTimer.Stop()
 		timeoutCh = timeoutTimer.C
 	}
@@ -268,9 +300,9 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 
 		case <-timeoutCh:
 			if !cfg.Quiet {
-				fmt.Fprintf(cfg.ErrOut, "\n[agentpulse] Job %s timed out after %ds\n", cfg.JobID, cfg.TimeoutSeconds)
+				fmt.Fprintf(cfg.ErrOut, "\n[agentpulse] Wait timed out after %ds (job %s may still be running remotely)\n", cfg.WaitTimeoutSeconds, cfg.JobID)
 			}
-			return &dispatchMsg, fmt.Errorf("job %s timed out after %ds", cfg.JobID, cfg.TimeoutSeconds)
+			return &dispatchMsg, fmt.Errorf("wait timed out after %ds", cfg.WaitTimeoutSeconds)
 
 		case l := <-logCh:
 			if cfg.Follow {
@@ -281,6 +313,14 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 			}
 
 		case j := <-statusCh:
+			ts := j.UpdatedAt
+			if ts.IsZero() {
+				ts = j.StartedAt
+			}
+			if !ts.IsZero() && ts.Before(dispatchStartTime) {
+				continue
+			}
+
 			if cfg.OnProgress != nil {
 				cfg.OnProgress(j)
 			}

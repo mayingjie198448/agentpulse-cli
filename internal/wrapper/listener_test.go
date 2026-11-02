@@ -424,3 +424,370 @@ func TestListener_SerialExecution(t *testing.T) {
 		t.Errorf("expected serial execution order [job-first-1, job-second-2], got %v", executionOrder)
 	}
 }
+
+// TestListener_AutoReconnect_Resubscribes tests Critical C2:
+// When the connection drops and reconnects (e.g. clean session),
+// Listener.OnConnect re-subscribes to the dispatch topic and resumes receiving commands.
+func TestListener_AutoReconnect_Resubscribes(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "reconnect-status.json")
+
+	var completedJob *model.Job
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	listeningCh := make(chan struct{})
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "reconnect-node-1",
+		StatusFile: statusFile,
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+		OnListening: func(_ string) {
+			select {
+			case <-listeningCh:
+			default:
+				close(listeningCh)
+			}
+		},
+		OnJobComplete: func(j model.Job, err error) {
+			completedJob = &j
+			wg.Done()
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	select {
+	case <-listeningCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for OnListening")
+	}
+
+	dispatchTopic := mqtt.MachineDispatchTopic("reconnect-node-1")
+	if !mockClient.HasSubscription(dispatchTopic) {
+		t.Fatalf("expected initial subscription to %s", dispatchTopic)
+	}
+
+	// 1. Simulate network disconnect & clean session: subscriptions lost!
+	mockClient.ClearSubscriptions()
+	if mockClient.HasSubscription(dispatchTopic) {
+		t.Fatalf("subscription should be cleared after disconnect")
+	}
+
+	// 2. Simulate / inject AutoReconnect
+	l.OnConnect(mockClient)
+
+	// Verify subscription is restored
+	if !mockClient.HasSubscription(dispatchTopic) {
+		t.Fatalf("expected subscription to %s to be restored upon OnConnect", dispatchTopic)
+	}
+
+	// 3. Publish dispatch command now that it reconnected
+	cmd := model.DispatchCommand{
+		CommandID: "cmd-reconnect-1",
+		JobID:     "job-reconnect-1",
+		Engine:    model.EngineAgy,
+		Command:   "agy",
+		Title:     "Reconnect test",
+	}
+	p, _ := json.Marshal(cmd)
+	mockClient.Publish(dispatchTopic, 1, false, p)
+
+	wg.Wait()
+
+	if completedJob == nil || completedJob.ID != "job-reconnect-1" {
+		t.Errorf("expected job to execute after reconnect, got %+v", completedJob)
+	}
+}
+
+// TestListener_CancelRunningJob_PublishesOffline tests Important #6:
+// Cancelling a running job or shutting down publishes online: false and job_count: 0.
+func TestListener_CancelRunningJob_PublishesOffline(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "cancel-status.json")
+
+	jobStartedCh := make(chan struct{})
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "cancel-node-1",
+		StatusFile: statusFile,
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+		OnJobStart: func(j model.Job) {
+			close(jobStartedCh)
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listenerDone := make(chan error, 1)
+	go func() {
+		listenerDone <- l.Run(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	dispatchTopic := mqtt.MachineDispatchTopic("cancel-node-1")
+	cmd := model.DispatchCommand{
+		CommandID: "cmd-long-1",
+		JobID:     "job-long-1",
+		Engine:    model.EngineAgy,
+		Command:   "agy",
+		Title:     "Long running job",
+	}
+	p, _ := json.Marshal(cmd)
+	mockClient.Publish(dispatchTopic, 1, false, p)
+
+	// Wait until job starts
+	select {
+	case <-jobStartedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("job did not start in time")
+	}
+
+	// Cancel listener while job is in progress!
+	cancel()
+
+	select {
+	case err := <-listenerDone:
+		if err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("listener did not shut down in time after context cancellation")
+	}
+
+	// Verify final published status is online: false and job_count: 0
+	finalMsgs := mockClient.GetPublished()
+	var lastMachine *model.Machine
+	for _, m := range finalMsgs {
+		if m.Topic == mqtt.MachineStatusTopic("cancel-node-1") {
+			var mach model.Machine
+			if err := json.Unmarshal(m.Payload, &mach); err == nil {
+				machCopy := mach
+				lastMachine = &machCopy
+			}
+		}
+	}
+	if lastMachine == nil {
+		t.Fatalf("expected machine status published")
+	}
+	if lastMachine.Online {
+		t.Errorf("expected machine online: false after cancellation, got %v", lastMachine.Online)
+	}
+	if lastMachine.JobCount != 0 {
+		t.Errorf("expected machine job_count: 0 after cancellation, got %d", lastMachine.JobCount)
+	}
+}
+
+// TestListener_Deduplication_QoS1_Redelivery tests Important #3:
+// Commands with duplicate command_id are ignored and not executed multiple times.
+func TestListener_Deduplication_QoS1_Redelivery(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	var executionCount int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "dedup-node-1",
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+		OnJobComplete: func(j model.Job, err error) {
+			mu.Lock()
+			executionCount++
+			mu.Unlock()
+			wg.Done()
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	dispatchTopic := mqtt.MachineDispatchTopic("dedup-node-1")
+	cmd := model.DispatchCommand{
+		CommandID: "duplicate-cmd-999",
+		JobID:     "job-dedup-1",
+		Engine:    model.EngineAgy,
+		Command:   "agy",
+		Title:     "Dedup test",
+	}
+	p, _ := json.Marshal(cmd)
+
+	// Publish twice with the same command_id (simulating QoS 1 redelivery)
+	mockClient.Publish(dispatchTopic, 1, false, p)
+	mockClient.Publish(dispatchTopic, 1, false, p)
+
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	count := executionCount
+	mu.Unlock()
+
+	if count != 1 {
+		t.Errorf("expected job to execute exactly once, but executed %d times", count)
+	}
+}
+
+// TestListener_ErrorPublishJobFailed tests Important #1:
+// Malformed JSON and empty command publish failed status if job_id can be extracted.
+func TestListener_ErrorPublishJobFailed(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "err-node-1",
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	dispatchTopic := mqtt.MachineDispatchTopic("err-node-1")
+
+	// 1. Malformed JSON with job_id
+	malformed := []byte(`{"job_id": "job-bad-json-1", "command": `)
+	mockClient.Publish(dispatchTopic, 1, false, malformed)
+
+	time.Sleep(50 * time.Millisecond)
+
+	var failedJob *model.Job
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == mqtt.JobStatusTopic("err-node-1", "job-bad-json-1") {
+			var j model.Job
+			if err := json.Unmarshal(m.Payload, &j); err == nil {
+				failedJob = &j
+			}
+		}
+	}
+	if failedJob == nil {
+		t.Fatalf("expected job status failed published for malformed JSON with job_id")
+	}
+	if failedJob.Status != model.StatusFailed {
+		t.Errorf("expected status failed, got %s", failedJob.Status)
+	}
+	if !strings.Contains(failedJob.Error, "rejected malformed dispatch payload") {
+		t.Errorf("expected malformed payload error, got %s", failedJob.Error)
+	}
+
+	// 2. Empty command with job_id
+	emptyCmd := model.DispatchCommand{
+		CommandID: "cmd-empty-2",
+		JobID:     "job-empty-cmd-2",
+		Command:   "",
+		Args:      []string{},
+	}
+	pEmpty, _ := json.Marshal(emptyCmd)
+	mockClient.Publish(dispatchTopic, 1, false, pEmpty)
+
+	time.Sleep(50 * time.Millisecond)
+
+	var emptyFailedJob *model.Job
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == mqtt.JobStatusTopic("err-node-1", "job-empty-cmd-2") {
+			var j model.Job
+			if err := json.Unmarshal(m.Payload, &j); err == nil {
+				emptyFailedJob = &j
+			}
+		}
+	}
+	if emptyFailedJob == nil {
+		t.Fatalf("expected job status failed published for empty command")
+	}
+	if emptyFailedJob.Status != model.StatusFailed {
+		t.Errorf("expected status failed, got %s", emptyFailedJob.Status)
+	}
+	if !strings.Contains(emptyFailedJob.Error, "rejected invalid dispatch: command is empty") {
+		t.Errorf("expected empty command error, got %s", emptyFailedJob.Error)
+	}
+}
+
+// TestListener_QueuedStatusAndJobCount tests Important #5:
+// Incoming command immediately triggers queued status, and job_count reflects running + queued.
+func TestListener_QueuedStatusAndJobCount(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "queue-node-1",
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	dispatchTopic := mqtt.MachineDispatchTopic("queue-node-1")
+	cmd := model.DispatchCommand{
+		CommandID: "cmd-q-1",
+		JobID:     "job-q-1",
+		Engine:    model.EngineAgy,
+		Command:   "agy",
+		Args:      []string{"run", "--prompt", "test"},
+		Title:     "Queue test",
+	}
+	p, _ := json.Marshal(cmd)
+	mockClient.Publish(dispatchTopic, 1, false, p)
+
+	time.Sleep(100 * time.Millisecond)
+
+	var queuedJob *model.Job
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == mqtt.JobStatusTopic("queue-node-1", "job-q-1") {
+			var j model.Job
+			if err := json.Unmarshal(m.Payload, &j); err == nil && j.Status == model.StatusQueued {
+				queuedJob = &j
+			}
+		}
+	}
+	if queuedJob == nil {
+		t.Fatalf("expected queued job status to be published")
+	}
+	if queuedJob.Status != model.StatusQueued {
+		t.Errorf("expected queued status, got %s", queuedJob.Status)
+	}
+}

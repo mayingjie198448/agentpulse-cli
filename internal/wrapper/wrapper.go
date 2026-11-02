@@ -66,6 +66,7 @@ type Config struct {
 	Quiet             bool
 	Env               map[string]string
 	KeepMachineOnline bool
+	StartedAt         time.Time
 	OnMQTTConnected   func()
 	OnExecute         func(cmdStr string)
 }
@@ -131,6 +132,9 @@ func New(cfg Config) (*Wrapper, error) {
 	}
 
 	now := time.Now().UTC()
+	if !cfg.StartedAt.IsZero() && now.Before(cfg.StartedAt) {
+		now = cfg.StartedAt
+	}
 	machine := model.Machine{
 		ID:            cfg.MachineID,
 		Name:          cfg.MachineName,
@@ -215,7 +219,9 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		if w.mqttClient != nil && w.mqttClient.IsConnected() {
 			w.publishJobStatus()
 			w.publishAlert()
-			w.publishMachineStatus()
+			if !w.cfg.KeepMachineOnline {
+				w.publishMachineStatus()
+			}
 
 			if w.ownsMQTT {
 				w.mqttClient.Disconnect(100)
@@ -231,7 +237,9 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 
 	// Publish initial MQTT states if connected
 	if w.mqttClient != nil && w.mqttClient.IsConnected() {
-		w.publishMachineStatus()
+		if !w.cfg.KeepMachineOnline {
+			w.publishMachineStatus()
+		}
 		w.publishJobStatus()
 	}
 
@@ -349,7 +357,9 @@ func (w *Wrapper) heartbeatLoop() {
 			w.job.UpdatedAt = now
 			w.mu.Unlock()
 
-			w.publishMachineStatus()
+			if !w.cfg.KeepMachineOnline {
+				w.publishMachineStatus()
+			}
 			_ = w.writeStatusFile()
 		}
 	}

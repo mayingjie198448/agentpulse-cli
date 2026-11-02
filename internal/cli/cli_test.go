@@ -496,6 +496,30 @@ func TestDispatchCommand(t *testing.T) {
 			t.Errorf("expected no false connected banner, got: %s", out)
 		}
 	})
+
+	// 5. Flags --timeout-seconds and --wait-timeout are accepted
+	t.Run("timeout flags accepted", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"dispatch",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"--machine", "box-1",
+			"--timeout-seconds", "1800",
+			"--wait-timeout", "60",
+			"--", "agy", "-p", "test",
+		})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected connection error, got nil")
+		}
+		if strings.Contains(err.Error(), "unknown flag") {
+			t.Errorf("unexpected flag error: %v", err)
+		}
+	})
 }
 
 func TestListenCommand(t *testing.T) {

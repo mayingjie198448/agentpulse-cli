@@ -20,9 +20,10 @@ func newDispatchCmd() *cobra.Command {
 		jobID          string
 		engine         string
 		cwd            string
-		title          string
-		timeoutSeconds int
-		requestedBy    string
+		title              string
+		timeoutSeconds     int
+		waitTimeoutSeconds int
+		requestedBy        string
 		envFlags       []string
 		commandFlag    string
 		argFlags       []string
@@ -133,22 +134,23 @@ Examples:
 			pMQTT := &mqttCfg
 
 			cfg := dispatch.Config{
-				MachineID:      machineID,
-				JobID:          jobID,
-				Engine:         engType,
-				Cwd:            cwd,
-				Command:        finalCmd,
-				Args:           finalArgs,
-				Title:          title,
-				TimeoutSeconds: timeoutSeconds,
-				Env:            envMap,
-				RequestedBy:    requestedBy,
-				Wait:           waitFlag,
-				Follow:         followFlag,
-				Quiet:          quiet,
-				MQTT:           pMQTT,
-				Out:            out,
-				ErrOut:         errOut,
+				MachineID:          machineID,
+				JobID:              jobID,
+				Engine:             engType,
+				Cwd:                cwd,
+				Command:            finalCmd,
+				Args:               finalArgs,
+				Title:              title,
+				TimeoutSeconds:     timeoutSeconds,
+				WaitTimeoutSeconds: waitTimeoutSeconds,
+				Env:                envMap,
+				RequestedBy:        requestedBy,
+				Wait:               waitFlag,
+				Follow:             followFlag,
+				Quiet:              quiet,
+				MQTT:               pMQTT,
+				Out:                out,
+				ErrOut:             errOut,
 			}
 
 			_, err := dispatch.Dispatch(ctx, cfg)
@@ -164,7 +166,8 @@ Examples:
 	dispatchCmd.Flags().StringVar(&engine, "engine", "", "Agent engine type ('agy' or 'opencode')")
 	dispatchCmd.Flags().StringVar(&cwd, "cwd", "", "Remote target working directory")
 	dispatchCmd.Flags().StringVar(&title, "title", "", "Job title or summary description")
-	dispatchCmd.Flags().IntVar(&timeoutSeconds, "timeout-seconds", 0, "Execution timeout in seconds (0 for no timeout)")
+	dispatchCmd.Flags().IntVar(&timeoutSeconds, "timeout-seconds", 0, "Remote job execution timeout in seconds (0 for no limit)")
+	dispatchCmd.Flags().IntVar(&waitTimeoutSeconds, "wait-timeout", 0, "Local wait wall-clock timeout in seconds (0 for no limit)")
 	dispatchCmd.Flags().StringVar(&requestedBy, "requested-by", "", "Dispatcher identity tag (default: $USER@hostname)")
 	dispatchCmd.Flags().StringSliceVarP(&envFlags, "env", "e", nil, "Environment variables for remote job (key=value, repeatable)")
 	dispatchCmd.Flags().StringVar(&commandFlag, "command", "", "Executable command to invoke")

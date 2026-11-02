@@ -187,9 +187,11 @@ By default, missing binaries fail explicitly (never silently stubbed). Passing `
 
 - **Topic**: Publishes to `agentpulse/v1/machines/{machine_id}/commands/dispatch` with QoS 1, Retained `false`.
 - **Payload**: Includes `command_id`, `job_id`, `engine`, `cwd`, `command`, `args`, `title`, `timeout_seconds`, `env`, `requested_by`, and `timestamp` (RFC 3339).
-- **Progress Tracking**:
-  - `--wait`: Subscribes to the job's status topic, prints status and progress updates, and exits non-zero if the job fails or times out.
+- **Progress Tracking & Timeouts**:
+  - `--wait`: Subscribes to the job's status topic, prints status and progress updates, and exits non-zero if the job fails or wait times out.
   - `--follow`: Streams real-time stdout/stderr logs in addition to waiting for completion.
+  - `--timeout-seconds <sec>`: Remote job execution timeout (passed in dispatch payload; remote daemon enforces this).
+  - `--wait-timeout <sec>`: Local wait wall-clock timeout in seconds (0 for no limit; stops local waiting without killing the remote job).
 
 ```bash
 # Dispatch command to target machine:
@@ -201,8 +203,8 @@ By default, missing binaries fail explicitly (never silently stubbed). Passing `
 # Dispatch with wait and real-time log streaming:
 ./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --follow -- agy -p "Run test suite"
 
-# Dispatch with timeout and environment variables:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --timeout-seconds 1800 -e ENV=production_test --wait -- agy -p "Verify migrations"
+# Dispatch with remote execution timeout and local wait wall-clock timeout:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --timeout-seconds 1800 --wait-timeout 600 -e ENV=production_test --wait -- agy -p "Verify migrations"
 ```
 
 ---

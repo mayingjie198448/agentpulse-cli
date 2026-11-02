@@ -42,12 +42,14 @@ type mockMQTTClient struct {
 	mu            sync.Mutex
 	connected     bool
 	published     []publishedMsg
+	retained      map[string]publishedMsg
 	subscriptions map[string]paho.MessageHandler
 }
 
 func newMockMQTTClient() *mockMQTTClient {
 	return &mockMQTTClient{
 		connected:     true,
+		retained:      make(map[string]publishedMsg),
 		subscriptions: make(map[string]paho.MessageHandler),
 	}
 }
@@ -72,12 +74,20 @@ func (m *mockMQTTClient) Publish(topic string, qos byte, retained bool, payload 
 	default:
 		b = []byte(fmt.Sprintf("%v", p))
 	}
-	m.published = append(m.published, publishedMsg{
+	msgInfo := publishedMsg{
 		Topic:    topic,
 		QoS:      qos,
 		Retained: retained,
 		Payload:  b,
-	})
+	}
+	m.published = append(m.published, msgInfo)
+	if retained {
+		if len(b) == 0 {
+			delete(m.retained, topic)
+		} else {
+			m.retained[topic] = msgInfo
+		}
+	}
 
 	var handlers []paho.MessageHandler
 	for filter, h := range m.subscriptions {
@@ -98,16 +108,38 @@ func (m *mockMQTTClient) Publish(topic string, qos byte, retained bool, payload 
 func (m *mockMQTTClient) Subscribe(topic string, qos byte, callback paho.MessageHandler) paho.Token {
 	m.mu.Lock()
 	m.subscriptions[topic] = callback
+	var retainedToDeliver []publishedMsg
+	for retTopic, msg := range m.retained {
+		if retTopic == topic || topic == "#" {
+			retainedToDeliver = append(retainedToDeliver, msg)
+		}
+	}
 	m.mu.Unlock()
+
+	for _, msg := range retainedToDeliver {
+		callback(m, &mockPahoMessage{topic: msg.Topic, payload: msg.Payload, retained: true, qos: msg.QoS})
+	}
+
 	return &mockToken{}
 }
 
 func (m *mockMQTTClient) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) paho.Token {
 	m.mu.Lock()
+	var retainedToDeliver []publishedMsg
 	for filter := range filters {
 		m.subscriptions[filter] = callback
+		for retTopic, msg := range m.retained {
+			if retTopic == filter || filter == "#" {
+				retainedToDeliver = append(retainedToDeliver, msg)
+			}
+		}
 	}
 	m.mu.Unlock()
+
+	for _, msg := range retainedToDeliver {
+		callback(m, &mockPahoMessage{topic: msg.Topic, payload: msg.Payload, retained: true, qos: msg.QoS})
+	}
+
 	return &mockToken{}
 }
 
@@ -394,20 +426,202 @@ func TestDispatch_Wait_Timeout(t *testing.T) {
 	errBuf := new(bytes.Buffer)
 
 	_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
-		MachineID:      "silent-node",
-		JobID:          "job-timeout-1",
-		Command:        "agy",
-		Wait:           true,
-		TimeoutSeconds: 1, // 1s timeout
-		MQTTClient:     mockClient,
-		Out:            outBuf,
-		ErrOut:         errBuf,
+		MachineID:          "silent-node",
+		JobID:              "job-timeout-1",
+		Command:            "agy",
+		Wait:               true,
+		WaitTimeoutSeconds: 1,    // 1s local wait wall-clock timeout
+		TimeoutSeconds:     3600, // remote timeout in payload
+		MQTTClient:         mockClient,
+		Out:                outBuf,
+		ErrOut:             errBuf,
 	})
 	if err == nil {
 		t.Fatalf("expected timeout error, got nil")
 	}
 	if !strings.Contains(err.Error(), "timed out after 1s") {
 		t.Errorf("expected timeout error, got %v", err)
+	}
+
+	// Verify remote payload received TimeoutSeconds: 3600
+	var foundPayload *model.DispatchCommand
+	for _, m := range mockClient.published {
+		if m.Topic == mqtt.MachineDispatchTopic("silent-node") {
+			var cmd model.DispatchCommand
+			if err := json.Unmarshal(m.Payload, &cmd); err == nil {
+				foundPayload = &cmd
+			}
+		}
+	}
+	if foundPayload == nil {
+		t.Fatalf("expected dispatch payload published")
+	}
+	if foundPayload.TimeoutSeconds != 3600 {
+		t.Errorf("expected payload TimeoutSeconds 3600, got %d", foundPayload.TimeoutSeconds)
+	}
+}
+
+// TestDispatch_Wait_IgnoresStaleRetainedTerminalStatus regression tests C1:
+// An old retained "done" message from a previous run on the job status topic
+// must NOT cause dispatch --wait to succeed immediately; it must wait for the new run.
+func TestDispatch_Wait_IgnoresStaleRetainedTerminalStatus(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	outBuf := new(bytes.Buffer)
+	errBuf := new(bytes.Buffer)
+
+	machineID := "retained-test-node"
+	jobID := "reused-job-001"
+	statusTopic := mqtt.JobStatusTopic(machineID, jobID)
+
+	// 1. Publish an old retained "done" status to the topic (timestamp 10 minutes ago)
+	oldDoneTime := time.Now().UTC().Add(-10 * time.Minute)
+	oldJob := model.Job{
+		ID:          jobID,
+		MachineID:   machineID,
+		Engine:      model.EngineAgy,
+		Status:      model.StatusDone,
+		Progress:    100.0,
+		StartedAt:   oldDoneTime.Add(-1 * time.Minute),
+		UpdatedAt:   oldDoneTime,
+		DurationStr: "1m",
+	}
+	oldPayload, _ := json.Marshal(oldJob)
+	mockClient.Publish(statusTopic, 1, true, oldPayload)
+
+	newRunFinished := make(chan struct{})
+
+	// 2. Simulate listener responding to the new dispatch
+	dispatchTopic := mqtt.MachineDispatchTopic(machineID)
+	mockClient.Subscribe(dispatchTopic, 1, func(_ paho.Client, msg paho.Message) {
+		var cmd model.DispatchCommand
+		if err := json.Unmarshal(msg.Payload(), &cmd); err == nil && cmd.JobID == jobID {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				now := time.Now().UTC()
+				queuedJob := model.Job{
+					ID:        jobID,
+					MachineID: machineID,
+					Engine:    cmd.Engine,
+					Status:    model.StatusQueued,
+					StartedAt: now,
+					UpdatedAt: now,
+				}
+				pQueued, _ := json.Marshal(queuedJob)
+				mockClient.Publish(statusTopic, 1, true, pQueued)
+
+				time.Sleep(50 * time.Millisecond)
+				runningJob := queuedJob
+				runningJob.Status = model.StatusRunning
+				runningJob.Progress = 50.0
+				runningJob.UpdatedAt = time.Now().UTC()
+				pRunning, _ := json.Marshal(runningJob)
+				mockClient.Publish(statusTopic, 1, true, pRunning)
+
+				time.Sleep(50 * time.Millisecond)
+				doneJob := runningJob
+				doneJob.Status = model.StatusDone
+				doneJob.Progress = 100.0
+				doneJob.UpdatedAt = time.Now().UTC()
+				doneJob.DurationStr = "150ms"
+				pDone, _ := json.Marshal(doneJob)
+				mockClient.Publish(statusTopic, 1, true, pDone)
+				close(newRunFinished)
+			}()
+		}
+	})
+
+	startDispatch := time.Now()
+	cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+		MachineID:          machineID,
+		JobID:              jobID,
+		Command:            "agy",
+		Wait:               true,
+		WaitTimeoutSeconds: 5,
+		MQTTClient:         mockClient,
+		Out:                outBuf,
+		ErrOut:             errBuf,
+	})
+	if err != nil {
+		t.Fatalf("expected dispatch to succeed, got %v", err)
+	}
+	if cmd == nil || cmd.JobID != jobID {
+		t.Fatalf("unexpected dispatch result: %+v", cmd)
+	}
+
+	elapsed := time.Since(startDispatch)
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("dispatch returned too quickly (%v), indicating it consumed stale retained status instead of waiting for new run", elapsed)
+	}
+
+	select {
+	case <-newRunFinished:
+	default:
+		t.Fatalf("new run was not completed when dispatch returned")
+	}
+
+	outStr := outBuf.String()
+	if !strings.Contains(outStr, "Job reused-job-001 status: queued") {
+		t.Errorf("expected queued status in output, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "Job reused-job-001 completed successfully in 150ms") {
+		t.Errorf("expected new run completion in output, got: %s", outStr)
+	}
+}
+
+// TestDispatch_Wait_StatusChannelSaturationDoesNotDropDone tests Important #2:
+// Flooding status updates does not silently drop terminal done status.
+func TestDispatch_Wait_StatusChannelSaturationDoesNotDropDone(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	outBuf := new(bytes.Buffer)
+	errBuf := new(bytes.Buffer)
+
+	machineID := "saturate-node"
+	jobID := "job-saturate-1"
+	statusTopic := mqtt.JobStatusTopic(machineID, jobID)
+	dispatchTopic := mqtt.MachineDispatchTopic(machineID)
+
+	mockClient.Subscribe(dispatchTopic, 1, func(_ paho.Client, msg paho.Message) {
+		go func() {
+			// Rapidly send 50 progress updates (exceeding channel capacity of 32)
+			for i := 1; i <= 50; i++ {
+				j := model.Job{
+					ID:        jobID,
+					MachineID: machineID,
+					Status:    model.StatusRunning,
+					Progress:  float64(i),
+					StartedAt: time.Now().UTC(),
+					UpdatedAt: time.Now().UTC(),
+				}
+				data, _ := json.Marshal(j)
+				mockClient.Publish(statusTopic, 1, false, data)
+			}
+			// Immediately publish done
+			doneJob := model.Job{
+				ID:          jobID,
+				MachineID:   machineID,
+				Status:      model.StatusDone,
+				Progress:    100.0,
+				StartedAt:   time.Now().UTC(),
+				UpdatedAt:   time.Now().UTC(),
+				DurationStr: "1s",
+			}
+			data, _ := json.Marshal(doneJob)
+			mockClient.Publish(statusTopic, 1, true, data)
+		}()
+	})
+
+	_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+		MachineID:          machineID,
+		JobID:              jobID,
+		Command:            "agy",
+		Wait:               true,
+		WaitTimeoutSeconds: 5,
+		MQTTClient:         mockClient,
+		Out:                outBuf,
+		ErrOut:             errBuf,
+	})
+	if err != nil {
+		t.Fatalf("expected dispatch to complete successfully despite channel saturation, got: %v", err)
 	}
 }
 
