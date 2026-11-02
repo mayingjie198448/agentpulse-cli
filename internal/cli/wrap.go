@@ -149,6 +149,16 @@ Examples:
 				MirrorStderr:      os.Stderr,
 				Stub:              stub,
 				Quiet:             quiet,
+				OnMQTTConnected: func() {
+					if !quiet && pMQTT != nil {
+						fmt.Fprintf(out, "[agentpulse] Connected to MQTT broker %s (telemetry & logs active)\n", pMQTT.BrokerURL)
+					}
+				},
+				OnExecute: func(cmdStr string) {
+					if !quiet && cmdStr != "" {
+						fmt.Fprintf(out, "[agentpulse] Executing: %s\n\n", cmdStr)
+					}
+				},
 			})
 			if err != nil {
 				return fmt.Errorf("failed to initialize wrapper: %w", err)
@@ -158,12 +168,9 @@ Examples:
 				fmt.Fprintf(out, "[agentpulse] Initialized job %s on node %s\n", w.Job().ID, w.Machine().ID)
 				fmt.Fprintf(out, "[agentpulse] Local status snapshot: %s\n", statusFile)
 				if pMQTT != nil {
-					fmt.Fprintf(out, "[agentpulse] Connected to MQTT broker %s (telemetry & logs active)\n", pMQTT.BrokerURL)
+					fmt.Fprintf(out, "[agentpulse] Connecting to MQTT broker %s...\n", pMQTT.BrokerURL)
 				} else {
 					fmt.Fprintln(out, "[agentpulse] Running in local mode (no MQTT broker configured)")
-				}
-				if len(args) > 0 {
-					fmt.Fprintf(out, "[agentpulse] Executing: %s\n\n", strings.Join(args, " "))
 				}
 			}
 

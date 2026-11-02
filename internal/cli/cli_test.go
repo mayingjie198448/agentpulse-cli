@@ -304,6 +304,17 @@ func TestWrapCommand(t *testing.T) {
 			t.Fatalf("expected wrap to fail on unreachable broker, got nil")
 		}
 
+		out := buf.String()
+		if !strings.Contains(out, "Connecting to MQTT broker tcp://127.0.0.1:18833...") {
+			t.Errorf("expected 'Connecting to MQTT broker' banner, got: %s", out)
+		}
+		if strings.Contains(out, "Connected to MQTT broker") {
+			t.Errorf("expected no false 'Connected to MQTT broker' banner, got: %s", out)
+		}
+		if strings.Contains(out, "Executing:") {
+			t.Errorf("expected no 'Executing:' banner when MQTT setup fails, got: %s", out)
+		}
+
 		data, err := os.ReadFile(statusFile)
 		if err != nil {
 			t.Fatalf("failed to read status file: %v", err)

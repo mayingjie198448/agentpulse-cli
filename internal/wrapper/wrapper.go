@@ -63,6 +63,8 @@ type Config struct {
 	MirrorStderr      io.Writer
 	Stub              bool
 	Quiet             bool
+	OnMQTTConnected   func()
+	OnExecute         func(cmdStr string)
 }
 
 // Wrapper is the thin local process managing local agent execution, local status writing,
@@ -227,6 +229,14 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		go w.heartbeatLoop()
 	}
 
+	if w.cfg.OnExecute != nil {
+		if w.cfg.Stub {
+			w.cfg.OnExecute(fmt.Sprintf("%s (stub)", w.cfg.Engine))
+		} else if len(w.cfg.Args) > 0 {
+			w.cfg.OnExecute(strings.Join(w.cfg.Args, " "))
+		}
+	}
+
 	// Execute command or stub
 	if w.cfg.Stub {
 		runErr = w.runStub(ctx)
@@ -242,6 +252,9 @@ func (w *Wrapper) setupMQTT() error {
 	if w.cfg.MQTTClient != nil {
 		w.mqttClient = w.cfg.MQTTClient
 		w.ownsMQTT = false
+		if w.cfg.OnMQTTConnected != nil {
+			w.cfg.OnMQTTConnected()
+		}
 		return nil
 	}
 
@@ -292,6 +305,9 @@ func (w *Wrapper) setupMQTT() error {
 
 	w.mqttClient = client
 	w.ownsMQTT = true
+	if w.cfg.OnMQTTConnected != nil {
+		w.cfg.OnMQTTConnected()
+	}
 	return nil
 }
 
