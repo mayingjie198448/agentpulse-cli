@@ -1,0 +1,11 @@
+# Binaries
+/agentpulse
+/agentpulse.exe
+*.exe
+*.test
+*.prof
+
+# OS & Editor
+.DS_Store
+.idea/
+.vscode/
