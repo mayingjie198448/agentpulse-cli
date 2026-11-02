@@ -124,7 +124,7 @@ flowchart TD
   "online": true,
   "last_heartbeat": "2026-11-02T13:30:00Z",
   "platform": "darwin/arm64",
-  "ip": "100.98.12.34",
+  "ip": "192.0.2.10",
   "job_count": 2
 }
 ```
@@ -137,7 +137,7 @@ flowchart TD
   "online": false,
   "last_heartbeat": "2026-11-02T13:30:45Z",
   "platform": "darwin/arm64",
-  "ip": "100.98.12.34",
+  "ip": "192.0.2.10",
   "job_count": 0
 }
 ```
@@ -411,7 +411,7 @@ flowchart LR
    - CLI 客户端与 Thin Wrapper 配置文件中预留认证配置块：
      ```yaml
      mqtt:
-       broker: "tcp://100.98.0.1:1883" # 支持 tls://100.98.0.1:8883
+       broker: "tcp://broker.example:1883" # 支持 tls://broker.example:8883
        client_id: "agentpulse-cli-mayingjie"
        username: "agentpulse_user"     # 鉴权占位符，默认留空支持匿名
        password: "secret_token_here"   # 鉴权占位符，默认留空支持匿名

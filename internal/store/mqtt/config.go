@@ -9,7 +9,7 @@ import (
 
 // Config configures the MQTT Store client connection and runtime buffers.
 type Config struct {
-	BrokerURL              string        // e.g. "tcp://100.98.0.1:1883"
+	BrokerURL              string        // e.g. "tcp://broker.example:1883"
 	ClientID               string        // Client identifier; auto-generated if empty
 	Username               string        // Optional MQTT broker username
 	Password               string        // Optional MQTT broker password

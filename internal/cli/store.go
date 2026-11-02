@@ -15,7 +15,7 @@ import (
 
 func registerStoreFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().String("store", "", "Data store backend ('mock' or 'mqtt', default: 'mock')")
-	cmd.PersistentFlags().String("mqtt-url", "", "MQTT broker URL (e.g. tcp://100.98.0.1:1883 or $AGENTPULSE_MQTT_URL)")
+	cmd.PersistentFlags().String("mqtt-url", "", "MQTT broker URL (e.g. tcp://broker.example:1883 or $AGENTPULSE_MQTT_URL)")
 	cmd.PersistentFlags().String("mqtt-client-id", "", "MQTT client ID (or $AGENTPULSE_MQTT_CLIENT_ID)")
 	cmd.PersistentFlags().String("mqtt-username", "", "MQTT username (or $AGENTPULSE_MQTT_USERNAME)")
 	cmd.PersistentFlags().String("mqtt-password", "", "MQTT password (or $AGENTPULSE_MQTT_PASSWORD)")

@@ -33,7 +33,7 @@ func TestMQTTStore_RetainedMachines(t *testing.T) {
 	}
 
 	// 1. Deliver retained message for mac-studio-m2 (online)
-	macPayload := `{"id":"mac-studio-m2","name":"Mac Studio M2 Max","online":true,"platform":"darwin/arm64","job_count":2,"ip":"100.98.12.34"}`
+	macPayload := `{"id":"mac-studio-m2","name":"Mac Studio M2 Max","online":true,"platform":"darwin/arm64","job_count":2,"ip":"192.0.2.10"}`
 	fakeClient.Deliver("agentpulse/v1/machines/mac-studio-m2/status", []byte(macPayload), true)
 
 	machines, err = st.ListMachines(ctx)

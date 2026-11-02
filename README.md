@@ -139,7 +139,7 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 ./agentpulse doctor
 
 # Check connection intent to a live MQTT broker:
-./agentpulse doctor --mqtt-url tcp://100.98.0.1:1883
+./agentpulse doctor --mqtt-url tcp://broker.example:1883
 ```
 
 ---
@@ -150,11 +150,11 @@ All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling
 
 ```bash
 # 1. Run against a live MQTT broker via CLI flag:
-./agentpulse watch --mqtt-url tcp://100.98.0.1:1883
-./agentpulse list --mqtt-url tcp://100.98.0.1:1883 --mqtt-settle-timeout 200ms
+./agentpulse watch --mqtt-url tcp://broker.example:1883
+./agentpulse list --mqtt-url tcp://broker.example:1883 --mqtt-settle-timeout 200ms
 
 # 2. Or configure via environment variables:
-export AGENTPULSE_MQTT_URL="tcp://100.98.0.1:1883"
+export AGENTPULSE_MQTT_URL="tcp://broker.example:1883"
 export AGENTPULSE_MQTT_USERNAME="agentpulse_user"          # optional
 export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional
 export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained settle window
