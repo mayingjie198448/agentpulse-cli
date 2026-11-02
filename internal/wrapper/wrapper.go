@@ -173,13 +173,51 @@ func (w *Wrapper) Job() model.Job {
 }
 
 // Run executes the wrapped process or stub, writes local status, and publishes MQTT telemetry.
-func (w *Wrapper) Run(ctx context.Context) error {
-	// Write initial local status
+func (w *Wrapper) Run(ctx context.Context) (runErr error) {
+	// Write initial local status snapshot (status: running, online: true, job_count: 1)
 	_ = w.writeStatusFile()
+
+	defer func() {
+		// Stop heartbeat loop
+		w.stopHeartbeatLoop()
+
+		// Finalize job and machine status
+		w.mu.Lock()
+		finishTime := time.Now().UTC()
+		w.job.UpdatedAt = finishTime
+		w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
+		if runErr != nil {
+			w.job.Status = model.StatusFailed
+			w.job.Error = runErr.Error()
+		} else {
+			w.job.Status = model.StatusDone
+			w.job.Progress = 100.0
+			w.job.Error = ""
+		}
+		w.machine.Online = false
+		w.machine.JobCount = 0
+		w.machine.LastHeartbeat = finishTime
+		w.mu.Unlock()
+
+		// Write final local status snapshot to disk so status never stays running
+		_ = w.writeStatusFile()
+
+		// Final MQTT publications if connected
+		if w.mqttClient != nil && w.mqttClient.IsConnected() {
+			w.publishJobStatus()
+			w.publishAlert()
+			w.publishMachineStatus()
+
+			if w.ownsMQTT {
+				w.mqttClient.Disconnect(100)
+			}
+		}
+	}()
 
 	// Setup MQTT if configured
 	if err := w.setupMQTT(); err != nil {
-		return fmt.Errorf("MQTT setup failed: %w", err)
+		runErr = fmt.Errorf("MQTT setup failed: %w", err)
+		return runErr
 	}
 
 	// Publish initial MQTT states if connected
@@ -190,48 +228,13 @@ func (w *Wrapper) Run(ctx context.Context) error {
 	}
 
 	// Execute command or stub
-	var execErr error
 	if w.cfg.Stub {
-		execErr = w.runStub(ctx)
+		runErr = w.runStub(ctx)
 	} else {
-		execErr = w.runProcess(ctx)
+		runErr = w.runProcess(ctx)
 	}
 
-	// Stop heartbeat loop
-	w.stopHeartbeatLoop()
-
-	// Update final job state
-	w.mu.Lock()
-	finishTime := time.Now().UTC()
-	w.job.UpdatedAt = finishTime
-	w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
-	if execErr != nil {
-		w.job.Status = model.StatusFailed
-		w.job.Error = execErr.Error()
-	} else {
-		w.job.Status = model.StatusDone
-		w.job.Progress = 100.0
-		w.job.Error = ""
-	}
-	w.machine.JobCount = 0
-	w.machine.LastHeartbeat = finishTime
-	w.mu.Unlock()
-
-	// Write final local status
-	_ = w.writeStatusFile()
-
-	// Final MQTT publications
-	if w.mqttClient != nil && w.mqttClient.IsConnected() {
-		w.publishJobStatus()
-		w.publishAlert()
-		w.publishMachineStatus()
-
-		if w.ownsMQTT {
-			w.mqttClient.Disconnect(100)
-		}
-	}
-
-	return execErr
+	return runErr
 }
 
 // setupMQTT establishes MQTT connection if configured.

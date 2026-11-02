@@ -416,6 +416,74 @@ func TestWrapper_StubExecution(t *testing.T) {
 	}
 }
 
+func TestWrapper_MQTTConnectFailure_StatusFailed(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "mqtt-fail-status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "mqtt-fail-node",
+		JobID:      "job-mqtt-fail-01",
+		Engine:     model.EngineAgy,
+		Title:      "MQTT connect failure test",
+		Args:       []string{"echo", "should not run"},
+		StatusFile: statusFile,
+		MQTT: &mqtt.Config{
+			BrokerURL: "tcp://127.0.0.1:18833", // Unopened port
+			Timeout:   100 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = w.Run(ctx)
+	if err == nil {
+		t.Fatalf("expected error from MQTT connect failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "MQTT") {
+		t.Errorf("expected MQTT error message, got: %v", err)
+	}
+
+	// Verify job status failed in memory
+	job := w.Job()
+	if job.Status != model.StatusFailed {
+		t.Errorf("expected job status failed, got %s", job.Status)
+	}
+	if job.Error == "" {
+		t.Errorf("expected non-empty error in job")
+	}
+
+	// Verify machine status offline in memory
+	mach := w.Machine()
+	if mach.Online {
+		t.Errorf("expected machine to be offline on failure")
+	}
+	if mach.JobCount != 0 {
+		t.Errorf("expected machine job count 0, got %d", mach.JobCount)
+	}
+
+	// Verify status file recorded failure and offline status (never stuck at running)
+	st, err := wrapper.ReadLocalStatus(statusFile)
+	if err != nil {
+		t.Fatalf("failed to read status file: %v", err)
+	}
+	if st.Job.Status != model.StatusFailed {
+		t.Errorf("expected status file status failed, got %s", st.Job.Status)
+	}
+	if !strings.Contains(st.Job.Error, "MQTT") {
+		t.Errorf("expected status file error to mention MQTT, got: %s", st.Job.Error)
+	}
+	if st.Machine.Online {
+		t.Errorf("expected status file machine online to be false")
+	}
+	if st.Machine.JobCount != 0 {
+		t.Errorf("expected status file job count to be 0, got %d", st.Machine.JobCount)
+	}
+}
+
 func TestWrapper_MQTT_Publishing(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	tmpDir := t.TempDir()
@@ -450,6 +518,7 @@ func TestWrapper_MQTT_Publishing(t *testing.T) {
 
 	// Verify required topics were published
 	var foundMachineStatus, foundJobStatus, foundJobLog, foundAlert bool
+	var foundMachineOnline, foundMachineOffline bool
 	var finalJobStatusDone bool
 
 	for _, msg := range published {
@@ -461,6 +530,12 @@ func TestWrapper_MQTT_Publishing(t *testing.T) {
 			}
 			if msg.QoS != 1 {
 				t.Errorf("machine status must have QoS 1, got %d", msg.QoS)
+			}
+			if strings.Contains(string(msg.Payload), `"online":true`) || strings.Contains(string(msg.Payload), `"online": true`) {
+				foundMachineOnline = true
+			}
+			if strings.Contains(string(msg.Payload), `"online":false`) || strings.Contains(string(msg.Payload), `"online": false`) {
+				foundMachineOffline = true
 			}
 		case msg.Topic == "agentpulse/v1/machines/mqtt-worker/jobs/job-mqtt-01/status":
 			foundJobStatus = true
@@ -497,6 +572,12 @@ func TestWrapper_MQTT_Publishing(t *testing.T) {
 
 	if !foundMachineStatus {
 		t.Errorf("expected machine status topic to be published")
+	}
+	if !foundMachineOnline {
+		t.Errorf("expected initial machine status with online:true")
+	}
+	if !foundMachineOffline {
+		t.Errorf("expected final machine status with online:false")
 	}
 	if !foundJobStatus {
 		t.Errorf("expected job status topic to be published")
@@ -551,7 +632,7 @@ func TestWrapper_IntegrationWithMQTTStore(t *testing.T) {
 		t.Fatalf("wrapper.Run failed: %v", err)
 	}
 
-	// 1. Verify store.ListMachines sees our machine
+	// 1. Verify store.ListMachines sees our machine (marked offline after clean exit)
 	machines, err := store.ListMachines(ctx)
 	if err != nil {
 		t.Fatalf("ListMachines failed: %v", err)
@@ -560,8 +641,11 @@ func TestWrapper_IntegrationWithMQTTStore(t *testing.T) {
 	for _, m := range machines {
 		if m.ID == "mac-studio-integ" {
 			foundMachine = true
-			if !m.Online {
-				t.Errorf("expected machine to be marked online")
+			if m.Online {
+				t.Errorf("expected machine to be marked offline after clean exit")
+			}
+			if m.JobCount != 0 {
+				t.Errorf("expected machine job count 0, got %d", m.JobCount)
 			}
 		}
 	}

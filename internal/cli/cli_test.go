@@ -279,6 +279,42 @@ func TestWrapCommand(t *testing.T) {
 			t.Errorf("expected status 'done' in status file: %s", string(data))
 		}
 	})
+
+	// 6. MQTT connect failure marks status failed (never stuck at running)
+	t.Run("mqtt connect failure sets status failed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		statusFile := filepath.Join(tmpDir, "mqtt-fail-cli-status.json")
+
+		os.Setenv("AGENTPULSE_MQTT_TIMEOUT", "100ms")
+		defer os.Unsetenv("AGENTPULSE_MQTT_TIMEOUT")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"wrap",
+			"--status-file", statusFile,
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"echo", "should not run",
+		})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected wrap to fail on unreachable broker, got nil")
+		}
+
+		data, err := os.ReadFile(statusFile)
+		if err != nil {
+			t.Fatalf("failed to read status file: %v", err)
+		}
+		if !strings.Contains(string(data), `"failed"`) {
+			t.Errorf("expected status 'failed' in status file: %s", string(data))
+		}
+		if !strings.Contains(string(data), `"online": false`) && !strings.Contains(string(data), `"online":false`) {
+			t.Errorf("expected online: false in status file: %s", string(data))
+		}
+	})
 }
 
 func TestStatusCommand(t *testing.T) {

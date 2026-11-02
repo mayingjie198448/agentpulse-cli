@@ -68,6 +68,11 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 			cfg.SettleTimeout = d
 		}
 	}
+	if env := os.Getenv("AGENTPULSE_MQTT_TIMEOUT"); env != "" {
+		if d, err := time.ParseDuration(env); err == nil {
+			cfg.Timeout = d
+		}
+	}
 
 	return cfg
 }
