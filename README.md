@@ -133,7 +133,9 @@ Retrieve historical logs or stream live events:
 
 ### 4. Thin Wrapper: Monitor Local Agent Runs (`wrap`)
 
-`agentpulse wrap` is a thin local process that executes an AI agent command (`agy`, or stubbed `opencode`), streams console output locally, writes local status snapshots (`.agentpulse/status.json`), and publishes real-time node heartbeats, job lifecycle transitions, and log streams to an MQTT broker per [MQTT Protocol Spec](docs/mqtt-protocol.md).
+`agentpulse wrap` is a thin local process that executes an AI agent command (`agy` or `opencode`), streams console output locally, writes local status snapshots (`.agentpulse/status.json`), and publishes real-time node heartbeats, job lifecycle transitions, and log streams to an MQTT broker per [MQTT Protocol Spec](docs/mqtt-protocol.md).
+
+By default, missing binaries fail explicitly (never silently stubbed). Passing `--stub` enables simulated execution for testing or automated CI without requiring the engine to be installed.
 
 > [!NOTE]
 > **Single-Machine Slice (Step 3)**:
@@ -151,13 +153,61 @@ Retrieve historical logs or stream live events:
 # Wrap agy and stream live telemetry to an MQTT broker:
 ./agentpulse wrap --mqtt-url tcp://broker.example:1883 -- agy --dangerously-skip-permissions -p "Run test suite"
 
-# Run simulated execution (e.g. for stubbed OpenCode or automated testing):
+# Run simulated execution (explicit --stub required for simulation):
 ./agentpulse wrap --engine opencode --stub
 ```
 
 ---
 
-### 5. Inspect Local Status (`status`)
+### 5. Edge Listener Daemon (`wrap --listen` / `listen`)
+
+`agentpulse wrap --listen` (or `agentpulse listen`) runs an edge worker daemon on a target machine that connects to an MQTT broker, registers node LWT and periodic heartbeats, subscribes to incoming dispatch commands, and executes jobs serially:
+
+- **Topic**: Subscribes to `agentpulse/v1/machines/{machine_id}/commands/dispatch` (QoS 1).
+- **Concurrency**: Jobs are processed sequentially via an internal serial queue (one job at a time) to prevent resource contention.
+- **Resilience**: Malformed or invalid payloads are rejected with clear local logs without crashing the daemon.
+- **Clean Shutdown**: On `Ctrl+C` (SIGINT/SIGTERM), the daemon stops accepting new commands, cancels any running job, publishes offline status (`online: false, job_count: 0`), and disconnects cleanly.
+
+```bash
+# Start edge listener on this machine:
+./agentpulse listen --mqtt-url tcp://broker.example:1883
+
+# Or via wrap --listen with explicit node identifier:
+./agentpulse wrap --listen --mqtt-url tcp://broker.example:1883 --machine mac-studio
+
+# Start listener with simulated execution mode for testing:
+./agentpulse listen --mqtt-url tcp://broker.example:1883 --machine linux-gpu --stub
+```
+
+---
+
+### 6. Remote Job Dispatch (`dispatch`)
+
+`agentpulse dispatch` sends a remote execution instruction to a target machine over MQTT per [MQTT Protocol Spec §4.4](docs/mqtt-protocol.md#44-派活指令-job-dispatch--command):
+
+- **Topic**: Publishes to `agentpulse/v1/machines/{machine_id}/commands/dispatch` with QoS 1, Retained `false`.
+- **Payload**: Includes `command_id`, `job_id`, `engine`, `cwd`, `command`, `args`, `title`, `timeout_seconds`, `env`, `requested_by`, and `timestamp` (RFC 3339).
+- **Progress Tracking**:
+  - `--wait`: Subscribes to the job's status topic, prints status and progress updates, and exits non-zero if the job fails or times out.
+  - `--follow`: Streams real-time stdout/stderr logs in addition to waiting for completion.
+
+```bash
+# Dispatch command to target machine:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio -- agy run --prompt "Refactor database pool"
+
+# Dispatch via explicit flags:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine linux-gpu --command opencode --arg run --arg "--prompt=Fine-tune model"
+
+# Dispatch with wait and real-time log streaming:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --follow -- agy -p "Run test suite"
+
+# Dispatch with timeout and environment variables:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --timeout-seconds 1800 -e ENV=production_test --wait -- agy -p "Verify migrations"
+```
+
+---
+
+### 7. Inspect Local Status (`status`)
 
 Inspects the latest local agent execution snapshot written by `agentpulse wrap`:
 
@@ -171,7 +221,7 @@ Inspects the latest local agent execution snapshot written by `agentpulse wrap`:
 
 ---
 
-### 6. Diagnostics (`doctor`)
+### 8. Diagnostics (`doctor`)
 
 Validates terminal capabilities, TTY detection, engine CLI presence, and transport readiness:
 
@@ -184,7 +234,7 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 
 ---
 
-### 7. Switching Backend (Mock ↔ MQTT)
+### 9. Switching Backend (Mock ↔ MQTT)
 
 All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling between mock simulation and a live MQTT broker:
 

@@ -3,6 +3,7 @@ package wrapper
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,6 +64,8 @@ type Config struct {
 	MirrorStderr      io.Writer
 	Stub              bool
 	Quiet             bool
+	Env               map[string]string
+	KeepMachineOnline bool
 	OnMQTTConnected   func()
 	OnExecute         func(cmdStr string)
 }
@@ -198,7 +201,9 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 			w.job.Progress = 100.0
 			w.job.Error = ""
 		}
-		w.machine.Online = false
+		if !w.cfg.KeepMachineOnline {
+			w.machine.Online = false
+		}
 		w.machine.JobCount = 0
 		w.machine.LastHeartbeat = finishTime
 		w.mu.Unlock()
@@ -384,6 +389,12 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, bin, w.cfg.Args[1:]...)
 	cmd.Dir = w.cfg.Cwd
+	if len(w.cfg.Env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range w.cfg.Env {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
 
 	stdoutWriter := newLineWriter(func(line string) {
 		w.handleOutputLine(line, false)
@@ -737,17 +748,23 @@ func (lw *lineWriter) Flush() {
 
 // Helpers for node and environment detection
 
-func detectMachineID() string {
+// DetectMachineID determines the node identifier from environment or hostname.
+func DetectMachineID() string {
 	if env := os.Getenv("AGENTPULSE_MACHINE_ID"); env != "" {
-		return sanitizeID(env)
+		return SanitizeID(env)
 	}
 	if host, err := os.Hostname(); err == nil && host != "" {
-		return sanitizeID(host)
+		return SanitizeID(host)
 	}
 	return "local-node"
 }
 
-func sanitizeID(s string) string {
+func detectMachineID() string {
+	return DetectMachineID()
+}
+
+// SanitizeID normalizes an identifier into lowercase alphanumeric and dash characters.
+func SanitizeID(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	reg := regexp.MustCompile(`[^a-z0-9_-]+`)
 	clean := reg.ReplaceAllString(s, "-")
@@ -758,7 +775,12 @@ func sanitizeID(s string) string {
 	return clean
 }
 
-func detectEngine(args []string) model.EngineType {
+func sanitizeID(s string) string {
+	return SanitizeID(s)
+}
+
+// DetectEngine checks command line arguments to determine if agy or opencode is being executed.
+func DetectEngine(args []string) model.EngineType {
 	if len(args) > 0 {
 		base := strings.ToLower(filepath.Base(args[0]))
 		if strings.Contains(base, "opencode") {
@@ -768,12 +790,32 @@ func detectEngine(args []string) model.EngineType {
 	return model.EngineAgy
 }
 
-func generateJobID(engine model.EngineType) string {
+func detectEngine(args []string) model.EngineType {
+	return DetectEngine(args)
+}
+
+// GenerateJobID generates a unique Job ID conforming to docs/mqtt-protocol.md §3.1.
+func GenerateJobID(engine model.EngineType) string {
 	now := time.Now().UTC()
 	return fmt.Sprintf("job-%s-%s-%04x", engine, now.Format("20060102-150405"), now.Nanosecond()%0x10000)
 }
 
-func inferTitle(args []string, command string) string {
+func generateJobID(engine model.EngineType) string {
+	return GenerateJobID(engine)
+}
+
+// GenerateCommandID generates a unique dispatch command UUID/ID.
+func GenerateCommandID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		now := time.Now().UTC()
+		return fmt.Sprintf("cmd-%s-%04x", now.Format("20060102-150405"), now.Nanosecond()%0x10000)
+	}
+	return fmt.Sprintf("cmd-%x", b)
+}
+
+// InferTitle extracts or infers a human-readable title from command arguments.
+func InferTitle(args []string, command string) string {
 	for i, arg := range args {
 		if (arg == "-p" || arg == "--prompt" || arg == "--task") && i+1 < len(args) {
 			return args[i+1]
@@ -794,7 +836,12 @@ func inferTitle(args []string, command string) string {
 	return "Agent pulse job"
 }
 
-func detectLocalIP() string {
+func inferTitle(args []string, command string) string {
+	return InferTitle(args, command)
+}
+
+// DetectLocalIP attempts to detect the local or Tailscale outbound IP address.
+func DetectLocalIP() string {
 	if env := os.Getenv("AGENTPULSE_IP"); env != "" {
 		return env
 	}
@@ -817,3 +864,20 @@ func detectLocalIP() string {
 	}
 	return "127.0.0.1"
 }
+
+func detectLocalIP() string {
+	return DetectLocalIP()
+}
+
+// BuildCommandArgs normalizes command and arguments into an argument list for execution.
+func BuildCommandArgs(command string, args []string) []string {
+	var parts []string
+	if strings.TrimSpace(command) != "" {
+		parts = strings.Fields(command)
+	}
+	if len(args) > 0 {
+		parts = append(parts, args...)
+	}
+	return parts
+}
+

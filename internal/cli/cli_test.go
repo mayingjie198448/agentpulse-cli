@@ -408,3 +408,173 @@ func TestStatusCommand(t *testing.T) {
 		}
 	})
 }
+
+func TestDispatchCommand(t *testing.T) {
+	// 1. Missing machine
+	t.Run("missing machine", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"dispatch", "--mqtt-url", "tcp://127.0.0.1:18833", "--", "agy", "-p", "test"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for missing machine, got nil")
+		}
+		if !strings.Contains(err.Error(), "machine ID is required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// 2. Missing command
+	t.Run("missing command", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"dispatch", "--mqtt-url", "tcp://127.0.0.1:18833", "--machine", "box-1"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for missing command, got nil")
+		}
+		if !strings.Contains(err.Error(), "command to dispatch is required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// 3. Missing broker URL
+	t.Run("missing broker url", func(t *testing.T) {
+		// Clear env var if set
+		orig := os.Getenv("AGENTPULSE_MQTT_URL")
+		os.Unsetenv("AGENTPULSE_MQTT_URL")
+		defer func() {
+			if orig != "" {
+				os.Setenv("AGENTPULSE_MQTT_URL", orig)
+			}
+		}()
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"dispatch", "--machine", "box-1", "--", "agy", "-p", "test"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for missing broker url, got nil")
+		}
+		if !strings.Contains(err.Error(), "broker URL is required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// 4. Connecting banner does not claim connected before connect succeeds
+	t.Run("connecting banner behavior on unreachable broker", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"dispatch",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"--machine", "box-1",
+			"--", "agy", "-p", "test",
+		})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected connection error, got nil")
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "Connecting to MQTT broker tcp://127.0.0.1:18833...") {
+			t.Errorf("expected connecting banner, got: %s", out)
+		}
+		if strings.Contains(out, "Connected to MQTT broker") {
+			t.Errorf("expected no false connected banner, got: %s", out)
+		}
+	})
+}
+
+func TestListenCommand(t *testing.T) {
+	// 1. Missing broker URL
+	t.Run("missing broker url", func(t *testing.T) {
+		orig := os.Getenv("AGENTPULSE_MQTT_URL")
+		os.Unsetenv("AGENTPULSE_MQTT_URL")
+		defer func() {
+			if orig != "" {
+				os.Setenv("AGENTPULSE_MQTT_URL", orig)
+			}
+		}()
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"listen"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for missing broker url, got nil")
+		}
+		if !strings.Contains(err.Error(), "broker URL is required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// 2. Connecting banner behavior on unreachable broker
+	t.Run("connecting banner behavior on unreachable broker", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"listen",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"--machine", "test-listener-node",
+		})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for unreachable broker, got nil")
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "Connecting to MQTT broker tcp://127.0.0.1:18833...") {
+			t.Errorf("expected connecting banner, got: %s", out)
+		}
+		if strings.Contains(out, "Connected to MQTT broker") {
+			t.Errorf("expected no false connected banner, got: %s", out)
+		}
+	})
+
+	// 3. wrap --listen invokes listener
+	t.Run("wrap --listen unreachable broker", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"wrap",
+			"--listen",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"--machine", "test-wrap-listen-node",
+		})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error for unreachable broker, got nil")
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "Connecting to MQTT broker tcp://127.0.0.1:18833...") {
+			t.Errorf("expected connecting banner, got: %s", out)
+		}
+		if strings.Contains(out, "Connected to MQTT broker") {
+			t.Errorf("expected no false connected banner, got: %s", out)
+		}
+	})
+}
+
