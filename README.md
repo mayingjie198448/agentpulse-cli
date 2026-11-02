@@ -139,6 +139,11 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 
 ---
 
+## 📚 文档
+
+- [AgentPulse MQTT 协议设计规范 (v1)](docs/mqtt-protocol.md)（**协议草案，实现后置**）：主题树、QoS、消息 JSON 契约、`store.Store` 映射与安全运维约定。
+- [文档索引](docs/README.md)
+
 ## 🧪 Testing
 
 Run all unit tests:
