@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -19,6 +20,7 @@ func TestRootCommands(t *testing.T) {
 		{"list", []string{"list"}},
 		{"list_json", []string{"list", "--json"}},
 		{"logs", []string{"logs", "job-agy-01", "--tail", "5"}},
+		{"status", []string{"status"}},
 	}
 
 	for _, tt := range tests {
@@ -156,6 +158,157 @@ func TestCLI_StoreSelection(t *testing.T) {
 		out := buf.String()
 		if !strings.Contains(out, "settle=450ms") {
 			t.Errorf("expected doctor output to show settle=450ms, got: %s", out)
+		}
+	})
+}
+
+func TestWrapCommand(t *testing.T) {
+	// 1. Missing command error
+	t.Run("missing command error", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{"wrap"})
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error when wrapping without command, got nil")
+		}
+		if !strings.Contains(err.Error(), "command to wrap is required") {
+			t.Errorf("expected missing command error, got: %v", err)
+		}
+	})
+
+	// 2. Stub mode execution
+	t.Run("stub mode execution", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		statusFile := filepath.Join(tmpDir, "stub-cli-status.json")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"wrap", "--stub", "--engine", "opencode", "--status-file", statusFile, "--title", "CLI Stub Test"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error executing stub wrap: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "Job completed successfully") {
+			t.Errorf("expected success banner, got: %s", out)
+		}
+
+		// Verify status file was created
+		data, err := os.ReadFile(statusFile)
+		if err != nil {
+			t.Fatalf("failed to read status file: %v", err)
+		}
+		if !strings.Contains(string(data), `"done"`) {
+			t.Errorf("expected status 'done' in status file: %s", string(data))
+		}
+	})
+
+	// 3. Process execution with echo
+	t.Run("process execution", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		statusFile := filepath.Join(tmpDir, "echo-cli-status.json")
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"wrap", "--status-file", statusFile, "--quiet", "echo", "test output"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error executing wrap echo: %v", err)
+		}
+
+		// Verify status file
+		data, err := os.ReadFile(statusFile)
+		if err != nil {
+			t.Fatalf("failed to read status file: %v", err)
+		}
+		if !strings.Contains(string(data), `"done"`) {
+			t.Errorf("expected done status: %s", string(data))
+		}
+	})
+}
+
+func TestStatusCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	// 1. Missing status file reports clean message
+	t.Run("missing status file", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"status", "--status-file", filepath.Join(tmpDir, "absent.json")})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(buf.String(), "No local status snapshot found") {
+			t.Errorf("expected not found message, got: %s", buf.String())
+		}
+	})
+
+	// 2. Populate status file via wrap, then read via status
+	t.Run("read status after wrap", func(t *testing.T) {
+		wrapCmd := cli.NewRootCmd()
+		wrapBuf := new(bytes.Buffer)
+		wrapCmd.SetOut(wrapBuf)
+		wrapCmd.SetErr(wrapBuf)
+		wrapCmd.SetArgs([]string{
+			"wrap",
+			"--status-file", statusFile,
+			"--machine-id", "test-box-01",
+			"--title", "CLI Status Verification",
+			"--quiet",
+			"echo", "Status probe line",
+		})
+		if err := wrapCmd.Execute(); err != nil {
+			t.Fatalf("wrap command failed: %v", err)
+		}
+
+		// Test table / human-readable output
+		statusCmd := cli.NewRootCmd()
+		statusBuf := new(bytes.Buffer)
+		statusCmd.SetOut(statusBuf)
+		statusCmd.SetErr(statusBuf)
+		statusCmd.SetArgs([]string{"status", "--status-file", statusFile})
+
+		if err := statusCmd.Execute(); err != nil {
+			t.Fatalf("status command failed: %v", err)
+		}
+
+		out := statusBuf.String()
+		if !strings.Contains(out, "test-box-01") {
+			t.Errorf("expected machine ID in status output: %s", out)
+		}
+		if !strings.Contains(out, "done") {
+			t.Errorf("expected status 'done' in status output: %s", out)
+		}
+		if !strings.Contains(out, "CLI Status Verification") {
+			t.Errorf("expected title in status output: %s", out)
+		}
+
+		// Test JSON output
+		jsonCmd := cli.NewRootCmd()
+		jsonBuf := new(bytes.Buffer)
+		jsonCmd.SetOut(jsonBuf)
+		jsonCmd.SetErr(jsonBuf)
+		jsonCmd.SetArgs([]string{"status", "--status-file", statusFile, "--json"})
+
+		if err := jsonCmd.Execute(); err != nil {
+			t.Fatalf("status --json failed: %v", err)
+		}
+
+		jsonOut := jsonBuf.String()
+		if !strings.Contains(jsonOut, `"id": "test-box-01"`) {
+			t.Errorf("expected machine ID in JSON: %s", jsonOut)
+		}
+		if !strings.Contains(jsonOut, `"status": "done"`) {
+			t.Errorf("expected done status in JSON: %s", jsonOut)
 		}
 	})
 }

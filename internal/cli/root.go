@@ -31,6 +31,8 @@ engine simulating multi-node agent orchestration and telemetry.`,
 	rootCmd.AddCommand(newWatchCmd())
 	rootCmd.AddCommand(newListCmd())
 	rootCmd.AddCommand(newLogsCmd())
+	rootCmd.AddCommand(newWrapCmd())
+	rootCmd.AddCommand(newStatusCmd())
 	rootCmd.AddCommand(newDoctorCmd())
 	rootCmd.AddCommand(newVersionCmd())
 

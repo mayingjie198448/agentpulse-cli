@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
+	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -75,6 +76,17 @@ availability of engine CLI binaries (agy, opencode) and future network adapters.
 				fmt.Fprintln(out, "[OK] Data Layer: In-memory simulation store active (default)")
 				fmt.Fprintln(out, "[INFO] MQTT Transport: Ready for connection (pass --mqtt-url or set AGENTPULSE_MQTT_URL)")
 				fmt.Fprintln(out, "[INFO] Sidecar Agent: Stubbed for Phase 2 (Node telemetry daemon)")
+			}
+
+			// 5. Thin Wrapper
+			statusFilePath := wrapper.DefaultStatusFile
+			if env := os.Getenv("AGENTPULSE_STATUS_FILE"); env != "" {
+				statusFilePath = env
+			}
+			if st, err := wrapper.ReadLocalStatus(statusFilePath); err == nil {
+				fmt.Fprintf(out, "[OK] Thin Wrapper: Active/recent job %s on %s (status: %s)\n", st.Job.ID, st.Machine.ID, st.Job.Status)
+			} else {
+				fmt.Fprintln(out, "[OK] Thin Wrapper: Ready for local execution ('agentpulse wrap')")
 			}
 
 			fmt.Fprintln(out, "----------------------------------------")

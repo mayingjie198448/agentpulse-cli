@@ -131,7 +131,47 @@ Retrieve historical logs or stream live events:
 
 ---
 
-### 4. Diagnostics (`doctor`)
+### 4. Thin Wrapper: Monitor Local Agent Runs (`wrap`)
+
+`agentpulse wrap` is a thin local process that executes an AI agent command (`agy`, or stubbed `opencode`), streams console output locally, writes local status snapshots (`.agentpulse/status.json`), and publishes real-time node heartbeats, job lifecycle transitions, and log streams to an MQTT broker per [MQTT Protocol Spec](docs/mqtt-protocol.md).
+
+> [!NOTE]
+> **Single-Machine Slice (Step 3)**:
+> - If `AGENTPULSE_MQTT_URL` or `--mqtt-url` is specified, telemetry is actively published to the MQTT broker (LWT, QoS 1 retained heartbeats and job statuses, QoS 0 log streaming).
+> - If no broker URL is provided, the wrapper executes locally, mirrors output, and writes local status snapshots without requiring a broker.
+> - **Security Note**: Use `--dangerously-skip-permissions` only in this repo / trusted workspace to permit unattended execution.
+
+```bash
+# Wrap agy in local mode (writes .agentpulse/status.json, no broker needed):
+./agentpulse wrap -- agy --dangerously-skip-permissions -p "Fix bug in store"
+
+# Or pass --dangerously-skip-permissions as a wrapper flag:
+./agentpulse wrap --dangerously-skip-permissions agy -p "Refactor auth layer"
+
+# Wrap agy and stream live telemetry to an MQTT broker:
+./agentpulse wrap --mqtt-url tcp://broker.example:1883 -- agy --dangerously-skip-permissions -p "Run test suite"
+
+# Run simulated execution (e.g. for stubbed OpenCode or automated testing):
+./agentpulse wrap --engine opencode --stub
+```
+
+---
+
+### 5. Inspect Local Status (`status`)
+
+Inspects the latest local agent execution snapshot written by `agentpulse wrap`:
+
+```bash
+# Human-readable formatted snapshot
+./agentpulse status
+
+# Structured JSON output
+./agentpulse status --json
+```
+
+---
+
+### 6. Diagnostics (`doctor`)
 
 Validates terminal capabilities, TTY detection, engine CLI presence, and transport readiness:
 
@@ -144,7 +184,7 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 
 ---
 
-### 5. Switching Backend (Mock ↔ MQTT)
+### 7. Switching Backend (Mock ↔ MQTT)
 
 All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling between mock simulation and a live MQTT broker:
 
