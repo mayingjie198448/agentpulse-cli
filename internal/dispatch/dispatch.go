@@ -11,6 +11,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 )
@@ -33,7 +34,9 @@ type Config struct {
 	Wait   bool
 	Follow bool
 	Quiet  bool
+	Force  bool // Bypass target machine online/availability gate
 
+	Store      store.Store // Optional store to check target machine availability before dispatch
 	MQTT       *mqtt.Config
 	MQTTClient paho.Client
 
@@ -154,6 +157,32 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 
 	if ownsMQTT {
 		defer client.Disconnect(100)
+	}
+
+	// Target machine gate per docs/mqtt-protocol.md §4.4 / multi-machine spec:
+	// Verify target machine is known and online before dispatching unless --force is specified.
+	if !cfg.Force {
+		targetStore := cfg.Store
+		if targetStore == nil && cfg.MQTTClient == nil && cfg.MQTT != nil {
+			storeCfg := *cfg.MQTT
+			storeCfg.ClientID = fmt.Sprintf("agentpulse-dispatch-check-%d", os.Getpid())
+			st, err := mqtt.New(storeCfg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to verify target machine status on broker: %w", err)
+			}
+			defer st.Close()
+			targetStore = st
+		}
+
+		if targetStore != nil {
+			m, err := targetStore.GetMachine(ctx, cfg.MachineID)
+			if err != nil || m == nil {
+				return nil, fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse listen' is active on target node, or use --force to bypass", cfg.MachineID)
+			}
+			if !m.Online {
+				return nil, fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", cfg.MachineID, m.HeartbeatAgo())
+			}
+		}
 	}
 
 	dispatchStartTime := time.Now().UTC()

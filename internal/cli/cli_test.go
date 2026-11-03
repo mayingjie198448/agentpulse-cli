@@ -2,10 +2,12 @@ package cli_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 )
@@ -598,6 +600,183 @@ func TestListenCommand(t *testing.T) {
 		}
 		if strings.Contains(out, "Connected to MQTT broker") {
 			t.Errorf("expected no false connected banner, got: %s", out)
+		}
+	})
+}
+
+func TestListCommand_OnlineFilter(t *testing.T) {
+	// 1. Default list shows all machines including offline ones (e.g. macbook in mock)
+	t.Run("default list shows offline machines", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"list"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "macbook") {
+			t.Errorf("expected macbook to be present in full list, got: %s", out)
+		}
+		if !strings.Contains(out, "OFFLINE") {
+			t.Errorf("expected OFFLINE status in output, got: %s", out)
+		}
+		if !strings.Contains(out, "HEARTBEAT") {
+			t.Errorf("expected HEARTBEAT column header in output, got: %s", out)
+		}
+	})
+
+	// 2. list --online filters out offline machines
+	t.Run("list --online excludes offline machines", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"list", "--online"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		parts := strings.Split(out, "JOBS:")
+		machOut := parts[0]
+		if strings.Contains(machOut, "macbook") {
+			t.Errorf("expected macbook (offline) to be filtered out of machines list, got: %s", machOut)
+		}
+		if strings.Contains(machOut, "OFFLINE") {
+			t.Errorf("expected no OFFLINE rows with --online, got: %s", machOut)
+		}
+		if !strings.Contains(machOut, "ccdq") || !strings.Contains(machOut, "mac-mini") || !strings.Contains(machOut, "home-pc") {
+			t.Errorf("expected online machines to be present, got: %s", machOut)
+		}
+		if !strings.Contains(machOut, "HEARTBEAT") {
+			t.Errorf("expected HEARTBEAT column to be preserved, got: %s", machOut)
+		}
+	})
+
+	// 3. list --online --json outputs only online machines
+	t.Run("list --online --json", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"list", "--online", "--json"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var payload struct {
+			Machines []struct {
+				ID     string `json:"id"`
+				Online bool   `json:"online"`
+			} `json:"machines"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+			t.Fatalf("failed to unmarshal JSON output: %v", err)
+		}
+
+		if len(payload.Machines) != 3 {
+			t.Fatalf("expected 3 online machines, got %d", len(payload.Machines))
+		}
+		for _, m := range payload.Machines {
+			if !m.Online {
+				t.Errorf("expected machine %s to be online", m.ID)
+			}
+			if m.ID == "macbook" {
+				t.Errorf("macbook should not be present in online list")
+			}
+		}
+	})
+}
+
+func TestDispatchCommand_ForceFlag(t *testing.T) {
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{
+		"dispatch",
+		"--mqtt-url", "tcp://127.0.0.1:18833",
+		"--machine", "box-1",
+		"--force",
+		"--", "agy", "-p", "test",
+	})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected connection error to unreachable broker, got nil")
+	}
+	if strings.Contains(err.Error(), "unknown flag") {
+		t.Errorf("unexpected unknown flag error for --force: %v", err)
+	}
+}
+
+func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
+	// 1. Default values via doctor with no flags
+	t.Run("defaults", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{"doctor"})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.HeartbeatTimeout != 45*time.Second {
+			t.Errorf("expected default HeartbeatTimeout 45s, got %v", cfg.HeartbeatTimeout)
+		}
+		if cfg.HeartbeatCheckInterval != 10*time.Second {
+			t.Errorf("expected default HeartbeatCheckInterval 10s, got %v", cfg.HeartbeatCheckInterval)
+		}
+	})
+
+	// 2. Env variable configuration
+	t.Run("env variables", func(t *testing.T) {
+		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
+		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
+		defer func() {
+			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT")
+			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL")
+		}()
+
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{"doctor"})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.HeartbeatTimeout != 60*time.Second {
+			t.Errorf("expected HeartbeatTimeout 60s from env, got %v", cfg.HeartbeatTimeout)
+		}
+		if cfg.HeartbeatCheckInterval != 15*time.Second {
+			t.Errorf("expected HeartbeatCheckInterval 15s from env, got %v", cfg.HeartbeatCheckInterval)
+		}
+	})
+
+	// 3. Flags override env
+	t.Run("flags override env", func(t *testing.T) {
+		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
+		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
+		defer func() {
+			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT")
+			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL")
+		}()
+
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{
+			"doctor",
+			"--mqtt-heartbeat-timeout", "25s",
+			"--mqtt-heartbeat-check-interval", "5s",
+		})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.HeartbeatTimeout != 25*time.Second {
+			t.Errorf("expected HeartbeatTimeout 25s from flag, got %v", cfg.HeartbeatTimeout)
+		}
+		if cfg.HeartbeatCheckInterval != 5*time.Second {
+			t.Errorf("expected HeartbeatCheckInterval 5s from flag, got %v", cfg.HeartbeatCheckInterval)
 		}
 	})
 }

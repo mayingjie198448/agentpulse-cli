@@ -796,3 +796,147 @@ func TestDispatch_EndToEnd_WithListener(t *testing.T) {
 	}
 }
 
+type fakeDispatchStore struct {
+	machines map[string]*model.Machine
+}
+
+func (f *fakeDispatchStore) ListMachines(ctx context.Context) ([]model.Machine, error) {
+	var res []model.Machine
+	for _, m := range f.machines {
+		res = append(res, *m)
+	}
+	return res, nil
+}
+
+func (f *fakeDispatchStore) GetMachine(ctx context.Context, id string) (*model.Machine, error) {
+	if m, ok := f.machines[id]; ok {
+		cp := *m
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("machine not found: %s", id)
+}
+
+func (f *fakeDispatchStore) ListJobs(ctx context.Context) ([]model.Job, error) { return nil, nil }
+func (f *fakeDispatchStore) GetJob(ctx context.Context, id string) (*model.Job, error) { return nil, nil }
+func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) { return nil, nil }
+func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) { return nil, nil }
+func (f *fakeDispatchStore) Close() error { return nil }
+
+func TestDispatch_TargetMachineGate(t *testing.T) {
+	now := time.Now()
+	st := &fakeDispatchStore{
+		machines: map[string]*model.Machine{
+			"online-node": {
+				ID:            "online-node",
+				Name:          "online-node",
+				Online:        true,
+				LastHeartbeat: now.Add(-5 * time.Second),
+			},
+			"offline-node": {
+				ID:            "offline-node",
+				Name:          "offline-node",
+				Online:        false,
+				LastHeartbeat: now.Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	// 1. Unknown machine without --force fails
+	t.Run("unknown machine fails by default", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "unknown-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err == nil {
+			t.Fatalf("expected error for unknown machine, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'unknown' and '--force', got: %v", err)
+		}
+	})
+
+	// 2. Offline machine without --force fails
+	t.Run("offline machine fails by default", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "offline-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err == nil {
+			t.Fatalf("expected error for offline machine, got nil")
+		}
+		if !strings.Contains(err.Error(), "offline") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'offline' and '--force', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "2m ago") {
+			t.Errorf("expected error to mention last heartbeat age, got: %v", err)
+		}
+	})
+
+	// 3. Offline machine with --force succeeds
+	t.Run("offline machine with force succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "offline-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 4. Unknown machine with --force succeeds
+	t.Run("unknown machine with force succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "ghost-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch to ghost node to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 5. Online machine succeeds without --force
+	t.Run("online machine succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "online-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err != nil {
+			t.Fatalf("expected dispatch to online node to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+}
+

@@ -564,3 +564,44 @@ func TestMQTTStore_ColdStartRetainedSettle(t *testing.T) {
 		t.Fatalf("expected st.Settle to wait for duration")
 	}
 }
+
+func TestMQTTStore_HeartbeatConfigDefaultsAndValidation(t *testing.T) {
+	// 1. Verify default values
+	cfg := mqttstore.DefaultConfig()
+	if cfg.HeartbeatTimeout != 45*time.Second {
+		t.Errorf("expected DefaultConfig HeartbeatTimeout 45s, got %v", cfg.HeartbeatTimeout)
+	}
+	if cfg.HeartbeatCheckInterval != 10*time.Second {
+		t.Errorf("expected DefaultConfig HeartbeatCheckInterval 10s, got %v", cfg.HeartbeatCheckInterval)
+	}
+
+	// 2. Validate fills zero values with defaults
+	zeroCfg := mqttstore.Config{
+		BrokerURL: "tcp://broker.example:1883",
+	}
+	if err := zeroCfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if zeroCfg.HeartbeatTimeout != 45*time.Second {
+		t.Errorf("expected Validate to default HeartbeatTimeout to 45s, got %v", zeroCfg.HeartbeatTimeout)
+	}
+	if zeroCfg.HeartbeatCheckInterval != 10*time.Second {
+		t.Errorf("expected Validate to default HeartbeatCheckInterval to 10s, got %v", zeroCfg.HeartbeatCheckInterval)
+	}
+
+	// 3. Custom values are preserved
+	customCfg := mqttstore.Config{
+		BrokerURL:              "tcp://broker.example:1883",
+		HeartbeatTimeout:       30 * time.Second,
+		HeartbeatCheckInterval: 5 * time.Second,
+	}
+	if err := customCfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if customCfg.HeartbeatTimeout != 30*time.Second {
+		t.Errorf("expected HeartbeatTimeout 30s, got %v", customCfg.HeartbeatTimeout)
+	}
+	if customCfg.HeartbeatCheckInterval != 5*time.Second {
+		t.Errorf("expected HeartbeatCheckInterval 5s, got %v", customCfg.HeartbeatCheckInterval)
+	}
+}
