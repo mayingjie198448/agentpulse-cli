@@ -180,6 +180,18 @@ func (m *mockPahoMessage) MessageID() uint16 { return 0 }
 func (m *mockPahoMessage) Payload() []byte   { return m.payload }
 func (m *mockPahoMessage) Ack()              {}
 
+func seedOnlineMachine(client *mockMQTTClient, machineID string) {
+	sanitized := wrapper.SanitizeID(machineID)
+	m := model.Machine{
+		ID:            sanitized,
+		Name:          sanitized,
+		Online:        true,
+		LastHeartbeat: time.Now(),
+	}
+	payload, _ := json.Marshal(m)
+	client.Publish(mqtt.MachineStatusTopic(sanitized), 1, true, payload)
+}
+
 func TestDispatch_PayloadShape(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	outBuf := new(bytes.Buffer)
@@ -201,6 +213,7 @@ func TestDispatch_PayloadShape(t *testing.T) {
 		MQTTClient:  mockClient,
 		Out:         outBuf,
 		Quiet:       false,
+		Force:       true,
 	}
 
 	cmd, err := dispatch.Dispatch(context.Background(), cfg)
@@ -311,6 +324,7 @@ func TestDispatch_Validation(t *testing.T) {
 
 func TestDispatch_Wait_Done(t *testing.T) {
 	mockClient := newMockMQTTClient()
+	seedOnlineMachine(mockClient, "target-node")
 	outBuf := new(bytes.Buffer)
 
 	subscribedCh := make(chan struct{})
@@ -374,6 +388,7 @@ func TestDispatch_Wait_Done(t *testing.T) {
 
 func TestDispatch_Wait_Failed(t *testing.T) {
 	mockClient := newMockMQTTClient()
+	seedOnlineMachine(mockClient, "fail-node")
 	outBuf := new(bytes.Buffer)
 	errBuf := new(bytes.Buffer)
 
@@ -422,6 +437,7 @@ func TestDispatch_Wait_Failed(t *testing.T) {
 
 func TestDispatch_Wait_Timeout(t *testing.T) {
 	mockClient := newMockMQTTClient()
+	seedOnlineMachine(mockClient, "silent-node")
 	outBuf := new(bytes.Buffer)
 	errBuf := new(bytes.Buffer)
 
@@ -470,6 +486,7 @@ func TestDispatch_Wait_IgnoresStaleRetainedTerminalStatus(t *testing.T) {
 	errBuf := new(bytes.Buffer)
 
 	machineID := "retained-test-node"
+	seedOnlineMachine(mockClient, machineID)
 	jobID := "reused-job-001"
 	statusTopic := mqtt.JobStatusTopic(machineID, jobID)
 
@@ -576,6 +593,7 @@ func TestDispatch_Wait_StatusChannelSaturationDoesNotDropDone(t *testing.T) {
 	errBuf := new(bytes.Buffer)
 
 	machineID := "saturate-node"
+	seedOnlineMachine(mockClient, machineID)
 	jobID := "job-saturate-1"
 	statusTopic := mqtt.JobStatusTopic(machineID, jobID)
 	dispatchTopic := mqtt.MachineDispatchTopic(machineID)
@@ -627,6 +645,7 @@ func TestDispatch_Wait_StatusChannelSaturationDoesNotDropDone(t *testing.T) {
 
 func TestDispatch_Follow_Logs(t *testing.T) {
 	mockClient := newMockMQTTClient()
+	seedOnlineMachine(mockClient, "node-follow")
 	outBuf := new(bytes.Buffer)
 
 	subscribedCh := make(chan struct{})
@@ -793,6 +812,358 @@ func TestDispatch_EndToEnd_WithListener(t *testing.T) {
 	}
 	if !strings.Contains(outStr, "[job-e2e-dispatch-01]") {
 		t.Errorf("expected log streaming prefix in output: %s", outStr)
+	}
+}
+
+type fakeDispatchStore struct {
+	machines map[string]*model.Machine
+}
+
+func (f *fakeDispatchStore) ListMachines(ctx context.Context) ([]model.Machine, error) {
+	var res []model.Machine
+	for _, m := range f.machines {
+		res = append(res, *m)
+	}
+	return res, nil
+}
+
+func (f *fakeDispatchStore) GetMachine(ctx context.Context, id string) (*model.Machine, error) {
+	if m, ok := f.machines[id]; ok {
+		cp := *m
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("machine not found: %s", id)
+}
+
+func (f *fakeDispatchStore) ListJobs(ctx context.Context) ([]model.Job, error) { return nil, nil }
+func (f *fakeDispatchStore) GetJob(ctx context.Context, id string) (*model.Job, error) { return nil, nil }
+func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) { return nil, nil }
+func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) { return nil, nil }
+func (f *fakeDispatchStore) Close() error { return nil }
+
+func TestDispatch_TargetMachineGate(t *testing.T) {
+	now := time.Now()
+	st := &fakeDispatchStore{
+		machines: map[string]*model.Machine{
+			"online-node": {
+				ID:            "online-node",
+				Name:          "online-node",
+				Online:        true,
+				LastHeartbeat: now.Add(-5 * time.Second),
+			},
+			"offline-node": {
+				ID:            "offline-node",
+				Name:          "offline-node",
+				Online:        false,
+				LastHeartbeat: now.Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	// 1. Unknown machine without --force fails
+	t.Run("unknown machine fails by default", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "unknown-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err == nil {
+			t.Fatalf("expected error for unknown machine, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'unknown' and '--force', got: %v", err)
+		}
+	})
+
+	// 2. Offline machine without --force fails
+	t.Run("offline machine fails by default", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "offline-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err == nil {
+			t.Fatalf("expected error for offline machine, got nil")
+		}
+		if !strings.Contains(err.Error(), "offline") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'offline' and '--force', got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "2m ago") {
+			t.Errorf("expected error to mention last heartbeat age, got: %v", err)
+		}
+	})
+
+	// 3. Offline machine with --force succeeds
+	t.Run("offline machine with force succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "offline-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 4. Unknown machine with --force succeeds
+	t.Run("unknown machine with force succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "ghost-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch to ghost node to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 5. Online machine succeeds without --force
+	t.Run("online machine succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "online-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err != nil {
+			t.Fatalf("expected dispatch to online node to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 6. Important #1: When Store == nil && MQTTClient != nil, gatekeeper is reliably enforced (not silently skipped)
+	t.Run("client-only gate: unknown machine fails without force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "ghost-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			MQTTClient: mockClient,
+			Force:      false,
+			MQTT: &mqtt.Config{
+				SettleTimeout: 10 * time.Millisecond,
+			},
+		})
+		if err == nil {
+			t.Fatalf("expected error for unknown machine on client-only gate, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'unknown' and '--force', got: %v", err)
+		}
+	})
+
+	t.Run("client-only gate: offline machine fails without force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		offlineMachine := model.Machine{
+			ID:            "sleeping-node",
+			Name:          "sleeping-node",
+			Online:        false,
+			LastHeartbeat: now.Add(-3 * time.Minute),
+		}
+		p, _ := json.Marshal(offlineMachine)
+		mockClient.Publish(mqtt.MachineStatusTopic("sleeping-node"), 1, true, p)
+
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "sleeping-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			MQTTClient: mockClient,
+			Force:      false,
+			MQTT: &mqtt.Config{
+				SettleTimeout: 10 * time.Millisecond,
+			},
+		})
+		if err == nil {
+			t.Fatalf("expected error for offline machine on client-only gate, got nil")
+		}
+		if !strings.Contains(err.Error(), "offline") || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("expected error to mention 'offline' and '--force', got: %v", err)
+		}
+	})
+
+	t.Run("client-only gate: online machine succeeds without force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		seedOnlineMachine(mockClient, "active-node")
+
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "active-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			MQTTClient: mockClient,
+			Force:      false,
+			MQTT: &mqtt.Config{
+				SettleTimeout: 10 * time.Millisecond,
+			},
+		})
+		if err != nil {
+			t.Fatalf("expected dispatch to online machine to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	t.Run("client-only gate: unknown machine succeeds with force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "unregistered-node",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 7. Critical: Raw machine ID with underscores / uppercase (e.g. "Mac_Studio", "my_host")
+	// is sanitized so gatekeeper lookup and publish topic match normalized ID "mac-studio", "my-host".
+	t.Run("critical: sanitize raw machine ID with underscores and uppercase", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		seedOnlineMachine(mockClient, "mac-studio") // Seeded under normalized ID
+
+		// Dispatch with unsanitized raw string "Mac_Studio"
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "Mac_Studio",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			MQTTClient: mockClient,
+			Force:      false,
+			MQTT: &mqtt.Config{
+				SettleTimeout: 10 * time.Millisecond,
+			},
+		})
+		if err != nil {
+			t.Fatalf("expected dispatch with raw 'Mac_Studio' to match 'mac-studio', got: %v", err)
+		}
+		if cmd == nil {
+			t.Fatalf("expected non-nil returned command")
+		}
+
+		// Verify publication was routed to the sanitized topic
+		var publishedToTopic bool
+		expectedTopic := mqtt.MachineDispatchTopic("mac-studio")
+		for _, m := range mockClient.GetPublished() {
+			if m.Topic == expectedTopic {
+				publishedToTopic = true
+				break
+			}
+		}
+		if !publishedToTopic {
+			t.Errorf("expected dispatch to publish to %s, but topic was not found in published messages: %+v", expectedTopic, mockClient.GetPublished())
+		}
+	})
+}
+
+// TestDispatch_Listener_SanitizeIDSymmetry tests the Critical regression requirement:
+// Explicit machine ID with '_' or uppercase (e.g. "Mac_Studio" / "my_host"):
+// listener normalizes it upon registration, and dispatch with the identical raw string
+// hits the same normalized identity (gatekeeper passes and dispatch command is received by listener).
+func TestDispatch_Listener_SanitizeIDSymmetry(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "listener-sanitize-status.json")
+
+	listeningCh := make(chan struct{})
+
+	// 1. Start listener with explicit unsanitized ID "Mac_Studio"
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "Mac_Studio",
+		StatusFile: statusFile,
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+		OnListening: func(_ string) {
+			close(listeningCh)
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	// Listener normalized ID must be "mac-studio"
+	if l.Machine().ID != "mac-studio" {
+		t.Fatalf("expected listener Machine.ID to be 'mac-studio', got %q", l.Machine().ID)
+	}
+
+	listenerCtx, listenerCancel := context.WithCancel(context.Background())
+	defer listenerCancel()
+
+	go func() {
+		_ = l.Run(listenerCtx)
+	}()
+
+	select {
+	case <-listeningCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for listener to start listening")
+	}
+
+	// 2. Dispatch using the EXACT same raw string "Mac_Studio" without --force
+	outBuf := new(bytes.Buffer)
+	cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+		MachineID:  "Mac_Studio",
+		JobID:      "job-sanitize-sym-01",
+		Command:    "agy",
+		Args:       []string{"-p", "test symmetry"},
+		Wait:       true,
+		MQTTClient: mockClient,
+		Out:        outBuf,
+		Quiet:      true,
+		Force:      false, // Gatekeeper MUST pass!
+		MQTT: &mqtt.Config{
+			SettleTimeout: 10 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("dispatch with 'Mac_Studio' failed gatekeeper or execution against listener: %v", err)
+	}
+	if cmd == nil || cmd.JobID != "job-sanitize-sym-01" {
+		t.Errorf("unexpected cmd result: %+v", cmd)
+	}
+
+	// Verify command was delivered to the normalized topic
+	normalizedTopic := mqtt.MachineDispatchTopic("mac-studio")
+	foundNormalized := false
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == normalizedTopic {
+			foundNormalized = true
+			break
+		}
+	}
+	if !foundNormalized {
+		t.Errorf("expected dispatch to publish to %s, found none", normalizedTopic)
 	}
 }
 

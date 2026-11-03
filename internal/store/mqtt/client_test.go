@@ -45,6 +45,7 @@ type FakeMQTTClient struct {
 	mu             sync.Mutex
 	connected      bool
 	subscriptions  map[string]paho.MessageHandler
+	retained       map[string]fakeMessage
 	unsubscribed   []string
 	disconnectWait uint
 }
@@ -53,6 +54,7 @@ func NewFakeMQTTClient() *FakeMQTTClient {
 	return &FakeMQTTClient{
 		connected:     true,
 		subscriptions: make(map[string]paho.MessageHandler),
+		retained:      make(map[string]fakeMessage),
 	}
 }
 
@@ -84,7 +86,18 @@ func (c *FakeMQTTClient) Publish(topic string, qos byte, retained bool, payload 
 func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.MessageHandler) paho.Token {
 	c.mu.Lock()
 	c.subscriptions[topic] = callback
+	var retainedToDeliver []fakeMessage
+	for _, msg := range c.retained {
+		if matchTopic(topic, msg.topic) {
+			retainedToDeliver = append(retainedToDeliver, msg)
+		}
+	}
 	c.mu.Unlock()
+
+	for _, msg := range retainedToDeliver {
+		m := msg
+		callback(c, &m)
+	}
 	return newSuccessToken()
 }
 
@@ -93,7 +106,21 @@ func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback pah
 	for filter := range filters {
 		c.subscriptions[filter] = callback
 	}
+	var retainedToDeliver []fakeMessage
+	for _, msg := range c.retained {
+		for filter := range filters {
+			if matchTopic(filter, msg.topic) {
+				retainedToDeliver = append(retainedToDeliver, msg)
+				break
+			}
+		}
+	}
 	c.mu.Unlock()
+
+	for _, msg := range retainedToDeliver {
+		m := msg
+		callback(c, &m)
+	}
 	return newSuccessToken()
 }
 
@@ -129,7 +156,14 @@ func matchTopic(filter, topic string) bool {
 // Deliver simulated MQTT message to all registered matching callbacks.
 func (c *FakeMQTTClient) Deliver(topic string, payload []byte, retained bool) {
 	c.mu.Lock()
-	msg := &fakeMessage{topic: topic, payload: payload, retained: retained}
+	msg := fakeMessage{topic: topic, payload: payload, retained: retained}
+	if retained {
+		if len(payload) == 0 {
+			delete(c.retained, topic)
+		} else {
+			c.retained[topic] = msg
+		}
+	}
 	var handlers []paho.MessageHandler
 	for filter, h := range c.subscriptions {
 		if matchTopic(filter, topic) {
@@ -139,6 +173,7 @@ func (c *FakeMQTTClient) Deliver(topic string, payload []byte, retained bool) {
 	c.mu.Unlock()
 
 	for _, h := range handlers {
-		h(c, msg)
+		m := msg
+		h(c, &m)
 	}
 }

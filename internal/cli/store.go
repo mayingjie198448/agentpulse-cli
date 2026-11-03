@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ func registerStoreFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().String("mqtt-username", "", "MQTT username (or $AGENTPULSE_MQTT_USERNAME)")
 	cmd.PersistentFlags().String("mqtt-password", "", "MQTT password (or $AGENTPULSE_MQTT_PASSWORD)")
 	cmd.PersistentFlags().Duration("mqtt-settle-timeout", 200*time.Millisecond, "Duration to wait after subscription for retained messages to settle (or $AGENTPULSE_MQTT_SETTLE_TIMEOUT)")
+	cmd.PersistentFlags().Duration("mqtt-heartbeat-timeout", 45*time.Second, "Max duration without heartbeat before marking machine offline (or $AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT)")
+	cmd.PersistentFlags().Duration("mqtt-heartbeat-check-interval", 10*time.Second, "Interval to check for stale machine heartbeats (or $AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL)")
 }
 
 // resolveMQTTConfig aggregates MQTT options from CLI flags and environment variables.
@@ -41,6 +44,12 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 		}
 		if val, err := cmd.Flags().GetDuration("mqtt-settle-timeout"); err == nil && cmd.Flags().Changed("mqtt-settle-timeout") {
 			cfg.SettleTimeout = val
+		}
+		if val, err := cmd.Flags().GetDuration("mqtt-heartbeat-timeout"); err == nil && cmd.Flags().Changed("mqtt-heartbeat-timeout") {
+			cfg.HeartbeatTimeout = val
+		}
+		if val, err := cmd.Flags().GetDuration("mqtt-heartbeat-check-interval"); err == nil && cmd.Flags().Changed("mqtt-heartbeat-check-interval") {
+			cfg.HeartbeatCheckInterval = val
 		}
 	}
 
@@ -73,8 +82,27 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 			cfg.Timeout = d
 		}
 	}
+	if env := os.Getenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-heartbeat-timeout")) {
+		if d, err := time.ParseDuration(env); err == nil {
+			cfg.HeartbeatTimeout = d
+		} else if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
+			cfg.HeartbeatTimeout = time.Duration(sec) * time.Second
+		}
+	}
+	if env := os.Getenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-heartbeat-check-interval")) {
+		if d, err := time.ParseDuration(env); err == nil {
+			cfg.HeartbeatCheckInterval = d
+		} else if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
+			cfg.HeartbeatCheckInterval = time.Duration(sec) * time.Second
+		}
+	}
 
 	return cfg
+}
+
+// ResolveMQTTConfigForTest exposes resolveMQTTConfig for testing.
+func ResolveMQTTConfigForTest(cmd *cobra.Command) mqtt.Config {
+	return resolveMQTTConfig(cmd)
 }
 
 // determineStoreType decides whether to run mock or mqtt store.

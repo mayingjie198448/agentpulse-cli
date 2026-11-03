@@ -115,6 +115,8 @@ type Listener struct {
 func NewListener(cfg ListenerConfig) (*Listener, error) {
 	if cfg.MachineID == "" {
 		cfg.MachineID = DetectMachineID()
+	} else {
+		cfg.MachineID = SanitizeID(cfg.MachineID)
 	}
 	if cfg.MachineName == "" {
 		cfg.MachineName = cfg.MachineID

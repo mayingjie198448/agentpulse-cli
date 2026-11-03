@@ -105,6 +105,7 @@ func New(cfg Config) (*Store, error) {
 	if cfg.SettleTimeout > 0 {
 		time.Sleep(cfg.SettleTimeout)
 	}
+	s.checkStaleMachines()
 
 	return s, nil
 }
@@ -146,6 +147,7 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 	if cfg.SettleTimeout > 0 {
 		time.Sleep(cfg.SettleTimeout)
 	}
+	s.checkStaleMachines()
 
 	return s, nil
 }
@@ -295,6 +297,8 @@ func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
 
 // ListMachines returns all cached machines, ordered online first, then by ID.
 func (s *Store) ListMachines(ctx context.Context) ([]model.Machine, error) {
+	s.checkStaleMachines()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -315,6 +319,8 @@ func (s *Store) ListMachines(ctx context.Context) ([]model.Machine, error) {
 
 // GetMachine returns a single machine by ID.
 func (s *Store) GetMachine(ctx context.Context, id string) (*model.Machine, error) {
+	s.checkStaleMachines()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -488,6 +494,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) runHeartbeatChecker() {
+	s.checkStaleMachines()
 	ticker := time.NewTicker(s.cfg.HeartbeatCheckInterval)
 	defer ticker.Stop()
 

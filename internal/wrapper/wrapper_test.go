@@ -3,6 +3,7 @@ package wrapper_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -891,5 +892,115 @@ func TestReadWriteLocalStatus_Missing(t *testing.T) {
 	_, err := wrapper.ReadLocalStatus("/path/to/non/existent/file.json")
 	if err == nil {
 		t.Errorf("expected error reading non-existent status file, got nil")
+	}
+}
+
+func TestSanitizeID(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"mac-studio", "mac-studio"},
+		{"Mac-Studio-M2", "mac-studio-m2"},
+		{"My_Host_Name", "my-host-name"},
+		{"node.local", "node-local"},
+		{"  Spaces  Around  ", "spaces-around"},
+		{"special@chars!#$%^&*", "special-chars"},
+		{"multiple---hyphens___together", "multiple-hyphens-together"},
+		{"-leading-and-trailing-", "leading-and-trailing"},
+		{"", "local-node"},
+		{"   ", "local-node"},
+		{"---", "local-node"},
+		{"___", "local-node"},
+		{"!@#$%^", "local-node"},
+	}
+
+	for _, tt := range tests {
+		got := wrapper.SanitizeID(tt.input)
+		if got != tt.want {
+			t.Errorf("SanitizeID(%q) = %q; want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDetectMachineID_Precedence(t *testing.T) {
+	// 1. Env variable takes precedence over hostname
+	origEnv := os.Getenv("AGENTPULSE_MACHINE_ID")
+	defer func() {
+		if origEnv != "" {
+			os.Setenv("AGENTPULSE_MACHINE_ID", origEnv)
+		} else {
+			os.Unsetenv("AGENTPULSE_MACHINE_ID")
+		}
+	}()
+
+	os.Setenv("AGENTPULSE_MACHINE_ID", "Custom_Box_99")
+	got := wrapper.DetectMachineID()
+	if got != "custom-box-99" {
+		t.Errorf("expected custom-box-99 from env, got %q", got)
+	}
+
+	// 2. When env is empty, falls back to sanitized hostname
+	os.Unsetenv("AGENTPULSE_MACHINE_ID")
+	host, _ := os.Hostname()
+	expectedHostID := wrapper.SanitizeID(host)
+	gotHost := wrapper.DetectMachineID()
+	if gotHost != expectedHostID {
+		t.Errorf("expected sanitized hostname %q, got %q", expectedHostID, gotHost)
+	}
+}
+
+func TestWrapper_MachineIdentityDefaults(t *testing.T) {
+	// When MachineID is empty, wrapper defaults to DetectMachineID()
+	w, err := wrapper.New(wrapper.Config{
+		Stub: true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+	expectedID := wrapper.DetectMachineID()
+	if w.Machine().ID != expectedID {
+		t.Errorf("expected default machine ID %q, got %q", expectedID, w.Machine().ID)
+	}
+	if w.Machine().Name != expectedID {
+		t.Errorf("expected machine name to default to ID %q, got %q", expectedID, w.Machine().Name)
+	}
+
+	// Explicit machine ID is sanitized
+	w2, err := wrapper.New(wrapper.Config{
+		MachineID: "My_Custom_Node",
+		Stub:      true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+	if w2.Machine().ID != "my-custom-node" {
+		t.Errorf("expected sanitized ID 'my-custom-node', got %q", w2.Machine().ID)
+	}
+}
+
+func TestListener_MachineIdentityDefaults(t *testing.T) {
+	// When MachineID is empty, NewListener defaults to DetectMachineID()
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		Stub: true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.NewListener failed: %v", err)
+	}
+	expectedID := wrapper.DetectMachineID()
+	if l.Machine().ID != expectedID {
+		t.Errorf("expected default machine ID %q, got %q", expectedID, l.Machine().ID)
+	}
+
+	// Explicit machine ID is sanitized
+	l2, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID: "Worker_Node_Beta",
+		Stub:      true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.NewListener failed: %v", err)
+	}
+	if l2.Machine().ID != "worker-node-beta" {
+		t.Errorf("expected sanitized ID 'worker-node-beta', got %q", l2.Machine().ID)
 	}
 }
