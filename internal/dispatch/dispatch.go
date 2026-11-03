@@ -11,6 +11,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 )
@@ -33,7 +34,9 @@ type Config struct {
 	Wait   bool
 	Follow bool
 	Quiet  bool
+	Force  bool // Bypass target machine online/availability gate
 
+	Store      store.Store // Optional store to check target machine availability before dispatch
 	MQTT       *mqtt.Config
 	MQTTClient paho.Client
 
@@ -56,6 +59,7 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 	if strings.TrimSpace(cfg.MachineID) == "" {
 		return nil, fmt.Errorf("machine ID is required (pass --machine or --machine-id)")
 	}
+	cfg.MachineID = wrapper.SanitizeID(cfg.MachineID)
 
 	parts := wrapper.BuildCommandArgs(cfg.Command, cfg.Args)
 	if len(parts) == 0 {
@@ -154,6 +158,36 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 
 	if ownsMQTT {
 		defer client.Disconnect(100)
+	}
+
+	// Target machine gate per docs/mqtt-protocol.md §4.4 / multi-machine spec:
+	// Verify target machine is known and online before dispatching unless --force is specified.
+	if !cfg.Force {
+		heartbeatTimeout := 45 * time.Second
+		settleTimeout := 200 * time.Millisecond
+		if cfg.MQTT != nil {
+			if cfg.MQTT.HeartbeatTimeout > 0 {
+				heartbeatTimeout = cfg.MQTT.HeartbeatTimeout
+			}
+			if cfg.MQTT.SettleTimeout > 0 {
+				settleTimeout = cfg.MQTT.SettleTimeout
+			}
+		}
+
+		if cfg.Store != nil {
+			m, err := cfg.Store.GetMachine(ctx, cfg.MachineID)
+			if err != nil || m == nil {
+				return nil, fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse listen' is active on target node, or use --force to bypass", cfg.MachineID)
+			}
+			if !m.Online || (!m.LastHeartbeat.IsZero() && time.Since(m.LastHeartbeat) > heartbeatTimeout) {
+				return nil, fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", cfg.MachineID, m.HeartbeatAgo())
+			}
+		} else {
+			// Query broker retained status on the existing connected client without opening a second connection
+			if err := verifyTargetMachineOnClient(ctx, client, cfg.MachineID, settleTimeout, heartbeatTimeout); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	dispatchStartTime := time.Now().UTC()
@@ -364,5 +398,53 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 				return &dispatchMsg, fmt.Errorf("job %s failed: %s", j.ID, errMsg)
 			}
 		}
+	}
+}
+
+// verifyTargetMachineOnClient queries retained machine status on the existing MQTT client connection.
+func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machineID string, settleTimeout, heartbeatTimeout time.Duration) error {
+	statusTopic := mqtt.MachineStatusTopic(machineID)
+	received := make(chan *model.Machine, 1)
+
+	subToken := client.Subscribe(statusTopic, 1, func(_ paho.Client, msg paho.Message) {
+		var m model.Machine
+		if err := json.Unmarshal(msg.Payload(), &m); err == nil {
+			if m.ID == "" {
+				m.ID = machineID
+			}
+			if m.ID == machineID {
+				select {
+				case received <- &m:
+				default:
+				}
+			}
+		}
+	})
+	if !subToken.WaitTimeout(5 * time.Second) {
+		return fmt.Errorf("MQTT subscription timed out for %s", statusTopic)
+	}
+	if err := subToken.Error(); err != nil {
+		return fmt.Errorf("MQTT subscription failed for %s: %w", statusTopic, err)
+	}
+	defer func() {
+		unsub := client.Unsubscribe(statusTopic)
+		if unsub != nil {
+			unsub.WaitTimeout(time.Second)
+		}
+	}()
+
+	select {
+	case m := <-received:
+		if heartbeatTimeout <= 0 {
+			heartbeatTimeout = 45 * time.Second
+		}
+		if !m.Online || (!m.LastHeartbeat.IsZero() && time.Since(m.LastHeartbeat) > heartbeatTimeout) {
+			return fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", machineID, m.HeartbeatAgo())
+		}
+		return nil
+	case <-time.After(settleTimeout):
+		return fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse listen' is active on target node, or use --force to bypass", machineID)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

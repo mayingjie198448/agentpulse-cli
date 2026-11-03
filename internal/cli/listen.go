@@ -106,6 +106,11 @@ func newListenCmd() *cobra.Command {
 node heartbeat and LWT, subscribes to agentpulse/v1/machines/{machine_id}/commands/dispatch,
 and serially executes incoming AI agent jobs (agy / opencode).
 
+Node identity resolution precedence:
+  1. Explicit CLI flag (--machine / --machine-id)
+  2. AGENTPULSE_MACHINE_ID environment variable
+  3. Sanitized local hostname (lowercase alphanumeric with hyphens)
+
 Examples:
   # Listen for remote dispatch on broker:
   agentpulse listen --mqtt-url tcp://broker.example:1883
@@ -123,7 +128,7 @@ Examples:
 		},
 	}
 
-	listenCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (or $AGENTPULSE_MACHINE_ID)")
+	listenCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: $AGENTPULSE_MACHINE_ID or sanitized hostname)")
 	listenCmd.Flags().StringVar(&machineIDFlag, "machine-id", "", "Machine ID override (alias for --machine)")
 	listenCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (or $AGENTPULSE_MACHINE_NAME)")
 	listenCmd.Flags().StringVar(&statusFile, "status-file", "", "Path to write local status snapshot (or $AGENTPULSE_STATUS_FILE)")

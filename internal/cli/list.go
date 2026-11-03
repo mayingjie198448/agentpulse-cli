@@ -3,7 +3,6 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"text/tabwriter"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
@@ -12,12 +11,15 @@ import (
 
 func newListCmd() *cobra.Command {
 	var jsonOutput bool
+	var onlineOnly bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all monitored machines and agent jobs",
 		Long:  `Outputs a summary table of registered machines and current agent jobs.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+
 			st, err := getStore(cmd)
 			if err != nil {
 				return err
@@ -34,6 +36,16 @@ func newListCmd() *cobra.Command {
 				return err
 			}
 
+			if onlineOnly {
+				var filtered []model.Machine
+				for _, m := range machines {
+					if m.Online {
+						filtered = append(filtered, m)
+					}
+				}
+				machines = filtered
+			}
+
 			if jsonOutput {
 				payload := struct {
 					Machines []model.Machine `json:"machines"`
@@ -42,14 +54,14 @@ func newListCmd() *cobra.Command {
 					Machines: machines,
 					Jobs:     jobs,
 				}
-				enc := json.NewEncoder(os.Stdout)
+				enc := json.NewEncoder(out)
 				enc.SetIndent("", "  ")
 				return enc.Encode(payload)
 			}
 
 			// Format machine table
-			fmt.Println("MACHINES:")
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(out, "MACHINES:")
+			w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 			fmt.Fprintln(w, "NAME\tSTATUS\tHEARTBEAT\tPLATFORM\tIP\tACTIVE JOBS")
 			for _, m := range machines {
 				status := "ONLINE"
@@ -61,8 +73,8 @@ func newListCmd() *cobra.Command {
 			}
 			w.Flush()
 
-			fmt.Println("\nJOBS:")
-			wJobs := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(out, "\nJOBS:")
+			wJobs := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 			fmt.Fprintln(wJobs, "JOB ID\tMACHINE\tENGINE\tSTATUS\tPROGRESS\tTITLE\tCWD")
 			for _, j := range jobs {
 				fmt.Fprintf(wJobs, "%s\t%s\t%s\t%s\t%5.1f%%\t%s\t%s\n",
@@ -75,5 +87,6 @@ func newListCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output list in JSON format")
+	cmd.Flags().BoolVar(&onlineOnly, "online", false, "Filter machines to show only currently online nodes")
 	return cmd
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/dispatch"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +31,7 @@ func newDispatchCmd() *cobra.Command {
 		waitFlag       bool
 		followFlag     bool
 		quiet          bool
+		forceFlag      bool
 	)
 
 	dispatchCmd := &cobra.Command{
@@ -37,6 +39,12 @@ func newDispatchCmd() *cobra.Command {
 		Short: "Dispatch an autonomous agent task to a remote machine over MQTT",
 		Long: `Publishes a job dispatch instruction to agentpulse/v1/machines/{machine_id}/commands/dispatch
 over an MQTT broker per docs/mqtt-protocol.md §4.4.
+
+Target Machine Gate:
+  By default in MQTT mode, dispatch queries the broker to verify that the target machine
+  is known (has registered heartbeat) and currently online. If the machine is unknown or
+  offline, dispatch fails immediately to prevent lost commands. Use --force to bypass
+  this gate.
 
 Commands and arguments can be specified either via trailing arguments after -- or via
 --command and repeated --arg flags.
@@ -47,6 +55,9 @@ With --follow, the CLI additionally streams real-time stdout/stderr log events u
 Examples:
   # Dispatch agy command to remote machine:
   agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio -- agy run --prompt "Fix bug"
+
+  # Force dispatch to a node that has not yet reported online:
+  agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --force -- agy -p "Bootstrap"
 
   # Dispatch via --command and repeated --arg:
   agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine linux-gpu --command opencode --arg run --arg "--prompt=Train model"
@@ -66,6 +77,7 @@ Examples:
 			if machineID == "" {
 				return fmt.Errorf("machine ID is required (pass --machine or --machine-id)")
 			}
+			machineID = wrapper.SanitizeID(machineID)
 
 			// Resolve MQTT configuration
 			mqttCfg := resolveMQTTConfig(cmd)
@@ -148,6 +160,7 @@ Examples:
 				Wait:               waitFlag,
 				Follow:             followFlag,
 				Quiet:              quiet,
+				Force:              forceFlag,
 				MQTT:               pMQTT,
 				Out:                out,
 				ErrOut:             errOut,
@@ -175,6 +188,7 @@ Examples:
 	dispatchCmd.Flags().BoolVar(&waitFlag, "wait", false, "Wait for dispatched job completion and report progress")
 	dispatchCmd.Flags().BoolVar(&followFlag, "follow", false, "Wait for dispatched job completion and stream real-time logs")
 	dispatchCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress banner and status transition outputs")
+	dispatchCmd.Flags().BoolVar(&forceFlag, "force", false, "Force dispatch even if target machine is unknown or offline")
 
 	return dispatchCmd
 }
