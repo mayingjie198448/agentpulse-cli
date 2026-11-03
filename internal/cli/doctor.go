@@ -148,7 +148,11 @@ func newDoctorCmd() *cobra.Command {
 					Agents:    announceAgents,
 				}
 				opts := paho.NewClientOptions()
-				_ = mqtt.ApplyClientOptions(opts, mqttCfg)
+				doctorAnnounceCfg := mqttCfg
+				if doctorAnnounceCfg.ClientID != "" {
+					doctorAnnounceCfg.ClientID += "-announce"
+				}
+				_ = mqtt.ApplyClientOptions(opts, doctorAnnounceCfg)
 				c := paho.NewClient(opts)
 				if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
 					if err := mqtt.PublishAnnounce(c, ann); err == nil {

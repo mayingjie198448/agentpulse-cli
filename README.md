@@ -173,13 +173,13 @@ agentpulse doctor
 agentpulse dispatch agy -- run --prompt "优化数据库连接池"
 
 # 指定目标机器派发任务
-agentpulse dispatch op --machine mac-studio -- -p "重构认证模块"
+agentpulse dispatch --machine mac-studio op -- -p "重构认证模块"
 
 # 派发并实时跟踪进度与输出日志
-agentpulse dispatch agy --machine mac-studio --follow -- -p "运行单元测试集"
+agentpulse dispatch --machine mac-studio --follow agy -- -p "运行单元测试集"
 
 # 强制派发（绕过在线门禁）
-agentpulse dispatch agy --machine gpu-box --force -- -p "预热模型"
+agentpulse dispatch --machine gpu-box --force agy -- -p "预热模型"
 ```
 
 ---
@@ -271,10 +271,10 @@ agentpulse jobs
 主控端派发任务并实时追踪：
 ```bash
 # 自动匹配在线且装有 agy 的节点进行派发并实时跟踪日志
-agentpulse dispatch agy --follow -- run -p "修复支付模块并发 Bug"
+agentpulse dispatch --follow agy -- run -p "修复支付模块并发 Bug"
 
 # 指定机器派发
-agentpulse dispatch op --machine mac-studio --follow -- -p "重构数据迁移脚本"
+agentpulse dispatch --machine mac-studio --follow op -- -p "重构数据迁移脚本"
 ```
 
 > [!NOTE]
