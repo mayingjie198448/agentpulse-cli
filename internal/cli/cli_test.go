@@ -803,3 +803,153 @@ func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
 	})
 }
 
+func TestCLI_TLSConfiguration(t *testing.T) {
+	// 1. Flags resolution
+	t.Run("tls flags resolution", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{
+			"doctor",
+			"--mqtt-url", "tcp://broker.example:8883",
+			"--mqtt-tls",
+			"--mqtt-ca-cert", "/test/ca.pem",
+			"--mqtt-client-cert", "/test/client.crt",
+			"--mqtt-client-key", "/test/client.key",
+			"--mqtt-tls-insecure",
+			"--mqtt-server-name", "sni.example",
+		})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if !cfg.TLSEnable {
+			t.Errorf("expected TLSEnable=true from flag")
+		}
+		if cfg.CACertFile != "/test/ca.pem" {
+			t.Errorf("expected CACertFile='/test/ca.pem', got %q", cfg.CACertFile)
+		}
+		if cfg.ClientCertFile != "/test/client.crt" {
+			t.Errorf("expected ClientCertFile='/test/client.crt', got %q", cfg.ClientCertFile)
+		}
+		if cfg.ClientKeyFile != "/test/client.key" {
+			t.Errorf("expected ClientKeyFile='/test/client.key', got %q", cfg.ClientKeyFile)
+		}
+		if !cfg.InsecureSkipVerify {
+			t.Errorf("expected InsecureSkipVerify=true from flag")
+		}
+		if cfg.ServerName != "sni.example" {
+			t.Errorf("expected ServerName='sni.example', got %q", cfg.ServerName)
+		}
+		if !cfg.IsTLSEnabled() {
+			t.Errorf("expected IsTLSEnabled()=true")
+		}
+		if cfg.BrokerEndpoint() != "tls://broker.example:8883" {
+			t.Errorf("expected BrokerEndpoint='tls://broker.example:8883', got %q", cfg.BrokerEndpoint())
+		}
+	})
+
+	// 2. Env variables resolution
+	t.Run("tls env variables resolution", func(t *testing.T) {
+		os.Setenv("AGENTPULSE_MQTT_TLS", "true")
+		os.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
+		os.Setenv("AGENTPULSE_MQTT_CLIENT_CERT", "/env/client.crt")
+		os.Setenv("AGENTPULSE_MQTT_CLIENT_KEY", "/env/client.key")
+		os.Setenv("AGENTPULSE_MQTT_TLS_INSECURE", "1")
+		os.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
+		defer func() {
+			os.Unsetenv("AGENTPULSE_MQTT_TLS")
+			os.Unsetenv("AGENTPULSE_MQTT_CA_CERT")
+			os.Unsetenv("AGENTPULSE_MQTT_CLIENT_CERT")
+			os.Unsetenv("AGENTPULSE_MQTT_CLIENT_KEY")
+			os.Unsetenv("AGENTPULSE_MQTT_TLS_INSECURE")
+			os.Unsetenv("AGENTPULSE_MQTT_SERVER_NAME")
+		}()
+
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{"doctor"})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if !cfg.TLSEnable {
+			t.Errorf("expected TLSEnable=true from env")
+		}
+		if cfg.CACertFile != "/env/ca.pem" {
+			t.Errorf("expected CACertFile='/env/ca.pem', got %q", cfg.CACertFile)
+		}
+		if cfg.ClientCertFile != "/env/client.crt" {
+			t.Errorf("expected ClientCertFile='/env/client.crt', got %q", cfg.ClientCertFile)
+		}
+		if cfg.ClientKeyFile != "/env/client.key" {
+			t.Errorf("expected ClientKeyFile='/env/client.key', got %q", cfg.ClientKeyFile)
+		}
+		if !cfg.InsecureSkipVerify {
+			t.Errorf("expected InsecureSkipVerify=true from env")
+		}
+		if cfg.ServerName != "env.sni" {
+			t.Errorf("expected ServerName='env.sni', got %q", cfg.ServerName)
+		}
+	})
+
+	// 3. Flags override env
+	t.Run("tls flags override env", func(t *testing.T) {
+		os.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
+		os.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
+		defer func() {
+			os.Unsetenv("AGENTPULSE_MQTT_CA_CERT")
+			os.Unsetenv("AGENTPULSE_MQTT_SERVER_NAME")
+		}()
+
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{
+			"doctor",
+			"--mqtt-ca-cert", "/flag/ca.pem",
+			"--mqtt-server-name", "flag.sni",
+		})
+		_ = cmd.Execute()
+
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.CACertFile != "/flag/ca.pem" {
+			t.Errorf("expected CACertFile to be overridden by flag, got %q", cfg.CACertFile)
+		}
+		if cfg.ServerName != "flag.sni" {
+			t.Errorf("expected ServerName to be overridden by flag, got %q", cfg.ServerName)
+		}
+	})
+
+	// 4. Doctor output with TLS enabled and verify password is never printed
+	t.Run("doctor output displays TLS info and hides password", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{
+			"doctor",
+			"--mqtt-url", "tls://127.0.0.1:88833",
+			"--mqtt-username", "operator_alice",
+			"--mqtt-password", "super_secret_never_leak_pwd",
+			"--mqtt-ca-cert", "/certs/ca.pem",
+			"--mqtt-client-cert", "/certs/client.crt",
+			"--mqtt-client-key", "/certs/client.key",
+			"--mqtt-tls-insecure",
+			"--mqtt-server-name", "test.broker",
+		})
+
+		_ = cmd.Execute()
+		out := buf.String()
+
+		// Verify TLS info line
+		if !strings.Contains(out, "[INFO] MQTT TLS: enabled, insecure=true, ca=/certs/ca.pem, mTLS=true, sni=test.broker") {
+			t.Errorf("expected doctor output to contain complete TLS summary line, got:\n%s", out)
+		}
+
+		// Verify username is printed
+		if !strings.Contains(out, `auth=username "operator_alice"`) {
+			t.Errorf("expected username in doctor auth info, got:\n%s", out)
+		}
+
+		// Hard requirement: Password must NEVER be printed
+		if strings.Contains(out, "super_secret_never_leak_pwd") {
+			t.Errorf("CRITICAL SECURITY VIOLATION: password was printed in doctor output:\n%s", out)
+		}
+	})
+}
+
+

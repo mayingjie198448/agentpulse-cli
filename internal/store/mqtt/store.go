@@ -47,16 +47,9 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	opts := paho.NewClientOptions()
-	opts.AddBroker(cfg.BrokerURL)
-	opts.SetClientID(cfg.ClientID)
-	if cfg.Username != "" {
-		opts.SetUsername(cfg.Username)
+	if err := ApplyClientOptions(opts, cfg); err != nil {
+		return nil, fmt.Errorf("MQTT client options error: %w", err)
 	}
-	if cfg.Password != "" {
-		opts.SetPassword(cfg.Password)
-	}
-	opts.SetKeepAlive(cfg.KeepAlive)
-	opts.SetConnectTimeout(cfg.Timeout)
 	opts.SetAutoReconnect(true)
 	opts.SetCleanSession(true)
 

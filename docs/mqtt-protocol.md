@@ -397,38 +397,64 @@ flowchart LR
 ### 6.1 网络环境假设：家庭网关与 Tailscale
 
 1. **Broker 部署宿主**：
-   - 假定运行在家庭环境的 iStoreOS（OpenWrt 衍生版）路由或工控机，已安装并开启 `mosquitto` 服务，监听标准端口 `1883`。
+   - 假定运行在家庭环境的 iStoreOS（OpenWrt 衍生版）路由或工控机，已安装并开启 `mosquitto` 服务，监听标准端口 `1883`（明文）或 `8883`（TLS）。
 2. **跨机穿透与连通性**：
    - 所有工作站（Mac、云主机、本地 Linux）与家庭网关均加入同一个 **Tailscale 私有虚拟网格（Mesh VPN）**。
    - 所有通信流量均在 Tailscale 的 WireGuard 隧道内部加密传输（点对点直连或 DERP 中继），天然阻断公网扫描与非法探测。
-   - Broker 监听地址可直接使用 Tailscale 节点分配的专属 IP（例如 `100.x.y.z:1883`）或 MagicDNS 域名（例如 `istoreos-router.tailnet-xxxx.ts.net:1883`）。
+   - Broker 监听地址可使用私网域名（例如 `broker.example:8883`）或本地回环测试（例如 `127.0.0.1:8883`）。
 
-### 6.2 鉴权与安全占位设计 (Auth Placeholders)
+### 6.2 安全强化：TLS 加密传输与 Mosquitto ACL 访问控制 (Security Hardening: TLS & ACL)
 
-尽管运行在受信任的 Tailscale 隧道内部，协议依然规范预留完整的安全鉴权扩展能力：
+在 `release/0.4.0` 中，AgentPulse 实现了端到端的 MQTT TLS 加密与证书鉴权机制，并推荐配合 Mosquitto 最小权限 ACL 规则实现跨节点安全隔离：
 
-1. **连接凭据占位**：
-   - CLI 客户端与 Thin Wrapper 配置文件中预留认证配置块：
-     ```yaml
-     mqtt:
-       broker: "tcp://broker.example:1883" # 支持 tls://broker.example:8883
-       client_id: "agentpulse-cli-mayingjie"
-       username: "agentpulse_user"     # 鉴权占位符，默认留空支持匿名
-       password: "secret_token_here"   # 鉴权占位符，默认留空支持匿名
-       tls:
-         enable: false
-         ca_cert: ""
-         client_cert: ""
-         client_key: ""
-     ```
-2. **最小权限 ACL 规划建议**：
-   - 若 Broker 开启 Mosquitto ACL 规则，推荐权限隔离如下：
-     - **Thin Wrapper**（身份：`node-{machine_id}`）：
-       - 拥有 `agentpulse/v1/machines/{machine_id}/#` 的 `readwrite` 权限；
-       - 无权向其他 machine 主题发布虚假心跳或截获他人日志。
-     - **调度/监控 CLI**（身份：`operator-{user}`）：
-       - 拥有 `agentpulse/v1/machines/+/status` 与 `.../jobs/+/logs` 的 `read` 权限；
-       - 拥有 `agentpulse/v1/machines/+/commands/dispatch` 的 `write` 权限。
+#### 1. TLS 加密传输 (已在 release/0.4.0 落地)
+
+所有 MQTT 连接端点（`store.Store` 聚合读取、`agentpulse wrap` 边缘守护、`agentpulse listen` 监听守护、`agentpulse dispatch` 派活指令发送、`agentpulse doctor` 连通性自检）均统一支持 TLS 加密传输。
+
+- **URL Scheme 自动识别**：
+  - Broker URL 采用 `tls://`、`ssl://`、`mqtts://` 或 `tcps://`（例如 `tls://broker.example:8883`）时，CLI 与守护进程会自动开启 TLS 传输握手，无需额外参数。
+  - 亦可通过 `--mqtt-tls` 标志或环境变量 `AGENTPULSE_MQTT_TLS=true` 显式强制启用 TLS。
+
+- **CLI 标志与环境变量支持**：
+  | 配置项 | CLI 标志 | 环境变量 | 说明与默认值 |
+  | :--- | :--- | :--- | :--- |
+  | **强制启用 TLS** | `--mqtt-tls` | `AGENTPULSE_MQTT_TLS` | 布尔值（默认 `false`；若 Broker URL 为 `tls://` 等安全 scheme 则自动置为 `true`） |
+  | **自定义 CA 证书** | `--mqtt-ca-cert` | `AGENTPULSE_MQTT_CA_CERT` | 根 CA 证书 PEM 文件路径（用于自签名或企业自建 PKI 验签；留空则使用系统根证书库） |
+  | **客户端证书 (mTLS)** | `--mqtt-client-cert` | `AGENTPULSE_MQTT_CLIENT_CERT` | mTLS 双向认证客户端证书 PEM 文件路径 |
+  | **客户端私钥 (mTLS)** | `--mqtt-client-key` | `AGENTPULSE_MQTT_CLIENT_KEY` | mTLS 双向认证客户端私钥 PEM 文件路径（必须与 client-cert 成对提供） |
+  | **跳过服务端证书校验** | `--mqtt-tls-insecure` | `AGENTPULSE_MQTT_TLS_INSECURE` | 布尔值（默认 `false`；**危险**，详见下文警告） |
+  | **TLS SNI 覆盖** | `--mqtt-server-name` | `AGENTPULSE_MQTT_SERVER_NAME` | 自定义 TLS SNI 服务器名称（用于通过 IP 连接时匹配证书域名） |
+
+> [!WARNING]
+> `--mqtt-tls-insecure` / `AGENTPULSE_MQTT_TLS_INSECURE` 会彻底跳过 Broker 证书链与主机名合法性校验，导致连接容易遭受中间人劫持（MITM）与凭据窥探。**严禁在生产或公网环境下使用**，仅允许在局域网沙箱实验室调试或临时排障。
+
+- **密码安全保护 (Zero-Leakage Guarantee)**：
+  - MQTT 认证密码属于敏感机密，AgentPulse 保证密码在任何日志输出、终端错误堆栈以及 `agentpulse doctor` 诊断输出中均绝不打印展示（仅展示用户名）。
+
+- **证书错误快速失败 (Fail-Fast)**：
+  - 若配置了不存在或损坏的证书/密钥路径，CLI 与守护进程会在初始化阶段即刻报错退出，杜绝任何超时假死或网络悬挂。
+
+#### 2. 最小权限 Mosquitto ACL 规划与配置
+
+为防止恶意或被攻陷的单机节点冒充其它机器发布虚假心跳、窃听其它工作站日志或截获派活指令，推荐在 Mosquitto 中启用基于身份的 ACL 隔离。
+
+完整配置样例见：[docs/mosquitto-acl.example](mosquitto-acl.example)。
+
+核心隔离规则如下：
+- **监控/调度端 (Operator)**：身份前缀 `operator-{user}`（例如 `operator-alice`）
+  - 读权限：所有机器心跳（`agentpulse/v1/machines/+/status`）、任务状态（`.../jobs/+/status`）与日志（`.../jobs/+/logs`）；
+  - 写权限：向任意节点下发派活指令（`agentpulse/v1/machines/+/commands/dispatch`）；
+  - 读写权限：通知预警（`agentpulse/v1/notifications/alerts`）。
+- **边缘工作站 (Worker Node)**：身份前缀 `node-{machine_id}`（例如 `node-mac-studio`）
+  - 读写权限：**严格限定**在其专属机器主题树内（`agentpulse/v1/machines/{machine_id}/#`）；
+  - 无权写入其他机器的主题，亦无权读取其他节点专属的执行指令或日志流；
+  - 写权限：向通知中心上报紧急预警（`agentpulse/v1/notifications/alerts`）。
+- **动态模式匹配 (Pattern Matching)**：
+  - 对于大规模节点网络，可直接配置 Mosquitto 动态模式规则：
+    ```text
+    pattern readwrite agentpulse/v1/machines/%u/#
+    pattern write agentpulse/v1/notifications/alerts
+    ```
 
 ### 6.3 日志截断与背压控制 (Log Truncation & Backpressure)
 

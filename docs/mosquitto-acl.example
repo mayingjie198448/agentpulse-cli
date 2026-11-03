@@ -1,0 +1,74 @@
+# ==============================================================================
+# AgentPulse Mosquitto ACL Sample Configuration
+# ==============================================================================
+# This configuration demonstrates least-privilege Access Control Lists (ACLs)
+# for securing MQTT communication in AgentPulse v1 / release-0.4.0+.
+#
+# References:
+#   - docs/mqtt-protocol.md §6.2 (Security Hardening: TLS & ACL)
+#   - Mosquitto ACL format documentation: https://mosquitto.org/man/mosquitto-conf-5.html
+#
+# IMPORTANT:
+#   1. Replace placeholder user accounts (operator-alice, node-mac-studio) with
+#      your actual deployment usernames or client certificate Common Names.
+#   2. Never commit real credentials, passwords, or production network addresses
+#      to source control.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Operator & Monitor Clients (`agentpulse watch`, `agentpulse list`, `dispatch`)
+# ------------------------------------------------------------------------------
+# Identity: operator-{user} (e.g. operator-alice, operator-bob)
+#
+# Permissions:
+#   - Read all machine heartbeats and online statuses:
+#   - Read all job lifecycle state transitions:
+#   - Read task execution console log streams:
+#   - Write dispatch instructions to worker machines:
+#   - Read/write system notifications and alerts:
+
+user operator-alice
+topic read agentpulse/v1/machines/+/status
+topic read agentpulse/v1/machines/+/jobs/+/status
+topic read agentpulse/v1/machines/+/jobs/+/logs
+topic write agentpulse/v1/machines/+/commands/dispatch
+topic readwrite agentpulse/v1/notifications/alerts
+
+user operator-bob
+topic read agentpulse/v1/machines/+/status
+topic read agentpulse/v1/machines/+/jobs/+/status
+topic read agentpulse/v1/machines/+/jobs/+/logs
+topic write agentpulse/v1/machines/+/commands/dispatch
+topic readwrite agentpulse/v1/notifications/alerts
+
+# ------------------------------------------------------------------------------
+# 2. Worker Nodes (Thin Wrapper & Listener Daemons)
+# ------------------------------------------------------------------------------
+# Identity: node-{machine_id} (e.g. node-mac-studio, node-linux-gpu)
+#
+# Permissions:
+#   - Read and write ONLY within their own machine topic sub-tree.
+#   - Workers cannot spoof heartbeats or status updates of other nodes.
+#   - Workers cannot eavesdrop on other machines' dispatch commands or log streams.
+#   - Optional write permission to system notifications for urgent alerts.
+
+# Worker Node 1: mac-studio
+user node-mac-studio
+topic readwrite agentpulse/v1/machines/mac-studio/#
+topic write agentpulse/v1/notifications/alerts
+
+# Worker Node 2: linux-gpu
+user node-linux-gpu
+topic readwrite agentpulse/v1/machines/linux-gpu/#
+topic write agentpulse/v1/notifications/alerts
+
+# ------------------------------------------------------------------------------
+# 3. Dynamic Pattern Matching Alternative (Mosquitto 1.5+)
+# ------------------------------------------------------------------------------
+# When worker nodes authenticate using usernames matching their machine ID,
+# or when using mTLS client certificates where the Common Name matches %u,
+# the pattern directive enables automatic per-machine isolation without manually
+# enumerating every node identity:
+#
+# pattern readwrite agentpulse/v1/machines/%u/#
+# pattern write agentpulse/v1/notifications/alerts

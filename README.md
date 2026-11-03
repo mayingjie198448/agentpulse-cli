@@ -278,19 +278,25 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 All CLI commands (`watch`, `list`, `logs`, `doctor`, `dispatch`) support seamlessly toggling between mock simulation and a live MQTT broker:
 
 ```bash
-# 1. Run against a live MQTT broker via CLI flag:
-./agentpulse watch --mqtt-url tcp://broker.example:1883
+# 1. Run against a live MQTT broker via CLI flag (supports tcp:// and tls://):
+./agentpulse watch --mqtt-url tls://broker.example:8883
 ./agentpulse list --mqtt-url tcp://broker.example:1883 --mqtt-settle-timeout 200ms
 
-# 2. Or configure via environment variables:
-export AGENTPULSE_MQTT_URL="tcp://broker.example:1883"
+# 2. Or configure via environment variables (with optional TLS / mTLS):
+export AGENTPULSE_MQTT_URL="tls://broker.example:8883"
 export AGENTPULSE_MQTT_USERNAME="agentpulse_user"          # optional
-export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional
+export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional (never logged)
+export AGENTPULSE_MQTT_CA_CERT="/path/to/ca.pem"           # optional custom CA
+export AGENTPULSE_MQTT_CLIENT_CERT="/path/to/client.crt"   # optional mTLS
+export AGENTPULSE_MQTT_CLIENT_KEY="/path/to/client.key"    # optional mTLS
 export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained settle window
 export AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT="45s"             # optional stale heartbeat timeout
 ./agentpulse watch
 
-# 3. Explicit fallback to mock (overriding env vars):
+# 3. Security hardening (TLS & Mosquitto ACL):
+# See docs/mqtt-protocol.md §6.2 and docs/mosquitto-acl.example for detailed TLS options & ACL rules.
+
+# 4. Explicit fallback to mock (overriding env vars):
 ./agentpulse watch --store=mock
 ```
 

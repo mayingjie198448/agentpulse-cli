@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
@@ -65,6 +66,22 @@ availability of engine CLI binaries (agy, opencode) and future network adapters.
 				}
 				fmt.Fprintf(out, "[OK] Data Layer: MQTT Store configured (Target: %s)\n", cfg.BrokerURL)
 				fmt.Fprintf(out, "[INFO] MQTT Config: client_id=%s, auth=%s, settle=%v\n", cfg.ClientID, authInfo, cfg.SettleTimeout)
+				if cfg.IsTLSEnabled() {
+					tlsParts := []string{"enabled"}
+					if cfg.InsecureSkipVerify {
+						tlsParts = append(tlsParts, "insecure=true")
+					}
+					if cfg.CACertFile != "" {
+						tlsParts = append(tlsParts, fmt.Sprintf("ca=%s", cfg.CACertFile))
+					}
+					if cfg.ClientCertFile != "" {
+						tlsParts = append(tlsParts, "mTLS=true")
+					}
+					if cfg.ServerName != "" {
+						tlsParts = append(tlsParts, fmt.Sprintf("sni=%s", cfg.ServerName))
+					}
+					fmt.Fprintf(out, "[INFO] MQTT TLS: %s\n", strings.Join(tlsParts, ", "))
+				}
 				fmt.Fprintf(out, "[...] MQTT Broker: Checking connectivity to %s (timeout: 2s)...\n", cfg.BrokerURL)
 				if err := testMQTTConnection(cfg, 2*time.Second); err != nil {
 					fmt.Fprintf(out, "[WARN] MQTT Broker: Connectivity check failed (%v)\n", err)
