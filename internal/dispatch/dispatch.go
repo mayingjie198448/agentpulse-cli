@@ -19,6 +19,7 @@ import (
 // Config configures a job dispatch invocation.
 type Config struct {
 	MachineID          string
+	AgentName          string // Requested agent CLI or alias (0.5.0 gate check)
 	JobID              string
 	CommandID          string
 	Engine             model.EngineType
@@ -171,14 +172,30 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		if cfg.Store != nil {
 			m, err := cfg.Store.GetMachine(ctx, cfg.MachineID)
 			if err != nil || m == nil {
-				return nil, fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse listen' is active on target node, or use --force to bypass", cfg.MachineID)
+				return nil, fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse' is active on target node, or use --force to bypass", cfg.MachineID)
 			}
 			if !m.Online || (!m.LastHeartbeat.IsZero() && time.Since(m.LastHeartbeat) > heartbeatTimeout) {
 				return nil, fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", cfg.MachineID, m.HeartbeatAgo())
 			}
+
+			// 0.5.0 Agent readiness gate
+			if cfg.AgentName != "" {
+				ann, err := cfg.Store.GetAnnounce(ctx, cfg.MachineID)
+				if err != nil || ann == nil {
+					return nil, fmt.Errorf("target machine %q has no announce registered (cannot verify agent %q); check doctor or use --force to bypass", cfg.MachineID, cfg.AgentName)
+				}
+				ag, ok := ann.FindAgent(cfg.AgentName)
+				if !ok || !ag.Ok {
+					detail := "not announced"
+					if ok {
+						detail = ag.Detail
+					}
+					return nil, fmt.Errorf("target machine %q agent %q is not available (ok: false: %s); check doctor or use --force to bypass", cfg.MachineID, cfg.AgentName, detail)
+				}
+			}
 		} else {
-			// Query broker retained status on the existing connected client without opening a second connection
-			if err := verifyTargetMachineOnClient(ctx, client, cfg.MachineID, settleTimeout, heartbeatTimeout); err != nil {
+			// Query broker retained status and announce on the existing connected client without opening a second connection
+			if err := verifyTargetMachineOnClient(ctx, client, cfg.MachineID, cfg.AgentName, settleTimeout, heartbeatTimeout); err != nil {
 				return nil, err
 			}
 		}
@@ -395,10 +412,12 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 	}
 }
 
-// verifyTargetMachineOnClient queries retained machine status on the existing MQTT client connection.
-func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machineID string, settleTimeout, heartbeatTimeout time.Duration) error {
+// verifyTargetMachineOnClient queries retained machine status and announcement on the existing MQTT client connection.
+func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machineID, agentName string, settleTimeout, heartbeatTimeout time.Duration) error {
 	statusTopic := mqtt.MachineStatusTopic(machineID)
-	received := make(chan *model.Machine, 1)
+	announceTopic := mqtt.MachineAnnounceTopic(machineID)
+	receivedMachine := make(chan *model.Machine, 1)
+	receivedAnnounce := make(chan *model.MachineAnnounce, 1)
 
 	subToken := client.Subscribe(statusTopic, 1, func(_ paho.Client, msg paho.Message) {
 		var m model.Machine
@@ -408,7 +427,7 @@ func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machin
 			}
 			if m.ID == machineID {
 				select {
-				case received <- &m:
+				case receivedMachine <- &m:
 				default:
 				}
 			}
@@ -427,18 +446,65 @@ func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machin
 		}
 	}()
 
+	if agentName != "" {
+		annToken := client.Subscribe(announceTopic, 1, func(_ paho.Client, msg paho.Message) {
+			var ann model.MachineAnnounce
+			if err := json.Unmarshal(msg.Payload(), &ann); err == nil {
+				if ann.MachineID == "" {
+					ann.MachineID = machineID
+				}
+				if ann.MachineID == machineID {
+					select {
+					case receivedAnnounce <- &ann:
+					default:
+					}
+				}
+			}
+		})
+		if annToken.WaitTimeout(5 * time.Second) && annToken.Error() == nil {
+			defer func() {
+				unsub := client.Unsubscribe(announceTopic)
+				if unsub != nil {
+					unsub.WaitTimeout(time.Second)
+				}
+			}()
+		}
+	}
+
+	var targetMachine *model.Machine
 	select {
-	case m := <-received:
-		if heartbeatTimeout <= 0 {
-			heartbeatTimeout = 45 * time.Second
-		}
-		if !m.Online || (!m.LastHeartbeat.IsZero() && time.Since(m.LastHeartbeat) > heartbeatTimeout) {
-			return fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", machineID, m.HeartbeatAgo())
-		}
-		return nil
+	case m := <-receivedMachine:
+		targetMachine = m
 	case <-time.After(settleTimeout):
-		return fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse listen' is active on target node, or use --force to bypass", machineID)
+		return fmt.Errorf("target machine %q is unknown (never registered or no heartbeat seen); ensure 'agentpulse' is active on target node, or use --force to bypass", machineID)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+
+	if heartbeatTimeout <= 0 {
+		heartbeatTimeout = 45 * time.Second
+	}
+	if !targetMachine.Online || (!targetMachine.LastHeartbeat.IsZero() && time.Since(targetMachine.LastHeartbeat) > heartbeatTimeout) {
+		return fmt.Errorf("target machine %q is offline (last heartbeat %s); check node listen status and connectivity, or use --force to bypass", machineID, targetMachine.HeartbeatAgo())
+	}
+
+	if agentName != "" {
+		select {
+		case ann := <-receivedAnnounce:
+			ag, ok := ann.FindAgent(agentName)
+			if !ok || !ag.Ok {
+				detail := "not announced"
+				if ok {
+					detail = ag.Detail
+				}
+				return fmt.Errorf("target machine %q agent %q is not available (ok: false: %s); check doctor or use --force to bypass", machineID, agentName, detail)
+			}
+		case <-time.After(settleTimeout):
+			return fmt.Errorf("target machine %q has no announce data (cannot verify agent %q); check doctor or use --force to bypass", machineID, agentName)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
 }

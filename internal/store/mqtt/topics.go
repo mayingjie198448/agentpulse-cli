@@ -20,7 +20,18 @@ const (
 
 	// TopicMachinesDispatch subscribes to all job dispatch commands across machines.
 	TopicMachinesDispatch = "agentpulse/v1/machines/+/commands/dispatch"
+
+	// TopicAnnounceWildcard subscribes to all machine announcements per 0.5.0 spec.
+	TopicAnnounceWildcard = "agentpulse/v1/+/announce"
+
+	// TopicMachinesAnnounceWildcard subscribes to legacy/namespaced announcements.
+	TopicMachinesAnnounceWildcard = "agentpulse/v1/machines/+/announce"
 )
+
+// MachineAnnounceTopic returns the announce topic for a specific machine.
+func MachineAnnounceTopic(machineID string) string {
+	return fmt.Sprintf("agentpulse/v1/%s/announce", machineID)
+}
 
 // MachineDispatchTopic returns the dispatch command topic for a specific machine.
 func MachineDispatchTopic(machineID string) string {
@@ -50,6 +61,7 @@ const (
 	topicJobStatus
 	topicJobLog
 	topicCommandDispatch
+	topicAnnounce
 )
 
 type parsedTopic struct {
@@ -63,8 +75,28 @@ func parseTopic(topic string) parsedTopic {
 	clean := strings.Trim(topic, "/")
 	parts := strings.Split(clean, "/")
 
-	// Minimum topic length is 5: agentpulse/v1/machines/{machine_id}/status
-	if len(parts) < 5 || parts[0] != "agentpulse" || parts[1] != "v1" || parts[2] != "machines" {
+	if len(parts) < 3 || parts[0] != "agentpulse" || parts[1] != "v1" {
+		return parsedTopic{typ: topicUnknown}
+	}
+
+	// 0.5.0 spec: agentpulse/v1/{machine_id}/announce
+	if len(parts) == 4 && parts[3] == "announce" {
+		return parsedTopic{
+			typ:       topicAnnounce,
+			machineID: parts[2],
+		}
+	}
+
+	// Legacy / namespaced announce: agentpulse/v1/machines/{machine_id}/announce
+	if len(parts) == 5 && parts[2] == "machines" && parts[4] == "announce" {
+		return parsedTopic{
+			typ:       topicAnnounce,
+			machineID: parts[3],
+		}
+	}
+
+	// Minimum topic length for machine commands/jobs/status is 5: agentpulse/v1/machines/{machine_id}/status
+	if len(parts) < 5 || parts[2] != "machines" {
 		return parsedTopic{typ: topicUnknown}
 	}
 

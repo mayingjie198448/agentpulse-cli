@@ -816,7 +816,8 @@ func TestDispatch_EndToEnd_WithListener(t *testing.T) {
 }
 
 type fakeDispatchStore struct {
-	machines map[string]*model.Machine
+	machines  map[string]*model.Machine
+	announces map[string]*model.MachineAnnounce
 }
 
 func (f *fakeDispatchStore) ListMachines(ctx context.Context) ([]model.Machine, error) {
@@ -833,6 +834,22 @@ func (f *fakeDispatchStore) GetMachine(ctx context.Context, id string) (*model.M
 		return &cp, nil
 	}
 	return nil, fmt.Errorf("machine not found: %s", id)
+}
+
+func (f *fakeDispatchStore) ListAnnounces(ctx context.Context) ([]model.MachineAnnounce, error) {
+	var res []model.MachineAnnounce
+	for _, a := range f.announces {
+		res = append(res, *a)
+	}
+	return res, nil
+}
+
+func (f *fakeDispatchStore) GetAnnounce(ctx context.Context, id string) (*model.MachineAnnounce, error) {
+	if a, ok := f.announces[id]; ok {
+		cp := *a
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("announce not found: %s", id)
 }
 
 func (f *fakeDispatchStore) ListJobs(ctx context.Context) ([]model.Job, error) { return nil, nil }
@@ -856,6 +873,15 @@ func TestDispatch_TargetMachineGate(t *testing.T) {
 				Name:          "offline-node",
 				Online:        false,
 				LastHeartbeat: now.Add(-2 * time.Minute),
+			},
+		},
+		announces: map[string]*model.MachineAnnounce{
+			"online-node": {
+				MachineID: "online-node",
+				Agents: []model.AgentAnnounce{
+					{ID: "agy", Alias: []string{"agy"}, Ok: true, Detail: "/usr/local/bin/agy"},
+					{ID: "opencode", Alias: []string{"op", "opencode"}, Ok: false, Detail: "binary missing"},
+				},
 			},
 		},
 	}
@@ -952,6 +978,66 @@ func TestDispatch_TargetMachineGate(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("expected dispatch to online node to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 5a. Online machine with OK agent succeeds
+	t.Run("online machine with ok agent succeeds", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "online-node",
+			AgentName:  "agy",
+			Command:    "agy",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err != nil {
+			t.Fatalf("expected dispatch with ready agent to succeed, got: %v", err)
+		}
+		if cmd == nil || cmd.JobID == "" {
+			t.Errorf("unexpected cmd result: %+v", cmd)
+		}
+	})
+
+	// 5b. Online machine with failed agent (ok: false) fails without force
+	t.Run("online machine with unready agent fails without force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "online-node",
+			AgentName:  "opencode",
+			Command:    "opencode",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      false,
+		})
+		if err == nil {
+			t.Fatal("expected dispatch with unready agent to fail")
+		}
+		if !strings.Contains(err.Error(), "not available") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	// 5c. Online machine with unready agent succeeds with --force
+	t.Run("online machine with unready agent succeeds with force", func(t *testing.T) {
+		mockClient := newMockMQTTClient()
+		cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+			MachineID:  "online-node",
+			AgentName:  "opencode",
+			Command:    "opencode",
+			Args:       []string{"-p", "test"},
+			Store:      st,
+			MQTTClient: mockClient,
+			Force:      true,
+		})
+		if err != nil {
+			t.Fatalf("expected forced dispatch with unready agent to succeed, got: %v", err)
 		}
 		if cmd == nil || cmd.JobID == "" {
 			t.Errorf("unexpected cmd result: %+v", cmd)
