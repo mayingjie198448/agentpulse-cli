@@ -125,15 +125,9 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		}
 
 		opts := paho.NewClientOptions()
-		opts.AddBroker(mqttCfg.BrokerURL)
-		opts.SetClientID(mqttCfg.ClientID)
-		if mqttCfg.Username != "" {
-			opts.SetUsername(mqttCfg.Username)
+		if err := mqtt.ApplyClientOptions(opts, mqttCfg); err != nil {
+			return nil, fmt.Errorf("MQTT client options error: %w", err)
 		}
-		if mqttCfg.Password != "" {
-			opts.SetPassword(mqttCfg.Password)
-		}
-		opts.SetConnectTimeout(mqttCfg.Timeout)
 		opts.SetAutoReconnect(false)
 
 		c := paho.NewClient(opts)
