@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -90,18 +91,58 @@ type LogEntry struct {
 type EventType string
 
 const (
-	EventMachineUpdated EventType = "machine_updated"
-	EventJobUpdated     EventType = "job_updated"
-	EventLogAdded       EventType = "log_added"
+	EventMachineUpdated  EventType = "machine_updated"
+	EventJobUpdated      EventType = "job_updated"
+	EventLogAdded        EventType = "log_added"
+	EventAnnounceUpdated EventType = "announce_updated"
 )
 
 // Event carries state changes emitted across machines/jobs.
 type Event struct {
-	Type      EventType `json:"type"`
-	Machine   *Machine  `json:"machine,omitempty"`
-	Job       *Job      `json:"job,omitempty"`
-	Log       *LogEntry `json:"log,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	Type      EventType        `json:"type"`
+	Machine   *Machine         `json:"machine,omitempty"`
+	Job       *Job             `json:"job,omitempty"`
+	Log       *LogEntry        `json:"log,omitempty"`
+	Announce  *MachineAnnounce `json:"announce,omitempty"`
+	Timestamp time.Time        `json:"timestamp"`
+}
+
+// AgentAnnounce represents a single agent announced by a machine.
+type AgentAnnounce struct {
+	ID     string   `json:"id"`
+	Alias  []string `json:"alias"`
+	Ok     bool     `json:"ok"`
+	Detail string   `json:"detail"`
+}
+
+// MachineAnnounce represents an announcement payload published to agentpulse/v1/{machine_id}/announce.
+type MachineAnnounce struct {
+	V         int             `json:"v"`
+	MachineID string          `json:"machine_id"`
+	TS        time.Time       `json:"ts"`
+	Rev       int             `json:"rev"`
+	Hostname  string          `json:"hostname"`
+	OS        string          `json:"os"`
+	Agents    []AgentAnnounce `json:"agents"`
+}
+
+// FindAgent looks up an agent in the announcement by ID or alias.
+func (m *MachineAnnounce) FindAgent(nameOrAlias string) (AgentAnnounce, bool) {
+	if m == nil {
+		return AgentAnnounce{}, false
+	}
+	nameLower := strings.ToLower(strings.TrimSpace(nameOrAlias))
+	for _, ag := range m.Agents {
+		if strings.ToLower(ag.ID) == nameLower {
+			return ag, true
+		}
+		for _, a := range ag.Alias {
+			if strings.ToLower(a) == nameLower {
+				return ag, true
+			}
+		}
+	}
+	return AgentAnnounce{}, false
 }
 
 // DispatchCommand represents a remote job dispatch instruction (docs/mqtt-protocol.md §4.4).

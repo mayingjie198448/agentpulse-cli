@@ -54,7 +54,7 @@ func TestDoctorCommand_Output(t *testing.T) {
 		}
 
 		out := buf.String()
-		if !strings.Contains(out, "In-memory simulation store active (default)") {
+		if !strings.Contains(out, "内存模拟模式 (mock store)") && !strings.Contains(out, "In-memory simulation store active (default)") {
 			t.Errorf("expected default mock store message, got: %s", out)
 		}
 	})
@@ -72,10 +72,10 @@ func TestDoctorCommand_Output(t *testing.T) {
 		}
 
 		out := buf.String()
-		if !strings.Contains(out, "MQTT Store configured (Target: tcp://127.0.0.1:18833)") {
+		if !strings.Contains(out, "tcp://127.0.0.1:18833") {
 			t.Errorf("expected MQTT Store configured output, got: %s", out)
 		}
-		if !strings.Contains(out, "Checking connectivity") {
+		if !strings.Contains(out, "Broker 连通性测试中") && !strings.Contains(out, "Checking connectivity") {
 			t.Errorf("expected checking connectivity line, got: %s", out)
 		}
 	})
@@ -948,6 +948,90 @@ func TestCLI_TLSConfiguration(t *testing.T) {
 		// Hard requirement: Password must NEVER be printed
 		if strings.Contains(out, "super_secret_never_leak_pwd") {
 			t.Errorf("CRITICAL SECURITY VIOLATION: password was printed in doctor output:\n%s", out)
+		}
+	})
+}
+
+func TestRootCommand_050ProductBoundaries(t *testing.T) {
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--help"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error running --help: %v", err)
+	}
+
+	helpText := buf.String()
+
+	// Visible commands must be present
+	expectedVisible := []string{"config", "doctor", "dispatch", "jobs", "watch", "version"}
+	for _, sub := range expectedVisible {
+		if !strings.Contains(helpText, sub) {
+			t.Errorf("expected %q to be visible in root help, got:\n%s", sub, helpText)
+		}
+	}
+
+	// Chinese help text requirement
+	if !strings.Contains(helpText, "AgentPulse 监控并调度多台机器") {
+		t.Errorf("expected Chinese description in root help, got:\n%s", helpText)
+	}
+
+	// Hidden subcommands must NOT appear in visible Available Commands list
+	for _, hidden := range []string{"listen", "wrap"} {
+		// When hidden, cobra will not include them in the Available Commands list
+		lines := strings.Split(helpText, "\n")
+		inAvailableCommands := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "Available Commands:") {
+				inAvailableCommands = true
+				continue
+			}
+			if inAvailableCommands && strings.HasPrefix(trimmed, "Flags:") {
+				inAvailableCommands = false
+				break
+			}
+			if inAvailableCommands && strings.HasPrefix(trimmed, hidden+" ") {
+				t.Errorf("hidden command %q should NOT be listed in Available Commands, line: %s", hidden, line)
+			}
+		}
+	}
+}
+
+func TestJobsCommand_Output(t *testing.T) {
+	t.Run("table output", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"jobs"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error running jobs: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "AgentPulse 全网任务列表") {
+			t.Errorf("expected jobs header, got:\n%s", out)
+		}
+	})
+
+	t.Run("json output", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"jobs", "--json"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error running jobs --json: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, `"id":`) && !strings.Contains(out, `[]`) {
+			t.Errorf("expected JSON array or job objects, got:\n%s", out)
 		}
 	})
 }

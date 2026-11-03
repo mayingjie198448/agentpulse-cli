@@ -66,243 +66,163 @@ go build -o agentpulse ./cmd/agentpulse
 ./agentpulse version
 ```
 
-### 构建 / 获取 Mac .app（Apple Silicon）
+### 发版构建 (Release Binaries + SHA256SUMS)
 
-为 macOS 用户提供了一键打包 Apple Silicon (`darwin/arm64`) 原生 App Bundle 的脚本：
+0.5.0 起，项目 Release 官方分发资产统一为各平台**裸二进制与 SHA256SUMS 校验文件**，废除 `.app` 必选项：
 
-- **环境要求**：Apple Silicon Mac (M1/M2/M3/M4 系列) + Go 1.22+
-- **构建命令**：
-  ```bash
-  bash scripts/build-macos-app.sh
-  ```
+```bash
+# 一键交叉编译全平台二进制并生成 SHA256SUMS
+bash scripts/build-release.sh
+```
+产物将输出至 `dist/`：
+- `agentpulse-0.5.0-darwin-arm64` / `agentpulse-0.5.0-darwin-amd64`
+- `agentpulse-0.5.0-linux-arm64` / `agentpulse-0.5.0-linux-amd64`
+- `agentpulse-0.5.0-windows-amd64.exe`
+- `SHA256SUMS`
+
+### 可选：本地打包 Mac .app（Apple Silicon）
+
+项目保留了用于本地 macOS 桌面双击体验的打包脚本（非发版必选）：
+
+- **构建命令**：`bash scripts/build-macos-app.sh`
 - **产物路径**：`dist/AgentPulse.app`
-- **使用方式**：
-  - **Finder 双击**：自动唤起 Terminal.app 执行 `agentpulse version` 与帮助说明，并驻留交互终端以便随时输入命令。
-  - **终端直接执行**：
-    ```bash
-    # 启动器（兼容 CLI 参数并支持终端交互）：
-    ./dist/AgentPulse.app/Contents/MacOS/agentpulse version
-    # 或直接运行底层 Mach-O 二进制：
-    ./dist/AgentPulse.app/Contents/MacOS/agentpulse-bin version
-    ```
-- **Gatekeeper 与安全性说明**：
-  - 本地离线构建未接入 Apple 商业付费开发者证书公证（Notarization）。
-  - 若在其他 Mac 上通过网络分发打开提示拦截，可在 Finder 中右键点击 App 选择「打开」，或在终端使用中性命令解除隔离属性：
-    ```bash
-    xattr -cr /path/to/AgentPulse.app
-    ```
-
-详细 Bundle 内部结构与原理解析参见 [macOS App 打包设计文档](docs/macos-app.md)。
+- 详细说明参见 [macOS App 打包设计文档](docs/macos-app.md)。
 
 ---
 
-## 🚀 Usage
+## 🚀 Usage (0.5.0 命令面体系)
 
-### 1. Interactive Watch Dashboard (`watch`)
+### 1. 常驻单进程双角色 (`agentpulse`)
 
-Launches a cyberpunk-styled terminal dashboard (Bubble Tea & Lipgloss) showing multi-machine heartbeats, active agent jobs, real-time progress bars, and scrolling logs:
-
-```bash
-./agentpulse watch
-```
-
-#### TUI Keyboard Shortcuts
-
-| Key | Action |
-| :--- | :--- |
-| `↑` / `↓` or `j` / `k` | Navigate and select jobs |
-| `Tab` | Switch focus between Jobs list and Log Viewer |
-| `Space` | Pause / Resume live telemetry simulation |
-| `a` | Toggle log autoscroll |
-| `c` | Clear log buffer for selected job |
-| `PgUp` / `PgDn` | Scroll through logs |
-| `q` / `Ctrl+C` | Exit dashboard |
-
-#### Plain-text / Piped Mode
-If stdout is not a TTY (e.g. redirected to a pipe or log file) or when `--plain` is specified, `watch` gracefully downgrades to a plain-text periodic snapshot:
+直接运行 `agentpulse`（无子命令）即启动常驻单进程：
+- **本机上报角色**：自动向 MQTT Broker 上报心跳（LWT 守护）、广播本机 Announce 拓扑，并在后台监听与串行执行下发到本机的 dispatch 作业；
+- **全网监控角色**：订阅全网机器心跳与任务流式事件，在终端拉起 Cyber 风格实时监控大盘（TUI，在非 TTY 管道中自动退化为纯文本快照）。
 
 ```bash
-./agentpulse watch --plain
-./agentpulse watch | grep "job-agy-01"
+# 启动常驻双角色守护服务（默认读取 ~/.config/agentpulse/config.yaml）
+agentpulse
+
+# 强制以纯文本快照模式运行
+agentpulse --plain
+
+# 指定特定配置文件
+agentpulse --config /path/to/custom-config.yaml
 ```
 
 ---
 
-### 2. List Machines and Jobs (`list`)
+### 2. 交互式配置向导 (`config`)
 
-Prints registered nodes, heartbeats, active jobs, engines, and status:
+引导式完成客户端与 Broker 配置，取代旧版环境变量形式：
+- **步骤 1**：配置 MQTT Broker 地址与鉴权信息（自动测试连通性）；
+- **步骤 2**：确认/设定本机机器标识 `machine_id`；
+- **步骤 3**：安全保存配置文件并广播本机 Announce，扫描展示网内其他在线设备；
+- **步骤 4**：探测本机 PATH 中安装的 Agent CLI（`agy`、`opencode`、`codex`）并注册别名。
 
 ```bash
-# Standard table output
-./agentpulse list
+# 运行配置向导
+agentpulse config
+```
 
-# Filter to only show online machines
-./agentpulse list --online
+- **配置文件规范**：
+  - 默认路径：`~/.config/agentpulse/config.yaml`（Windows 为 `%AppData%\agentpulse\config.yaml`）
+  - 安全权限：目录权限 `0700`，文件权限 `0600`
+  - 仅支持 `--config <path>` 显式覆盖；不再使用环境变量指向配置路径。
+  - 若检测到旧 `AGENTPULSE_*` 环境变量，自动输出降级告警引导迁移。
+- **配置示例 Schema**：
+  ```yaml
+  version: 1
+  machine_id: macbook-pro
+  broker:
+    url: tls://broker.example:8883
+    username: agentpulse
+    password: "..."
+    tls: true
+  agents:
+    - id: agy
+      path: ""
+      alias: [agy]
+    - id: opencode
+      path: ""
+      alias: [op, opencode]
+    - id: codex
+      path: ""
+      alias: [codex]
+  ```
 
-# JSON output
-./agentpulse list --json
+---
+
+### 3. 系统诊断与全网拓扑 (`doctor`)
+
+对当前终端环境、配置文件、MQTT Broker 连通性以及本机 Agent CLI 进行全面探测。诊断完成后自动向 Broker 同步最新 Announce 广播，并拉取全网所有机器与 CLI 拓扑汇总为扁平表格：
+
+```bash
+agentpulse doctor
 ```
 
 ---
 
-### 3. Inspect Job Logs (`logs <job-id>`)
+### 4. 远程任务调度 (`dispatch`)
 
-Retrieve historical logs or stream live events:
+向 MQTT 消息中枢下发作业调度指令：
+- **自动选机与门禁**：若未指定 `--machine`，自动扫描网内唯一在线且声明支持该 Agent CLI 的机器；派发时进行门禁核验（目标节点心跳新鲜 + 对应 `agents[].ok: true`）。
+- **实时跟踪与流式日志**：支持 `--follow` 直播远程标准输出与错误流，直至任务结束。
 
 ```bash
-# View last 50 log entries
-./agentpulse logs job-agy-01
+# 自动匹配支持 agy 的在线机器并派发
+agentpulse dispatch agy -- run --prompt "优化数据库连接池"
 
-# Stream real-time logs (equivalent to tail -f)
-./agentpulse logs job-agy-01 -f
+# 指定目标机器派发任务
+agentpulse dispatch op --machine mac-studio -- -p "重构认证模块"
 
-# Specify log count
-./agentpulse logs job-opencode-04 --tail 10
+# 派发并实时跟踪进度与输出日志
+agentpulse dispatch agy --machine mac-studio --follow -- -p "运行单元测试集"
+
+# 强制派发（绕过在线门禁）
+agentpulse dispatch agy --machine gpu-box --force -- -p "预热模型"
 ```
 
 ---
 
-### 4. Thin Wrapper: Monitor Local Agent Runs (`wrap`)
+### 5. 全网任务查看 (`jobs`)
 
-`agentpulse wrap` is a thin local process that executes an AI agent command (`agy` or `opencode`), streams console output locally, writes local status snapshots (`.agentpulse/status.json`), and publishes real-time node heartbeats, job lifecycle transitions, and log streams to an MQTT broker per [MQTT Protocol Spec](docs/mqtt-protocol.md).
-
-By default, missing binaries fail explicitly (never silently stubbed). Passing `--stub` enables simulated execution for testing or automated CI without requiring the engine to be installed.
-
-> [!NOTE]
-> **Single-Machine Slice (Step 3)**:
-> - If `AGENTPULSE_MQTT_URL` or `--mqtt-url` is specified, telemetry is actively published to the MQTT broker (LWT, QoS 1 retained heartbeats and job statuses, QoS 0 log streaming).
-> - If no broker URL is provided, the wrapper executes locally, mirrors output, and writes local status snapshots without requiring a broker.
-> - **Security Note**: Use `--dangerously-skip-permissions` only in this repo / trusted workspace to permit unattended execution.
+从消息存储中检索并汇总跨机器的全部 AI Agent 任务（运行中、排队中、已完成与失败任务）：
 
 ```bash
-# Wrap agy in local mode (writes .agentpulse/status.json, no broker needed):
-./agentpulse wrap -- agy --dangerously-skip-permissions -p "Fix bug in store"
+# 表格展示全网任务列表
+agentpulse jobs
 
-# Or pass --dangerously-skip-permissions as a wrapper flag:
-./agentpulse wrap --dangerously-skip-permissions agy -p "Refactor auth layer"
-
-# Wrap agy and stream live telemetry to an MQTT broker:
-./agentpulse wrap --mqtt-url tcp://broker.example:1883 -- agy --dangerously-skip-permissions -p "Run test suite"
-
-# Run simulated execution (explicit --stub required for simulation):
-./agentpulse wrap --engine opencode --stub
+# 输出机器可读的 JSON 格式
+agentpulse jobs --json
 ```
 
 ---
 
-### 5. Edge Listener Daemon (`wrap --listen` / `listen`)
+### 6. 实时监控看板与单任务监听 (`watch`)
 
-`agentpulse wrap --listen` (or `agentpulse listen`) runs an edge worker daemon on a target machine that connects to an MQTT broker, registers node LWT and periodic heartbeats, subscribes to incoming dispatch commands, and executes jobs serially:
-
-- **Topic**: Subscribes to `agentpulse/v1/machines/{machine_id}/commands/dispatch` (QoS 1).
-- **Concurrency**: Jobs are processed sequentially via an internal serial queue (one job at a time) to prevent resource contention.
-- **Resilience**: Malformed or invalid payloads are rejected with clear local logs without crashing the daemon.
-- **Clean Shutdown**: On `Ctrl+C` (SIGINT/SIGTERM), the daemon stops accepting new commands, cancels any running job, publishes offline status (`online: false, job_count: 0`), and disconnects cleanly.
+- **无参数**：启动交互式 Cyber TUI 监控大盘（快捷键：`Tab` 切换面板、`j`/`k` 选择任务、`Space` 暂停/恢复、`q` 退出）；
+- **带任务 ID**：定向追踪该任务的实时进度与控制台日志流，直到任务完成。
 
 ```bash
-# Start edge listener on this machine:
-./agentpulse listen --mqtt-url tcp://broker.example:1883
+# 启动全网 TUI 监控大盘
+agentpulse watch
 
-# Or via wrap --listen with explicit node identifier:
-./agentpulse wrap --listen --mqtt-url tcp://broker.example:1883 --machine mac-studio
-
-# Start listener with simulated execution mode for testing:
-./agentpulse listen --mqtt-url tcp://broker.example:1883 --machine linux-gpu --stub
+# 监听指定任务的实时日志流
+agentpulse watch job-agy-01
 ```
 
 ---
 
-### 6. Remote Job Dispatch (`dispatch`)
+### 7. 兼容子命令 (Advanced / Compatibility)
 
-`agentpulse dispatch` sends a remote execution instruction to a target machine over MQTT per [MQTT Protocol Spec §4.4](docs/mqtt-protocol.md#44-派活指令-job-dispatch--command):
-
-- **Topic**: Publishes to `agentpulse/v1/machines/{machine_id}/commands/dispatch` with QoS 1, Retained `false`.
-- **Payload**: Includes `command_id`, `job_id`, `engine`, `cwd`, `command`, `args`, `title`, `timeout_seconds`, `env`, `requested_by`, and `timestamp` (RFC 3339).
-- **Progress Tracking & Timeouts**:
-  - `--wait`: Subscribes to the job's status topic, prints status and progress updates, and exits non-zero if the job fails or wait times out.
-  - `--follow`: Streams real-time stdout/stderr logs in addition to waiting for completion.
-  - `--timeout-seconds <sec>`: Remote job execution timeout (passed in dispatch payload; remote daemon enforces this).
-  - `--wait-timeout <sec>`: Local wait wall-clock timeout in seconds (0 for no limit; stops local waiting without killing the remote job).
-- **Target Machine Gate**:
-  - In MQTT mode, `dispatch` inspects the target machine status on the broker before publishing. If the machine is unseen or `online: false`, dispatch fails immediately with a clear diagnostic message.
-  - `--force`: Bypasses this gate to dispatch even if the target machine is unknown or currently offline.
-
-```bash
-# Dispatch command to target machine:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio -- agy run --prompt "Refactor database pool"
-
-# Force dispatch to a machine not currently reported as online:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --force -- agy -p "Bootstrap agent"
-
-# Dispatch via explicit flags:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine linux-gpu --command opencode --arg run --arg "--prompt=Fine-tune model"
-
-# Dispatch with wait and real-time log streaming:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --follow -- agy -p "Run test suite"
-
-# Dispatch with remote execution timeout and local wait wall-clock timeout:
-./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --timeout-seconds 1800 --wait-timeout 600 -e ENV=production_test --wait -- agy -p "Verify migrations"
-```
+为保持版本平滑过渡，底层子命令保留为隐藏命令：
+- `agentpulse listen`：单跑边缘监听守护进程（已收敛至主命令 `agentpulse`）
+- `agentpulse wrap`：本地执行封装器（支持 `--stub` 模拟模式）
+- `agentpulse list` / `agentpulse status` / `agentpulse logs`：历史兼容查询接口
 
 ---
 
-### 7. Inspect Local Status (`status`)
-
-Inspects the latest local agent execution snapshot written by `agentpulse wrap`:
-
-```bash
-# Human-readable formatted snapshot
-./agentpulse status
-
-# Structured JSON output
-./agentpulse status --json
-```
-
----
-
-### 8. Diagnostics (`doctor`)
-
-Validates terminal capabilities, TTY detection, engine CLI presence, and transport readiness:
-
-```bash
-./agentpulse doctor
-
-# Check connection intent to a live MQTT broker:
-./agentpulse doctor --mqtt-url tcp://broker.example:1883
-```
-
----
-
-### 9. Switching Backend (Mock ↔ MQTT)
-
-All CLI commands (`watch`, `list`, `logs`, `doctor`, `dispatch`) support seamlessly toggling between mock simulation and a live MQTT broker:
-
-```bash
-# 1. Run against a live MQTT broker via CLI flag (supports tcp:// and tls://):
-./agentpulse watch --mqtt-url tls://broker.example:8883
-./agentpulse list --mqtt-url tcp://broker.example:1883 --mqtt-settle-timeout 200ms
-
-# 2. Or configure via environment variables (with optional TLS / mTLS):
-export AGENTPULSE_MQTT_URL="tls://broker.example:8883"
-export AGENTPULSE_MQTT_USERNAME="agentpulse_user"          # optional
-export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional (never logged)
-export AGENTPULSE_MQTT_CA_CERT="/path/to/ca.pem"           # optional custom CA
-export AGENTPULSE_MQTT_CLIENT_CERT="/path/to/client.crt"   # optional mTLS
-export AGENTPULSE_MQTT_CLIENT_KEY="/path/to/client.key"    # optional mTLS
-export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained settle window
-export AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT="45s"             # optional stale heartbeat timeout
-./agentpulse watch
-
-# 3. Security hardening (TLS & Mosquitto ACL):
-# See docs/mqtt-protocol.md §6.2 and docs/mosquitto-acl.example for detailed TLS options & ACL rules.
-
-# 4. Explicit fallback to mock (overriding env vars):
-./agentpulse watch --store=mock
-```
-
----
-
-### 10. 多机怎么跑 (Multi-Machine Quickstart)
+### 8. 多机怎么跑 (Multi-Machine Quickstart in 0.5.0)
 
 AgentPulse 支持跨多台物理机/虚拟机分布式协同跑 AI Agent。假设所有节点均接入 **Tailscale**（或等价私有网络），经私网均可直达集中 MQTT Broker：
 
@@ -310,71 +230,59 @@ AgentPulse 支持跨多台物理机/虚拟机分布式协同跑 AI Agent。假�
                 ┌───────────────────────────────────────┐
                 │          Tailscale / 私网              │
                 │     MQTT Broker (Mosquitto)           │
-                │     tcp://broker.example:1883         │
+                │     tls://broker.example:8883         │
                 └──────────────────┬────────────────────┘
                                    │
          ┌─────────────────────────┼─────────────────────────┐
          ▼                         ▼                         ▼
  ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
  │ Node: mac-mini│         │ Node: gpu-box │         │ Operator CLI  │
- │ agentpulse    │         │ agentpulse    │         │ agentpulse    │
- │ listen        │         │ listen        │         │ dispatch/watch│
+ │  agentpulse   │         │  agentpulse   │         │  agentpulse   │
+ │ (常驻双角色)  │         │ (常驻双角色)  │         │doctor/dispatch│
  └───────────────┘         └───────────────┘         └───────────────┘
 ```
 
-#### 步骤 1：每台工作机启动 Listener
+#### 步骤 1：各计算节点初始化配置并启动常驻服务
 
-在需要承载 Agent 任务的机器上启动监听守护进程。
-机器身份默认解析规则：显式 `--machine <id>` > 环境变量 `AGENTPULSE_MACHINE_ID` > 本机 hostname（自动规范化为小写字母与连字符）：
-
+在各机器上运行交互式向导完成配置：
 ```bash
-# 在 Machine A (如 mac-studio) 上启动：
-export AGENTPULSE_MQTT_URL="tcp://broker.example:1883"
-export AGENTPULSE_MACHINE_ID="mac-studio"
-agentpulse listen
+agentpulse config
+```
+向导将自动写入 `~/.config/agentpulse/config.yaml`（0600 权限），测连 Broker 并探测本机已安装的 Agent CLI（如 `agy`、`opencode`）。
 
-# 或在 Machine B (如 linux-gpu) 上通过 wrap --listen 启动：
-agentpulse wrap --listen --mqtt-url tcp://broker.example:1883 --machine linux-gpu
+随后在各计算节点启动常驻服务（自动上报心跳、Announce 拓扑并就绪接收派活指令）：
+```bash
+agentpulse
 ```
 
-- Listener 默认每 15 秒上报一次心跳（`--heartbeat-interval`）。
-- 建立连接时托管 LWT 遗嘱消息；进程崩溃或断网时 Broker 自动广播离线状态。
+#### 步骤 2：主控端查看集群拓扑与状态
 
-#### 步骤 2：主控端查看集群节点在线状态
-
-在任意节点或主控机上查看拓扑：
-
+在主控端或任意节点运行：
 ```bash
-# 查看所有已见机器与作业
-agentpulse list --mqtt-url tcp://broker.example:1883
+# 查看本机环境与全网各节点及 CLI 拓扑扁平表
+agentpulse doctor
 
-# 只看当前在线节点（过滤掉心跳超时或离线节点）
-agentpulse list --mqtt-url tcp://broker.example:1883 --online
-
-# 启动全屏 Cyberpunk TUI 实时看盘
-agentpulse watch --mqtt-url tcp://broker.example:1883
+# 查看全网当前活跃任务
+agentpulse jobs
 ```
-
-- 心跳超时保底机制（§6.4）：若某节点超过 45 秒未上报心跳（可配置 `--mqtt-heartbeat-timeout` / `AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT`，默认 45s），Store 主动将其标记为 `OFFLINE`。
 
 #### 步骤 3：谁派谁盯 (Dispatch & Follow)
 
-主控端向指定机器派活并实时盯盘：
-
+主控端派发任务并实时追踪：
 ```bash
-# 向 mac-studio 派发任务，并在本地等待完成、同步流式打印实时日志：
-agentpulse dispatch --mqtt-url tcp://broker.example:1883 \
-  --machine mac-studio --follow \
-  -- agy --dangerously-skip-permissions -p "Refactor payment module"
+# 自动匹配在线且装有 agy 的节点进行派发并实时跟踪日志
+agentpulse dispatch agy --follow -- run -p "修复支付模块并发 Bug"
 
-# 派发门禁 (Dispatch Gate)：
-# dispatch 会在派发前查询 Broker 上目标机的在线状态。
-# 若目标机未曾注册或处于 OFFLINE 状态，dispatch 默认直接失败并报错提示。
-# 如需忽略目标机当前心跳状态强制派发，可追加 --force：
-agentpulse dispatch --mqtt-url tcp://broker.example:1883 \
-  --machine mac-studio --force \
-  -- agy -p "Emergency bootstrap"
+# 指定机器派发
+agentpulse dispatch op --machine mac-studio --follow -- -p "重构数据迁移脚本"
 ```
+
+> [!NOTE]
+> **调度门禁 (Dispatch Gate)**：
+> dispatch 在下发前会进行双重在线门禁核验：
+> 1. 目标机器必须在线（心跳新鲜且未超时）；
+> 2. 目标机器广播的 Announce 中必须声明该 Agent CLI 处于可用状态（`ok: true`）。
+> 若需要对冷启动或特殊设备强制下发，可使用 `--force` 绕过门禁。
 
 > [!NOTE]
 > **机器标识规范化（SanitizeID）与破坏性说明**：

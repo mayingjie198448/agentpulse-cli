@@ -672,3 +672,70 @@ func TestMQTTStore_ImmediateStaleMachineCheckOnStartup(t *testing.T) {
 		t.Errorf("expected GetMachine('stale-node') to be offline, got online: true")
 	}
 }
+
+func TestMQTTStore_Announce(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+
+	// Initial announce list should be empty
+	announces, err := st.ListAnnounces(ctx)
+	if err != nil {
+		t.Fatalf("ListAnnounces failed: %v", err)
+	}
+	if len(announces) != 0 {
+		t.Fatalf("expected 0 announces, got %d", len(announces))
+	}
+
+	// 1. Deliver announce rev 1
+	payload1 := `{"v":1,"machine_id":"mac-mini","ts":"2026-11-03T08:00:00Z","rev":1,"hostname":"mini","os":"darwin/arm64","agents":[{"id":"agy","alias":["agy"],"ok":true,"detail":"/bin/agy"}]}`
+	fakeClient.Deliver("agentpulse/v1/mac-mini/announce", []byte(payload1), true)
+
+	ann, err := st.GetAnnounce(ctx, "mac-mini")
+	if err != nil {
+		t.Fatalf("GetAnnounce failed: %v", err)
+	}
+	if ann.Rev != 1 || len(ann.Agents) != 1 || ann.Agents[0].ID != "agy" {
+		t.Errorf("unexpected announce: %+v", ann)
+	}
+
+	// 2. Deliver older rev 0 (conflict resolution: should be rejected)
+	payloadOlder := `{"v":1,"machine_id":"mac-mini","ts":"2026-11-03T09:00:00Z","rev":0,"hostname":"mini","os":"darwin/arm64","agents":[]}`
+	fakeClient.Deliver("agentpulse/v1/mac-mini/announce", []byte(payloadOlder), true)
+
+	ann, err = st.GetAnnounce(ctx, "mac-mini")
+	if err != nil {
+		t.Fatalf("GetAnnounce failed: %v", err)
+	}
+	if ann.Rev != 1 || len(ann.Agents) != 1 {
+		t.Errorf("expected rev 1 to remain, got rev %d with %d agents", ann.Rev, len(ann.Agents))
+	}
+
+	// 3. Deliver newer rev 2 with updated agents
+	payload2 := `{"v":1,"machine_id":"mac-mini","ts":"2026-11-03T08:05:00Z","rev":2,"hostname":"mini","os":"darwin/arm64","agents":[{"id":"agy","alias":["agy"],"ok":true,"detail":"/bin/agy"},{"id":"opencode","alias":["op","opencode"],"ok":true,"detail":"/bin/opencode"}]}`
+	fakeClient.Deliver("agentpulse/v1/mac-mini/announce", []byte(payload2), true)
+
+	ann, err = st.GetAnnounce(ctx, "mac-mini")
+	if err != nil {
+		t.Fatalf("GetAnnounce failed: %v", err)
+	}
+	if ann.Rev != 2 || len(ann.Agents) != 2 {
+		t.Errorf("expected rev 2 with 2 agents, got %+v", ann)
+	}
+
+	// 4. ListAnnounces should now contain mac-mini
+	announces, err = st.ListAnnounces(ctx)
+	if err != nil {
+		t.Fatalf("ListAnnounces failed: %v", err)
+	}
+	if len(announces) != 1 || announces[0].MachineID != "mac-mini" {
+		t.Errorf("unexpected ListAnnounces: %+v", announces)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
@@ -15,28 +16,78 @@ import (
 )
 
 func registerStoreFlags(cmd *cobra.Command) {
+	cmd.PersistentFlags().String("config", "", "指定配置文件路径 (默认: ~/.config/agentpulse/config.yaml)")
 	cmd.PersistentFlags().String("store", "", "Data store backend ('mock' or 'mqtt', default: 'mock')")
-	cmd.PersistentFlags().String("mqtt-url", "", "MQTT broker URL (e.g. tcp://broker.example:1883, tls://broker.example:8883, or $AGENTPULSE_MQTT_URL)")
-	cmd.PersistentFlags().String("mqtt-client-id", "", "MQTT client ID (or $AGENTPULSE_MQTT_CLIENT_ID)")
-	cmd.PersistentFlags().String("mqtt-username", "", "MQTT username (or $AGENTPULSE_MQTT_USERNAME)")
-	cmd.PersistentFlags().String("mqtt-password", "", "MQTT password (or $AGENTPULSE_MQTT_PASSWORD)")
-	cmd.PersistentFlags().Duration("mqtt-settle-timeout", 200*time.Millisecond, "Duration to wait after subscription for retained messages to settle (or $AGENTPULSE_MQTT_SETTLE_TIMEOUT)")
-	cmd.PersistentFlags().Duration("mqtt-heartbeat-timeout", 45*time.Second, "Max duration without heartbeat before marking machine offline (or $AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT)")
-	cmd.PersistentFlags().Duration("mqtt-heartbeat-check-interval", 10*time.Second, "Interval to check for stale machine heartbeats (or $AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL)")
+	_ = cmd.PersistentFlags().MarkHidden("store")
+
+	cmd.PersistentFlags().String("mqtt-url", "", "MQTT broker URL (e.g. tcp://broker.example:1883, tls://broker.example:8883)")
+	cmd.PersistentFlags().String("mqtt-client-id", "", "MQTT client ID")
+	cmd.PersistentFlags().String("mqtt-username", "", "MQTT username")
+	cmd.PersistentFlags().String("mqtt-password", "", "MQTT password")
+	cmd.PersistentFlags().Duration("mqtt-settle-timeout", 200*time.Millisecond, "Duration to wait after subscription for retained messages to settle")
+	cmd.PersistentFlags().Duration("mqtt-heartbeat-timeout", 45*time.Second, "Max duration without heartbeat before marking machine offline")
+	cmd.PersistentFlags().Duration("mqtt-heartbeat-check-interval", 10*time.Second, "Interval to check for stale machine heartbeats")
 
 	// TLS flags
-	cmd.PersistentFlags().Bool("mqtt-tls", false, "Enable TLS connection to MQTT broker (or $AGENTPULSE_MQTT_TLS; also auto-enabled by tls:// URL scheme or cert flags)")
-	cmd.PersistentFlags().String("mqtt-ca-cert", "", "Path to CA certificate PEM file for verifying broker TLS certificate (or $AGENTPULSE_MQTT_CA_CERT)")
-	cmd.PersistentFlags().String("mqtt-client-cert", "", "Path to client certificate PEM file for MQTT mTLS authentication (or $AGENTPULSE_MQTT_CLIENT_CERT)")
-	cmd.PersistentFlags().String("mqtt-client-key", "", "Path to client private key PEM file for MQTT mTLS authentication (or $AGENTPULSE_MQTT_CLIENT_KEY)")
-	cmd.PersistentFlags().Bool("mqtt-tls-insecure", false, "Skip broker TLS certificate verification (DANGER: lab/test use only; or $AGENTPULSE_MQTT_TLS_INSECURE)")
-	cmd.PersistentFlags().String("mqtt-server-name", "", "Override TLS SNI server name for broker certificate verification (or $AGENTPULSE_MQTT_SERVER_NAME)")
+	cmd.PersistentFlags().Bool("mqtt-tls", false, "Enable TLS connection to MQTT broker")
+	cmd.PersistentFlags().String("mqtt-ca-cert", "", "Path to CA certificate PEM file")
+	cmd.PersistentFlags().String("mqtt-client-cert", "", "Path to client certificate PEM file")
+	cmd.PersistentFlags().String("mqtt-client-key", "", "Path to client private key PEM file")
+	cmd.PersistentFlags().Bool("mqtt-tls-insecure", false, "Skip broker TLS certificate verification")
+	cmd.PersistentFlags().String("mqtt-server-name", "", "Override TLS SNI server name")
 }
 
-// resolveMQTTConfig aggregates MQTT options from CLI flags and environment variables.
+// loadActiveConfig loads configuration from --config flag or default path.
+func loadActiveConfig(cmd *cobra.Command) (*config.Config, string, error) {
+	var confPath string
+	if cmd != nil {
+		if val, err := cmd.Flags().GetString("config"); err == nil && val != "" {
+			confPath = val
+		}
+	}
+	if confPath == "" {
+		confPath = config.DefaultConfigPath()
+	}
+	cfg, err := config.LoadConfig(confPath)
+	return cfg, confPath, err
+}
+
+// resolveMQTTConfig aggregates MQTT options from config file, CLI flags, and environment variables.
 func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 	cfg := mqtt.DefaultConfig()
 
+	// 1. Populate from config file if available
+	if fileCfg, _, err := loadActiveConfig(cmd); err == nil && fileCfg != nil {
+		if fileCfg.Broker.URL != "" {
+			cfg.BrokerURL = fileCfg.Broker.URL
+		}
+		if fileCfg.Broker.Username != "" {
+			cfg.Username = fileCfg.Broker.Username
+		}
+		if fileCfg.Broker.Password != "" {
+			cfg.Password = fileCfg.Broker.Password
+		}
+		if fileCfg.Broker.TLS {
+			cfg.TLSEnable = true
+		}
+		if fileCfg.Broker.CACertFile != "" {
+			cfg.CACertFile = fileCfg.Broker.CACertFile
+		}
+		if fileCfg.Broker.ClientCertFile != "" {
+			cfg.ClientCertFile = fileCfg.Broker.ClientCertFile
+		}
+		if fileCfg.Broker.ClientKeyFile != "" {
+			cfg.ClientKeyFile = fileCfg.Broker.ClientKeyFile
+		}
+		if fileCfg.Broker.InsecureSkipVerify {
+			cfg.InsecureSkipVerify = true
+		}
+		if fileCfg.Broker.ServerName != "" {
+			cfg.ServerName = fileCfg.Broker.ServerName
+		}
+	}
+
+	// 2. CLI flags override config file
 	if cmd != nil {
 		if val, err := cmd.Flags().GetString("mqtt-url"); err == nil && val != "" {
 			cfg.BrokerURL = val
@@ -79,7 +130,7 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 		}
 	}
 
-	// Environment variable fallbacks
+	// 3. Environment variable fallbacks
 	if cfg.BrokerURL == "" {
 		if env := os.Getenv("AGENTPULSE_MQTT_URL"); env != "" {
 			cfg.BrokerURL = env
@@ -186,10 +237,15 @@ func determineStoreType(cmd *cobra.Command) (string, error) {
 		return st, nil
 	}
 
-	// If no explicit store specified, check if broker URL is set
+	// If no explicit store specified, check if broker URL is set in flags or config
 	var hasMQTTURL bool
 	if cmd != nil {
 		if val, err := cmd.Flags().GetString("mqtt-url"); err == nil && val != "" {
+			hasMQTTURL = true
+		}
+	}
+	if !hasMQTTURL {
+		if fileCfg, _, err := loadActiveConfig(cmd); err == nil && fileCfg != nil && fileCfg.Broker.URL != "" {
 			hasMQTTURL = true
 		}
 	}
@@ -214,7 +270,7 @@ func getStore(cmd *cobra.Command) (store.Store, error) {
 	if stType == "mqtt" {
 		cfg := resolveMQTTConfig(cmd)
 		if cfg.BrokerURL == "" {
-			return nil, fmt.Errorf("MQTT store enabled but no broker URL provided (pass --mqtt-url or set AGENTPULSE_MQTT_URL)")
+			return nil, fmt.Errorf("MQTT store enabled but no broker URL provided (pass --mqtt-url or run 'agentpulse config')")
 		}
 		return mqtt.New(cfg)
 	}
@@ -245,3 +301,5 @@ func testMQTTConnection(cfg mqtt.Config, timeout time.Duration) error {
 	client.Disconnect(100)
 	return nil
 }
+
+

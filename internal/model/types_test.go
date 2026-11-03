@@ -66,3 +66,57 @@ func TestDispatchCommandJSON(t *testing.T) {
 		t.Errorf("timestamp mismatch: %v vs %v", decoded.Timestamp, ts)
 	}
 }
+
+func TestMachineAnnounce(t *testing.T) {
+	ann := model.MachineAnnounce{
+		V:         1,
+		MachineID: "macbook",
+		TS:        time.Now().UTC(),
+		Rev:       1,
+		Hostname:  "macbook-pro",
+		OS:        "darwin/arm64",
+		Agents: []model.AgentAnnounce{
+			{
+				ID:     "agy",
+				Alias:  []string{"agy"},
+				Ok:     true,
+				Detail: "/usr/local/bin/agy",
+			},
+			{
+				ID:     "opencode",
+				Alias:  []string{"op", "opencode"},
+				Ok:     false,
+				Detail: "not found",
+			},
+		},
+	}
+
+	data, err := json.Marshal(ann)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var restored model.MachineAnnounce
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if restored.MachineID != "macbook" || restored.Rev != 1 {
+		t.Errorf("unexpected restored announce: %+v", restored)
+	}
+
+	ag, ok := restored.FindAgent("op")
+	if !ok || ag.ID != "opencode" {
+		t.Errorf("expected to find agent 'opencode' via alias 'op', got %+v, ok=%v", ag, ok)
+	}
+
+	ag2, ok2 := restored.FindAgent("AGY")
+	if !ok2 || !ag2.Ok {
+		t.Errorf("expected to find agent 'agy' case-insensitively, got %+v, ok=%v", ag2, ok2)
+	}
+
+	_, ok3 := restored.FindAgent("unknown")
+	if ok3 {
+		t.Error("expected unknown agent to return false")
+	}
+}

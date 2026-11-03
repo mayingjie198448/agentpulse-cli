@@ -15,6 +15,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
@@ -481,6 +482,13 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 // executeJob executes a single dispatch command via wrapper.Run.
 func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	args := BuildCommandArgs(cmd.Command, cmd.Args)
+	if len(args) > 0 {
+		fileCfg, _ := config.LoadConfig("")
+		resolved := config.ResolveAgentBinary(fileCfg, args[0])
+		if resolved != "" {
+			args[0] = resolved
+		}
+	}
 	if l.cfg.DangerouslySkipPermissions && len(args) > 0 && filepath.Base(args[0]) == "agy" {
 		hasPerm := false
 		for _, a := range args {
