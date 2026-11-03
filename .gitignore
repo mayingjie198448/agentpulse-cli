@@ -5,6 +5,11 @@
 *.test
 *.prof
 
+# Build artifacts
+/dist/
+*.app/
+/AgentPulse.app/
+
 # OS & Editor
 .DS_Store
 .idea/
