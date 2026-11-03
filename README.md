@@ -136,6 +136,9 @@ Prints registered nodes, heartbeats, active jobs, engines, and status:
 # Standard table output
 ./agentpulse list
 
+# Filter to only show online machines
+./agentpulse list --online
+
 # JSON output
 ./agentpulse list --json
 ```
@@ -220,10 +223,16 @@ By default, missing binaries fail explicitly (never silently stubbed). Passing `
   - `--follow`: Streams real-time stdout/stderr logs in addition to waiting for completion.
   - `--timeout-seconds <sec>`: Remote job execution timeout (passed in dispatch payload; remote daemon enforces this).
   - `--wait-timeout <sec>`: Local wait wall-clock timeout in seconds (0 for no limit; stops local waiting without killing the remote job).
+- **Target Machine Gate**:
+  - In MQTT mode, `dispatch` inspects the target machine status on the broker before publishing. If the machine is unseen or `online: false`, dispatch fails immediately with a clear diagnostic message.
+  - `--force`: Bypasses this gate to dispatch even if the target machine is unknown or currently offline.
 
 ```bash
 # Dispatch command to target machine:
 ./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio -- agy run --prompt "Refactor database pool"
+
+# Force dispatch to a machine not currently reported as online:
+./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine mac-studio --force -- agy -p "Bootstrap agent"
 
 # Dispatch via explicit flags:
 ./agentpulse dispatch --mqtt-url tcp://broker.example:1883 --machine linux-gpu --command opencode --arg run --arg "--prompt=Fine-tune model"
@@ -266,7 +275,7 @@ Validates terminal capabilities, TTY detection, engine CLI presence, and transpo
 
 ### 9. Switching Backend (Mock ↔ MQTT)
 
-All CLI commands (`watch`, `list`, `logs`, `doctor`) support seamlessly toggling between mock simulation and a live MQTT broker:
+All CLI commands (`watch`, `list`, `logs`, `doctor`, `dispatch`) support seamlessly toggling between mock simulation and a live MQTT broker:
 
 ```bash
 # 1. Run against a live MQTT broker via CLI flag:
@@ -278,11 +287,98 @@ export AGENTPULSE_MQTT_URL="tcp://broker.example:1883"
 export AGENTPULSE_MQTT_USERNAME="agentpulse_user"          # optional
 export AGENTPULSE_MQTT_PASSWORD="secret"                   # optional
 export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained settle window
+export AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT="45s"             # optional stale heartbeat timeout
 ./agentpulse watch
 
 # 3. Explicit fallback to mock (overriding env vars):
 ./agentpulse watch --store=mock
 ```
+
+---
+
+### 10. 多机怎么跑 (Multi-Machine Quickstart)
+
+AgentPulse 支持跨多台物理机/虚拟机分布式协同跑 AI Agent。假设所有节点均接入 **Tailscale**（或等价私有网络），经私网均可直达集中 MQTT Broker：
+
+```
+                ┌───────────────────────────────────────┐
+                │          Tailscale / 私网              │
+                │     MQTT Broker (Mosquitto)           │
+                │     tcp://broker.example:1883         │
+                └──────────────────┬────────────────────┘
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         ▼                         ▼                         ▼
+ ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+ │ Node: mac-mini│         │ Node: gpu-box │         │ Operator CLI  │
+ │ agentpulse    │         │ agentpulse    │         │ agentpulse    │
+ │ listen        │         │ listen        │         │ dispatch/watch│
+ └───────────────┘         └───────────────┘         └───────────────┘
+```
+
+#### 步骤 1：每台工作机启动 Listener
+
+在需要承载 Agent 任务的机器上启动监听守护进程。
+机器身份默认解析规则：显式 `--machine <id>` > 环境变量 `AGENTPULSE_MACHINE_ID` > 本机 hostname（自动规范化为小写字母与连字符）：
+
+```bash
+# 在 Machine A (如 mac-studio) 上启动：
+export AGENTPULSE_MQTT_URL="tcp://broker.example:1883"
+export AGENTPULSE_MACHINE_ID="mac-studio"
+agentpulse listen
+
+# 或在 Machine B (如 linux-gpu) 上通过 wrap --listen 启动：
+agentpulse wrap --listen --mqtt-url tcp://broker.example:1883 --machine linux-gpu
+```
+
+- Listener 默认每 15 秒上报一次心跳（`--heartbeat-interval`）。
+- 建立连接时托管 LWT 遗嘱消息；进程崩溃或断网时 Broker 自动广播离线状态。
+
+#### 步骤 2：主控端查看集群节点在线状态
+
+在任意节点或主控机上查看拓扑：
+
+```bash
+# 查看所有已见机器与作业
+agentpulse list --mqtt-url tcp://broker.example:1883
+
+# 只看当前在线节点（过滤掉心跳超时或离线节点）
+agentpulse list --mqtt-url tcp://broker.example:1883 --online
+
+# 启动全屏 Cyberpunk TUI 实时看盘
+agentpulse watch --mqtt-url tcp://broker.example:1883
+```
+
+- 心跳超时保底机制（§6.4）：若某节点超过 45 秒未上报心跳（可配置 `--mqtt-heartbeat-timeout` / `AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT`，默认 45s），Store 主动将其标记为 `OFFLINE`。
+
+#### 步骤 3：谁派谁盯 (Dispatch & Follow)
+
+主控端向指定机器派活并实时盯盘：
+
+```bash
+# 向 mac-studio 派发任务，并在本地等待完成、同步流式打印实时日志：
+agentpulse dispatch --mqtt-url tcp://broker.example:1883 \
+  --machine mac-studio --follow \
+  -- agy --dangerously-skip-permissions -p "Refactor payment module"
+
+# 派发门禁 (Dispatch Gate)：
+# dispatch 会在派发前查询 Broker 上目标机的在线状态。
+# 若目标机未曾注册或处于 OFFLINE 状态，dispatch 默认直接失败并报错提示。
+# 如需忽略目标机当前心跳状态强制派发，可追加 --force：
+agentpulse dispatch --mqtt-url tcp://broker.example:1883 \
+  --machine mac-studio --force \
+  -- agy -p "Emergency bootstrap"
+```
+
+> [!NOTE]
+> **机器标识规范化（SanitizeID）与破坏性说明**：
+> `listen` 与 `dispatch` 现已双向统一使用同一套规范化逻辑（转小写、下划线 `_` 转连字符 `-`，去除非英数与非连字符号）。例如指定 `--machine Mac_Studio` 或 `--machine my_host` 时，双端均统一规范化为 `mac-studio` 与 `my-host`，确保门禁查找与指令路由严格一致。
+> - **兼容性说明**：若以往曾直接使用带下划线的原始 ID 派发，现统一转换为连字符（例如 `my_host` → `my-host`），与 [MQTT 协议规范 §3.1](docs/mqtt-protocol.md#31-机器标识-machine-id)「建议使用小写字母与连字符」完全一致。
+
+> [!CAUTION]
+> **安全与网络约定**：
+> - 文档和配置示例一律使用 `tcp://broker.example:1883` 占位符。
+> - **严禁**将真实 MQTT 地址、真实凭据（用户名/密码）、家庭 IP 或真实 Tailscale IP（如 100.x）提交至代码仓库。
 
 ---
 

@@ -43,6 +43,11 @@ telemetry to an MQTT broker per docs/mqtt-protocol.md.
 If AGENTPULSE_MQTT_URL or --mqtt-url is configured, telemetry is streamed in real-time.
 Otherwise, the wrapper operates in local mode without requiring a broker.
 
+Node identity resolution precedence:
+  1. Explicit CLI flag (--machine / --machine-id)
+  2. AGENTPULSE_MACHINE_ID environment variable
+  3. Sanitized local hostname (lowercase alphanumeric with hyphens)
+
 Examples:
   # Wrap agy with auto tool approval:
   agentpulse wrap -- agy --dangerously-skip-permissions -p "Fix bug in auth.go"
@@ -201,8 +206,8 @@ Examples:
 	// Disable interspersed flag parsing so flags for wrapped binary are preserved as positional arguments
 	wrapCmd.Flags().SetInterspersed(false)
 
-	wrapCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (alias for --machine-id)")
-	wrapCmd.Flags().StringVar(&machineID, "machine-id", "", "Machine ID override (or $AGENTPULSE_MACHINE_ID)")
+	wrapCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: $AGENTPULSE_MACHINE_ID or sanitized hostname)")
+	wrapCmd.Flags().StringVar(&machineID, "machine-id", "", "Machine ID override (alias for --machine)")
 	wrapCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (or $AGENTPULSE_MACHINE_NAME)")
 	wrapCmd.Flags().StringVar(&jobID, "job-id", "", "Job ID override (or $AGENTPULSE_JOB_ID)")
 	wrapCmd.Flags().StringVar(&engine, "engine", "", "Agent engine type ('agy' or 'opencode')")

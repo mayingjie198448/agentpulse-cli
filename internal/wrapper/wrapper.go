@@ -102,6 +102,8 @@ func New(cfg Config) (*Wrapper, error) {
 
 	if cfg.MachineID == "" {
 		cfg.MachineID = detectMachineID()
+	} else {
+		cfg.MachineID = SanitizeID(cfg.MachineID)
 	}
 	if cfg.MachineName == "" {
 		cfg.MachineName = cfg.MachineID
@@ -776,8 +778,11 @@ func detectMachineID() string {
 // SanitizeID normalizes an identifier into lowercase alphanumeric and dash characters.
 func SanitizeID(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	reg := regexp.MustCompile(`[^a-z0-9_-]+`)
+	s = strings.ReplaceAll(s, "_", "-")
+	reg := regexp.MustCompile(`[^a-z0-9-]+`)
 	clean := reg.ReplaceAllString(s, "-")
+	regConsecutive := regexp.MustCompile(`-+`)
+	clean = regConsecutive.ReplaceAllString(clean, "-")
 	clean = strings.Trim(clean, "-")
 	if clean == "" {
 		return "local-node"
