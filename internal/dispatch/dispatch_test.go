@@ -1167,3 +1167,25 @@ func TestDispatch_Listener_SanitizeIDSymmetry(t *testing.T) {
 	}
 }
 
+func TestDispatch_MQTT_TLS_InvalidCert_Fails(t *testing.T) {
+	outBuf := new(bytes.Buffer)
+	_, err := dispatch.Dispatch(context.Background(), dispatch.Config{
+		MachineID: "mac-studio",
+		Command:   "echo",
+		Args:      []string{"hello"},
+		Out:       outBuf,
+		Quiet:     true,
+		MQTT: &mqtt.Config{
+			BrokerURL:  "tls://broker.example:8883",
+			CACertFile: "/nonexistent/ca.pem",
+			Timeout:    100 * time.Millisecond,
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected dispatch to fail on invalid CA cert, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to read CA certificate") {
+		t.Errorf("expected error to mention 'failed to read CA certificate', got: %v", err)
+	}
+}
+

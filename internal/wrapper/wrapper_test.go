@@ -616,6 +616,39 @@ func TestWrapper_MQTTConnectFailure_StatusFailed(t *testing.T) {
 	}
 }
 
+func TestWrapper_MQTT_TLS_InvalidCert_Fails(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "mqtt-tls-fail-status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "mqtt-tls-node",
+		JobID:      "job-mqtt-tls-fail-01",
+		Engine:     model.EngineAgy,
+		Title:      "MQTT TLS cert failure test",
+		Args:       []string{"echo", "should not run"},
+		StatusFile: statusFile,
+		MQTT: &mqtt.Config{
+			BrokerURL:  "tls://broker.example:8883",
+			CACertFile: "/nonexistent/ca.pem",
+			Timeout:    100 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error creating wrapper: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = w.Run(ctx)
+	if err == nil {
+		t.Fatalf("expected error from MQTT TLS connect failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to read CA certificate") {
+		t.Errorf("expected CA certificate read error message, got: %v", err)
+	}
+}
+
 func TestWrapper_MQTT_Publishing(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	tmpDir := t.TempDir()
