@@ -66,6 +66,34 @@ go build -o agentpulse ./cmd/agentpulse
 ./agentpulse version
 ```
 
+### 构建 / 获取 Mac .app（Apple Silicon）
+
+为 macOS 用户提供了一键打包 Apple Silicon (`darwin/arm64`) 原生 App Bundle 的脚本：
+
+- **环境要求**：Apple Silicon Mac (M1/M2/M3/M4 系列) + Go 1.22+
+- **构建命令**：
+  ```bash
+  bash scripts/build-macos-app.sh
+  ```
+- **产物路径**：`dist/AgentPulse.app`
+- **使用方式**：
+  - **Finder 双击**：自动唤起 Terminal.app 执行 `agentpulse version` 与帮助说明，并驻留交互终端以便随时输入命令。
+  - **终端直接执行**：
+    ```bash
+    # 启动器（兼容 CLI 参数并支持终端交互）：
+    ./dist/AgentPulse.app/Contents/MacOS/agentpulse version
+    # 或直接运行底层 Mach-O 二进制：
+    ./dist/AgentPulse.app/Contents/MacOS/agentpulse-bin version
+    ```
+- **Gatekeeper 与安全性说明**：
+  - 本地离线构建未接入 Apple 商业付费开发者证书公证（Notarization）。
+  - 若在其他 Mac 上通过网络分发打开提示拦截，可在 Finder 中右键点击 App 选择「打开」，或在终端使用中性命令解除隔离属性：
+    ```bash
+    xattr -cr /path/to/AgentPulse.app
+    ```
+
+详细 Bundle 内部结构与原理解析参见 [macOS App 打包设计文档](docs/macos-app.md)。
+
 ---
 
 ## 🚀 Usage
@@ -261,6 +289,7 @@ export AGENTPULSE_MQTT_SETTLE_TIMEOUT="200ms"              # optional retained s
 ## 📚 文档
 
 - [AgentPulse MQTT 协议设计规范 (v1)](docs/mqtt-protocol.md)：主题树、QoS、消息 JSON 契约、`store.Store` 映射与安全运维约定。
+- [macOS App 打包指南 (Apple Silicon)](docs/macos-app.md)：构建脚本、Bundle 内部结构、双击交互 Launcher 原理及 Gatekeeper 说明。
 - [文档索引](docs/README.md)
 
 ## 🧪 Testing
