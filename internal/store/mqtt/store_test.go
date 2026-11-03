@@ -605,3 +605,70 @@ func TestMQTTStore_HeartbeatConfigDefaultsAndValidation(t *testing.T) {
 		t.Errorf("expected HeartbeatCheckInterval 5s, got %v", customCfg.HeartbeatCheckInterval)
 	}
 }
+
+// TestMQTTStore_ImmediateStaleMachineCheckOnStartup verifies Important #3:
+// When connecting to a broker with retained stale machine heartbeats,
+// the store immediately sweeps stale machines upon startup/settle so list --online
+// does not falsely report them as online during the first check interval.
+func TestMQTTStore_ImmediateStaleMachineCheckOnStartup(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.HeartbeatTimeout = 45 * time.Second
+	cfg.HeartbeatCheckInterval = 10 * time.Minute // Large interval: ticker won't fire during test
+	cfg.SettleTimeout = 10 * time.Millisecond
+
+	// Broker retained status: machine with online: true but last_heartbeat 5 minutes ago (stale)
+	staleTime := time.Now().Add(-5 * time.Minute).Format(time.RFC3339)
+	payload := fmt.Sprintf(`{"id":"stale-node","name":"Stale Node","online":true,"last_heartbeat":"%s"}`, staleTime)
+	fakeClient.Deliver("agentpulse/v1/machines/stale-node/status", []byte(payload), true)
+
+	// Online node with fresh heartbeat
+	freshTime := time.Now().Add(-2 * time.Second).Format(time.RFC3339)
+	payloadFresh := fmt.Sprintf(`{"id":"fresh-node","name":"Fresh Node","online":true,"last_heartbeat":"%s"}`, freshTime)
+	fakeClient.Deliver("agentpulse/v1/machines/fresh-node/status", []byte(payloadFresh), true)
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	// Immediately query ListMachines without waiting for ticker
+	machines, err := st.ListMachines(context.Background())
+	if err != nil {
+		t.Fatalf("ListMachines failed: %v", err)
+	}
+
+	foundStale := false
+	foundFresh := false
+	for _, m := range machines {
+		if m.ID == "stale-node" {
+			foundStale = true
+			if m.Online {
+				t.Errorf("expected stale-node to be marked OFFLINE immediately upon store startup, got online: true")
+			}
+		}
+		if m.ID == "fresh-node" {
+			foundFresh = true
+			if !m.Online {
+				t.Errorf("expected fresh-node to remain ONLINE, got online: false")
+			}
+		}
+	}
+
+	if !foundStale {
+		t.Errorf("stale-node not found in ListMachines")
+	}
+	if !foundFresh {
+		t.Errorf("fresh-node not found in ListMachines")
+	}
+
+	// Verify GetMachine also reflects offline
+	m, err := st.GetMachine(context.Background(), "stale-node")
+	if err != nil {
+		t.Fatalf("GetMachine failed: %v", err)
+	}
+	if m.Online {
+		t.Errorf("expected GetMachine('stale-node') to be offline, got online: true")
+	}
+}

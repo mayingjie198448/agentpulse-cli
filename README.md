@@ -342,6 +342,11 @@ agentpulse dispatch --mqtt-url tcp://broker.example:1883 \
   -- agy -p "Emergency bootstrap"
 ```
 
+> [!NOTE]
+> **机器标识规范化（SanitizeID）与破坏性说明**：
+> `listen` 与 `dispatch` 现已双向统一使用同一套规范化逻辑（转小写、下划线 `_` 转连字符 `-`，去除非英数与非连字符号）。例如指定 `--machine Mac_Studio` 或 `--machine my_host` 时，双端均统一规范化为 `mac-studio` 与 `my-host`，确保门禁查找与指令路由严格一致。
+> - **兼容性说明**：若以往曾直接使用带下划线的原始 ID 派发，现统一转换为连字符（例如 `my_host` → `my-host`），与 [MQTT 协议规范 §3.1](docs/mqtt-protocol.md#31-机器标识-machine-id)「建议使用小写字母与连字符」完全一致。
+
 > [!CAUTION]
 > **安全与网络约定**：
 > - 文档和配置示例一律使用 `tcp://broker.example:1883` 占位符。

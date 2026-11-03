@@ -716,6 +716,28 @@ func TestDispatchCommand_ForceFlag(t *testing.T) {
 	}
 }
 
+func TestDispatchCommand_MachineSanitized(t *testing.T) {
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{
+		"dispatch",
+		"--mqtt-url", "tcp://127.0.0.1:18833",
+		"--machine", "Mac_Studio",
+		"--force",
+		"--", "agy", "-p", "test",
+	})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("expected connection error to unreachable broker, got nil")
+	}
+	if strings.Contains(err.Error(), "unknown flag") {
+		t.Errorf("unexpected unknown flag error: %v", err)
+	}
+}
+
 func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
 	// 1. Default values via doctor with no flags
 	t.Run("defaults", func(t *testing.T) {

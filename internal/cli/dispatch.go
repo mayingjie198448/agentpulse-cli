@@ -10,6 +10,7 @@ import (
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/dispatch"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 	"github.com/spf13/cobra"
 )
 
@@ -76,6 +77,7 @@ Examples:
 			if machineID == "" {
 				return fmt.Errorf("machine ID is required (pass --machine or --machine-id)")
 			}
+			machineID = wrapper.SanitizeID(machineID)
 
 			// Resolve MQTT configuration
 			mqttCfg := resolveMQTTConfig(cmd)
