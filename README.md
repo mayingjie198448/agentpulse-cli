@@ -91,6 +91,7 @@ go build -o agentpulse ./cmd/agentpulse
     ```bash
     xattr -cr /path/to/AgentPulse.app
     ```
+- **GitHub Release 约定（必做）**：每个正式 Release **必须**附带 `AgentPulse-<version>-darwin-arm64.zip`（内含 `AgentPulse.app`，由 `scripts/build-macos-app.sh` 构建）。只打 tag、不挂 `.app` 视为发版未完成。可下载资产见 [Releases](https://github.com/mayingjie198448/agentpulse-cli/releases)；上传可用 `bash scripts/release-macos-app.sh <tag>`（详见 [docs/macos-app.md](docs/macos-app.md) §7）。
 
 详细 Bundle 内部结构与原理解析参见 [macOS App 打包设计文档](docs/macos-app.md)。
 

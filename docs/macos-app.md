@@ -127,3 +127,37 @@ go test -race -count=1 ./...
      ```bash
      xattr -cr /path/to/AgentPulse.app
      ```
+
+---
+
+## 7. GitHub Release 必挂 .app（硬性约定）
+
+**每个 GitHub Release 都必须附带 darwin/arm64 的 `AgentPulse.app` zip。** 只打 tag / 只放 Source code zip·tarball、不挂 `.app`，视为发版未完成。
+
+### 7.1 资产命名
+
+在 `dist/` 下用 `ditto` 保留 macOS 元数据打包：
+
+```bash
+bash scripts/build-macos-app.sh
+cd dist
+ditto -c -k --keepParent AgentPulse.app AgentPulse-<VERSION>-darwin-arm64.zip
+```
+
+示例：`AgentPulse-0.4.0-darwin-arm64.zip`。
+
+### 7.2 上传到已有 Release
+
+```bash
+gh release upload <TAG> dist/AgentPulse-<VERSION>-darwin-arm64.zip \
+  --repo mayingjie198448/agentpulse-cli --clobber
+```
+
+或一键：`bash scripts/release-macos-app.sh <TAG>`（在 Apple Silicon Mac 上执行；需已安装 `gh` 且登录）。
+
+### 7.3 校验清单
+
+- [ ] `./dist/AgentPulse.app/Contents/MacOS/agentpulse version` 与 tag 版本一致
+- [ ] `file` / `lipo` 显示 `arm64`
+- [ ] Release 页面出现可下载的 `AgentPulse-*-darwin-arm64.zip`
+- [ ] **不要**把真实 MQTT broker 地址或密码写进仓；文档与示例仅用 `broker.example` 等占位符
