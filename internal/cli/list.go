@@ -6,7 +6,6 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/spf13/cobra"
 )
@@ -19,7 +18,10 @@ func newListCmd() *cobra.Command {
 		Short: "List all monitored machines and agent jobs",
 		Long:  `Outputs a summary table of registered machines and current agent jobs.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			st := mock.NewMockStore()
+			st, err := getStore(cmd)
+			if err != nil {
+				return err
+			}
 			defer st.Close()
 
 			ctx := cmd.Context()

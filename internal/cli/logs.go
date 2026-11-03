@@ -6,7 +6,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/spf13/cobra"
 )
@@ -23,7 +22,10 @@ Use --follow (-f) to stream live log events in real time.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jobID := args[0]
-			st := mock.NewMockStore()
+			st, err := getStore(cmd)
+			if err != nil {
+				return err
+			}
 			defer st.Close()
 
 			ctx := cmd.Context()
