@@ -18,19 +18,19 @@ import (
 
 func newWrapCmd() *cobra.Command {
 	var (
-		machineFlag               string
-		machineID                 string
-		machineName               string
-		jobID                     string
-		engine                    string
-		title                     string
-		statusFile                string
-		heartbeatInterval         time.Duration
-		stub                      bool
-		promptFlag                string
+		machineFlag                string
+		machineID                  string
+		machineName                string
+		jobID                      string
+		engine                     string
+		title                      string
+		statusFile                 string
+		heartbeatInterval          time.Duration
+		stub                       bool
+		promptFlag                 string
 		dangerouslySkipPermissions bool
-		quiet                     bool
-		listen                    bool
+		quiet                      bool
+		listen                     bool
 	)
 
 	wrapCmd := &cobra.Command{
@@ -40,13 +40,12 @@ func newWrapCmd() *cobra.Command {
 logs, writing local status snapshots, and publishing heartbeat, job lifecycle, and log
 telemetry to an MQTT broker per docs/mqtt-protocol.md.
 
-If AGENTPULSE_MQTT_URL or --mqtt-url is configured, telemetry is streamed in real-time.
+If --mqtt-url or broker.url in config.yaml is configured, telemetry is streamed in real-time.
 Otherwise, the wrapper operates in local mode without requiring a broker.
 
 Node identity resolution precedence:
   1. Explicit CLI flag (--machine / --machine-id)
-  2. AGENTPULSE_MACHINE_ID environment variable
-  3. Sanitized local hostname (lowercase alphanumeric with hyphens)
+  2. Sanitized local hostname (lowercase alphanumeric with hyphens)
 
 Examples:
   # Wrap agy with auto tool approval:
@@ -74,13 +73,9 @@ Examples:
 				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet)
 			}
 
-			// Resolve status file: flag > env > default
+			// 状态文件只来自 --status-file，否则使用默认路径。
 			if statusFile == "" {
-				if env := os.Getenv("AGENTPULSE_STATUS_FILE"); env != "" {
-					statusFile = env
-				} else {
-					statusFile = wrapper.DefaultStatusFile
-				}
+				statusFile = wrapper.DefaultStatusFile
 			}
 
 			// Resolve engine
@@ -206,13 +201,13 @@ Examples:
 	// Disable interspersed flag parsing so flags for wrapped binary are preserved as positional arguments
 	wrapCmd.Flags().SetInterspersed(false)
 
-	wrapCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: $AGENTPULSE_MACHINE_ID or sanitized hostname)")
+	wrapCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: sanitized hostname)")
 	wrapCmd.Flags().StringVar(&machineID, "machine-id", "", "Machine ID override (alias for --machine)")
-	wrapCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (or $AGENTPULSE_MACHINE_NAME)")
-	wrapCmd.Flags().StringVar(&jobID, "job-id", "", "Job ID override (or $AGENTPULSE_JOB_ID)")
+	wrapCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (default: machine ID)")
+	wrapCmd.Flags().StringVar(&jobID, "job-id", "", "Job ID override (default: generated)")
 	wrapCmd.Flags().StringVar(&engine, "engine", "", "Agent engine type ('agy' or 'opencode')")
 	wrapCmd.Flags().StringVar(&title, "title", "", "Job title or summary description")
-	wrapCmd.Flags().StringVar(&statusFile, "status-file", "", "Path to write local status snapshot (or $AGENTPULSE_STATUS_FILE)")
+	wrapCmd.Flags().StringVar(&statusFile, "status-file", "", "Path to write local status snapshot (default: .agentpulse/status.json)")
 	wrapCmd.Flags().DurationVar(&heartbeatInterval, "heartbeat-interval", wrapper.DefaultHeartbeatInterval, "Interval between MQTT heartbeats")
 	wrapCmd.Flags().BoolVar(&stub, "stub", false, "Run in simulated stub mode (useful for testing or when engine is uninstalled)")
 	wrapCmd.Flags().StringVarP(&promptFlag, "prompt", "p", "", "Instruction/prompt for agent invocation")

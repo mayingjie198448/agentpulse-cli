@@ -2,8 +2,6 @@ package cli_test
 
 import (
 	"bytes"
-	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,15 +14,18 @@ import (
 
 func TestRootCommands(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
+		name      string
+		args      []string
+		wantError string
 	}{
-		{"version", []string{"version"}},
-		{"doctor", []string{"doctor"}},
-		{"list", []string{"list"}},
-		{"list_json", []string{"list", "--json"}},
-		{"logs", []string{"logs", "job-agy-01", "--tail", "5"}},
-		{"status", []string{"status"}},
+		{"version", []string{"version"}, ""},
+		{"doctor", []string{"doctor"}, ""},
+		{"status", []string{"status"}, ""},
+		{"list", []string{"list"}, "未配置 MQTT Broker URL"},
+		{"list_json", []string{"list", "--json"}, "未配置 MQTT Broker URL"},
+		{"logs", []string{"logs", "job-agy-01", "--tail", "5"}, "未配置 MQTT Broker URL"},
+		{"jobs", []string{"jobs"}, "未配置 MQTT Broker URL"},
+		{"watch", []string{"watch"}, "未配置 MQTT Broker URL"},
 	}
 
 	for _, tt := range tests {
@@ -35,29 +36,39 @@ func TestRootCommands(t *testing.T) {
 			cmd.SetErr(buf)
 			cmd.SetArgs(tt.args)
 
-			if err := cmd.Execute(); err != nil {
-				t.Fatalf("unexpected error executing %s: %v", tt.name, err)
+			err := cmd.Execute()
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error executing %s: %v", tt.name, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("expected error containing %q, got %v", tt.wantError, err)
 			}
 		})
 	}
 }
 
 func TestDoctorCommand_Output(t *testing.T) {
-	// 1. Default mock mode
-	t.Run("default mock mode", func(t *testing.T) {
+	// 1. No broker: guide the user to config instead of a simulated store.
+	t.Run("no broker guides to config", func(t *testing.T) {
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"doctor"})
+		cmd.SetArgs([]string{"doctor", "--config", filepath.Join(t.TempDir(), "missing.yaml")})
 
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
 		out := buf.String()
-		if !strings.Contains(out, "内存模拟模式 (mock store)") && !strings.Contains(out, "In-memory simulation store active (default)") {
-			t.Errorf("expected default mock store message, got: %s", out)
+		if !strings.Contains(out, "未配置 MQTT Broker URL") || !strings.Contains(out, "agentpulse config") {
+			t.Errorf("expected config guidance, got: %s", out)
+		}
+		if strings.Contains(out, "mock store") || strings.Contains(out, "内存模拟") {
+			t.Errorf("doctor must not advertise a mock store, got: %s", out)
 		}
 	})
 
@@ -84,45 +95,31 @@ func TestDoctorCommand_Output(t *testing.T) {
 }
 
 func TestCLI_StoreSelection(t *testing.T) {
-	// 1. Invalid store flag
-	t.Run("invalid store flag", func(t *testing.T) {
+	// 1. --store is no longer a product switch.
+	t.Run("store flag removed", func(t *testing.T) {
 		cmd := cli.NewRootCmd()
-		cmd.SetArgs([]string{"list", "--store", "invalid-store"})
+		cmd.SetArgs([]string{"list", "--store", "mock"})
 		err := cmd.Execute()
-		if err == nil {
-			t.Fatalf("expected error for invalid store flag, got nil")
-		}
-		if !strings.Contains(err.Error(), "invalid store type") {
-			t.Errorf("expected error message to mention invalid store type, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "unknown flag") {
+			t.Fatalf("expected unknown flag for --store, got %v", err)
 		}
 	})
 
-	// 2. MQTT store enabled but no URL
-	t.Run("mqtt without url", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		cmd.SetArgs([]string{"list", "--store", "mqtt"})
-		err := cmd.Execute()
-		if err == nil {
-			t.Fatalf("expected error for mqtt without url, got nil")
-		}
-		if !strings.Contains(err.Error(), "no broker URL provided") {
-			t.Errorf("expected error message about missing broker URL, got: %v", err)
-		}
-	})
-
-	// 3. Fallback: AGENTPULSE_MQTT_URL env overridden by --store=mock
-	t.Run("env url overridden by store=mock", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_URL", "tcp://127.0.0.1:18833")
-		defer os.Unsetenv("AGENTPULSE_MQTT_URL")
+	// 2. Legacy AGENTPULSE_* env must not open a store.
+	t.Run("legacy env does not select a store", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_URL", "tcp://127.0.0.1:18833")
+		t.Setenv("AGENTPULSE_STORE", "mock")
+		missing := filepath.Join(t.TempDir(), "missing.yaml")
 
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"list", "--store", "mock"})
+		cmd.SetArgs([]string{"list", "--config", missing})
 
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("expected mock to run successfully despite env var: %v", err)
+		err := cmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), "未配置 MQTT Broker URL") {
+			t.Fatalf("expected missing broker error, got %v", err)
 		}
 	})
 
@@ -144,24 +141,30 @@ func TestCLI_StoreSelection(t *testing.T) {
 		}
 	})
 
-	// 5. Settle timeout env in doctor output
-	t.Run("mqtt settle timeout env", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT", "450ms")
-		defer os.Unsetenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT")
+	// 5. Settle timeout env is ignored; doctor keeps the default.
+	t.Run("mqtt settle timeout env ignored", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT", "450ms")
+		missing := filepath.Join(t.TempDir(), "missing.yaml")
 
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"doctor", "--mqtt-url", "tcp://127.0.0.1:18833"})
+		cmd.SetArgs([]string{"doctor", "--config", missing, "--mqtt-url", "tcp://127.0.0.1:18833"})
 
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
 		out := buf.String()
-		if !strings.Contains(out, "settle=450ms") {
-			t.Errorf("expected doctor output to show settle=450ms, got: %s", out)
+		if !strings.Contains(out, "settle=200ms") {
+			t.Errorf("expected doctor output to keep default settle=200ms, got: %s", out)
+		}
+		if strings.Contains(out, "settle=450ms") {
+			t.Errorf("legacy settle timeout env must be ignored, got: %s", out)
+		}
+		if strings.Contains(out, "检测到旧的环境变量") {
+			t.Errorf("startup must not warn about legacy AGENTPULSE_* env, got: %s", out)
 		}
 	})
 }
@@ -289,9 +292,6 @@ func TestWrapCommand(t *testing.T) {
 		tmpDir := t.TempDir()
 		statusFile := filepath.Join(tmpDir, "mqtt-fail-cli-status.json")
 
-		os.Setenv("AGENTPULSE_MQTT_TIMEOUT", "100ms")
-		defer os.Unsetenv("AGENTPULSE_MQTT_TIMEOUT")
-
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
@@ -330,6 +330,62 @@ func TestWrapCommand(t *testing.T) {
 			t.Errorf("expected online: false in status file: %s", string(data))
 		}
 	})
+}
+
+func TestWrapIgnoresLegacyStatusAndMachineEnv(t *testing.T) {
+	tmp := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	envStatus := filepath.Join(tmp, "from-env.json")
+	t.Setenv("AGENTPULSE_STATUS_FILE", envStatus)
+	t.Setenv("AGENTPULSE_MACHINE_ID", "Custom_Box_99")
+	t.Setenv("AGENTPULSE_MACHINE_NAME", "Env Box")
+	t.Setenv("AGENTPULSE_JOB_ID", "job-from-env")
+
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"wrap", "--stub", "--quiet", "--engine", "opencode"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("wrap stub: %v", err)
+	}
+	if _, err := os.Stat(envStatus); !os.IsNotExist(err) {
+		t.Fatalf("AGENTPULSE_STATUS_FILE must not be written, stat err=%v", err)
+	}
+
+	defaultStatus := filepath.Join(tmp, ".agentpulse", "status.json")
+	data, err := os.ReadFile(defaultStatus)
+	if err != nil {
+		t.Fatalf("expected default status file: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "custom-box-99") || strings.Contains(text, "job-from-env") || strings.Contains(text, "Env Box") {
+		t.Errorf("legacy identity env leaked into status: %s", text)
+	}
+
+	statusCmd := cli.NewRootCmd()
+	statusBuf := new(bytes.Buffer)
+	statusCmd.SetOut(statusBuf)
+	statusCmd.SetErr(statusBuf)
+	statusCmd.SetArgs([]string{"status"})
+	if err := statusCmd.Execute(); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	statusOut := statusBuf.String()
+	if strings.Contains(statusOut, envStatus) {
+		t.Errorf("status must not read AGENTPULSE_STATUS_FILE, got: %s", statusOut)
+	}
+	if !strings.Contains(statusOut, "done") {
+		t.Errorf("expected status to read the default snapshot, got: %s", statusOut)
+	}
 }
 
 func TestStatusCommand(t *testing.T) {
@@ -448,22 +504,16 @@ func TestDispatchCommand(t *testing.T) {
 		}
 	})
 
-	// 3. Missing broker URL
+	// 3. Missing broker URL (legacy env must not satisfy it)
 	t.Run("missing broker url", func(t *testing.T) {
-		// Clear env var if set
-		orig := os.Getenv("AGENTPULSE_MQTT_URL")
-		os.Unsetenv("AGENTPULSE_MQTT_URL")
-		defer func() {
-			if orig != "" {
-				os.Setenv("AGENTPULSE_MQTT_URL", orig)
-			}
-		}()
+		t.Setenv("AGENTPULSE_MQTT_URL", "tcp://127.0.0.1:18833")
+		missing := filepath.Join(t.TempDir(), "missing.yaml")
 
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"dispatch", "--machine", "box-1", "--", "agy", "-p", "test"})
+		cmd.SetArgs([]string{"dispatch", "--config", missing, "--machine", "box-1", "--", "agy", "-p", "test"})
 
 		err := cmd.Execute()
 		if err == nil {
@@ -527,21 +577,16 @@ func TestDispatchCommand(t *testing.T) {
 }
 
 func TestListenCommand(t *testing.T) {
-	// 1. Missing broker URL
+	// 1. Missing broker URL (legacy env must not satisfy it)
 	t.Run("missing broker url", func(t *testing.T) {
-		orig := os.Getenv("AGENTPULSE_MQTT_URL")
-		os.Unsetenv("AGENTPULSE_MQTT_URL")
-		defer func() {
-			if orig != "" {
-				os.Setenv("AGENTPULSE_MQTT_URL", orig)
-			}
-		}()
+		t.Setenv("AGENTPULSE_MQTT_URL", "tcp://127.0.0.1:18833")
+		missing := filepath.Join(t.TempDir(), "missing.yaml")
 
 		cmd := cli.NewRootCmd()
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"listen"})
+		cmd.SetArgs([]string{"listen", "--config", missing})
 
 		err := cmd.Execute()
 		if err == nil {
@@ -606,96 +651,6 @@ func TestListenCommand(t *testing.T) {
 	})
 }
 
-func TestListCommand_OnlineFilter(t *testing.T) {
-	// 1. Default list shows all machines including offline ones (e.g. macbook in mock)
-	t.Run("default list shows offline machines", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		buf := new(bytes.Buffer)
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"list"})
-
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		out := buf.String()
-		if !strings.Contains(out, "macbook") {
-			t.Errorf("expected macbook to be present in full list, got: %s", out)
-		}
-		if !strings.Contains(out, "OFFLINE") {
-			t.Errorf("expected OFFLINE status in output, got: %s", out)
-		}
-		if !strings.Contains(out, "HEARTBEAT") {
-			t.Errorf("expected HEARTBEAT column header in output, got: %s", out)
-		}
-	})
-
-	// 2. list --online filters out offline machines
-	t.Run("list --online excludes offline machines", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		buf := new(bytes.Buffer)
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"list", "--online"})
-
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		out := buf.String()
-		parts := strings.Split(out, "JOBS:")
-		machOut := parts[0]
-		if strings.Contains(machOut, "macbook") {
-			t.Errorf("expected macbook (offline) to be filtered out of machines list, got: %s", machOut)
-		}
-		if strings.Contains(machOut, "OFFLINE") {
-			t.Errorf("expected no OFFLINE rows with --online, got: %s", machOut)
-		}
-		if !strings.Contains(machOut, "ccdq") || !strings.Contains(machOut, "mac-mini") || !strings.Contains(machOut, "home-pc") {
-			t.Errorf("expected online machines to be present, got: %s", machOut)
-		}
-		if !strings.Contains(machOut, "HEARTBEAT") {
-			t.Errorf("expected HEARTBEAT column to be preserved, got: %s", machOut)
-		}
-	})
-
-	// 3. list --online --json outputs only online machines
-	t.Run("list --online --json", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		buf := new(bytes.Buffer)
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"list", "--online", "--json"})
-
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		var payload struct {
-			Machines []struct {
-				ID     string `json:"id"`
-				Online bool   `json:"online"`
-			} `json:"machines"`
-		}
-		if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
-			t.Fatalf("failed to unmarshal JSON output: %v", err)
-		}
-
-		if len(payload.Machines) != 3 {
-			t.Fatalf("expected 3 online machines, got %d", len(payload.Machines))
-		}
-		for _, m := range payload.Machines {
-			if !m.Online {
-				t.Errorf("expected machine %s to be online", m.ID)
-			}
-			if m.ID == "macbook" {
-				t.Errorf("macbook should not be present in online list")
-			}
-		}
-	})
-}
-
 func TestDispatchCommand_ForceFlag(t *testing.T) {
 	cmd := cli.NewRootCmd()
 	buf := new(bytes.Buffer)
@@ -740,12 +695,16 @@ func TestDispatchCommand_MachineSanitized(t *testing.T) {
 	}
 }
 
-func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
-	// 1. Default values via doctor with no flags
+func TestResolveMQTTConfig_HeartbeatFlags(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+
+	// 1. Default values
 	t.Run("defaults", func(t *testing.T) {
 		cmd := cli.NewRootCmd()
-		cmd.SetArgs([]string{"doctor"})
-		_ = cmd.Execute()
+		cmd.SetArgs([]string{"version", "--config", missing})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		cfg := cli.ResolveMQTTConfigForTest(cmd)
 		if cfg.HeartbeatTimeout != 45*time.Second {
@@ -756,44 +715,41 @@ func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
 		}
 	})
 
-	// 2. Env variable configuration
-	t.Run("env variables", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
-		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
-		defer func() {
-			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT")
-			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL")
-		}()
+	// 2. Legacy env is ignored
+	t.Run("env ignored", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
+		t.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
 
 		cmd := cli.NewRootCmd()
-		cmd.SetArgs([]string{"doctor"})
-		_ = cmd.Execute()
+		cmd.SetArgs([]string{"version", "--config", missing})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		cfg := cli.ResolveMQTTConfigForTest(cmd)
-		if cfg.HeartbeatTimeout != 60*time.Second {
-			t.Errorf("expected HeartbeatTimeout 60s from env, got %v", cfg.HeartbeatTimeout)
+		if cfg.HeartbeatTimeout != 45*time.Second {
+			t.Errorf("expected HeartbeatTimeout to stay 45s, got %v", cfg.HeartbeatTimeout)
 		}
-		if cfg.HeartbeatCheckInterval != 15*time.Second {
-			t.Errorf("expected HeartbeatCheckInterval 15s from env, got %v", cfg.HeartbeatCheckInterval)
+		if cfg.HeartbeatCheckInterval != 10*time.Second {
+			t.Errorf("expected HeartbeatCheckInterval to stay 10s, got %v", cfg.HeartbeatCheckInterval)
 		}
 	})
 
-	// 3. Flags override env
-	t.Run("flags override env", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
-		os.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
-		defer func() {
-			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT")
-			os.Unsetenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL")
-		}()
+	// 3. Explicit flags apply even when legacy env is set
+	t.Run("flags", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT", "60s")
+		t.Setenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL", "15s")
 
 		cmd := cli.NewRootCmd()
 		cmd.SetArgs([]string{
-			"doctor",
+			"version",
+			"--config", missing,
 			"--mqtt-heartbeat-timeout", "25s",
 			"--mqtt-heartbeat-check-interval", "5s",
 		})
-		_ = cmd.Execute()
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		cfg := cli.ResolveMQTTConfigForTest(cmd)
 		if cfg.HeartbeatTimeout != 25*time.Second {
@@ -801,6 +757,87 @@ func TestResolveMQTTConfig_HeartbeatFlagsAndEnv(t *testing.T) {
 		}
 		if cfg.HeartbeatCheckInterval != 5*time.Second {
 			t.Errorf("expected HeartbeatCheckInterval 5s from flag, got %v", cfg.HeartbeatCheckInterval)
+		}
+	})
+}
+
+func TestResolveMQTTConfig_FileThenFlagsIgnoreEnv(t *testing.T) {
+	t.Setenv("AGENTPULSE_MQTT_URL", "tcp://from-env.example:1883")
+	t.Setenv("AGENTPULSE_MQTT_USERNAME", "env-user")
+	t.Setenv("AGENTPULSE_MQTT_PASSWORD", "env-secret")
+	t.Setenv("AGENTPULSE_MQTT_CLIENT_ID", "env-client")
+	t.Setenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT", "450ms")
+	t.Setenv("AGENTPULSE_MQTT_TIMEOUT", "100ms")
+	t.Setenv("AGENTPULSE_MQTT_TLS", "false")
+	t.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
+	t.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
+
+	confPath := filepath.Join(t.TempDir(), "config.yaml")
+	body := []byte(`version: 1
+machine_id: test-box
+broker:
+  url: tls://broker.example:8883
+  username: file-user
+  password: file-secret
+  tls: true
+  ca_cert: /file/ca.pem
+  server_name: file.sni
+`)
+	if err := os.WriteFile(confPath, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("config file wins over env", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{"version", "--config", confPath})
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.BrokerURL != "tls://broker.example:8883" {
+			t.Errorf("broker url: got %q", cfg.BrokerURL)
+		}
+		if cfg.Username != "file-user" || cfg.Password != "file-secret" {
+			t.Errorf("credentials: user=%q pass=%q", cfg.Username, cfg.Password)
+		}
+		if cfg.ClientID == "env-client" {
+			t.Error("client id must not come from env")
+		}
+		if !cfg.TLSEnable || cfg.CACertFile != "/file/ca.pem" || cfg.ServerName != "file.sni" {
+			t.Errorf("tls from file not applied: tls=%v ca=%q sni=%q", cfg.TLSEnable, cfg.CACertFile, cfg.ServerName)
+		}
+		if cfg.SettleTimeout != 200*time.Millisecond {
+			t.Errorf("settle timeout: got %v", cfg.SettleTimeout)
+		}
+		if cfg.Timeout != 5*time.Second {
+			t.Errorf("connect timeout: got %v", cfg.Timeout)
+		}
+	})
+
+	t.Run("flags override config file", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		cmd.SetArgs([]string{
+			"version",
+			"--config", confPath,
+			"--mqtt-url", "tcp://127.0.0.1:1883",
+			"--mqtt-username", "flag-user",
+			"--mqtt-settle-timeout", "350ms",
+		})
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		cfg := cli.ResolveMQTTConfigForTest(cmd)
+		if cfg.BrokerURL != "tcp://127.0.0.1:1883" {
+			t.Errorf("flag url: got %q", cfg.BrokerURL)
+		}
+		if cfg.Username != "flag-user" {
+			t.Errorf("flag user: got %q", cfg.Username)
+		}
+		if cfg.Password != "file-secret" {
+			t.Errorf("password should stay from file, got %q", cfg.Password)
+		}
+		if cfg.SettleTimeout != 350*time.Millisecond {
+			t.Errorf("flag settle: got %v", cfg.SettleTimeout)
 		}
 	})
 }
@@ -848,71 +885,52 @@ func TestCLI_TLSConfiguration(t *testing.T) {
 		}
 	})
 
-	// 2. Env variables resolution
-	t.Run("tls env variables resolution", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_TLS", "true")
-		os.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
-		os.Setenv("AGENTPULSE_MQTT_CLIENT_CERT", "/env/client.crt")
-		os.Setenv("AGENTPULSE_MQTT_CLIENT_KEY", "/env/client.key")
-		os.Setenv("AGENTPULSE_MQTT_TLS_INSECURE", "1")
-		os.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
-		defer func() {
-			os.Unsetenv("AGENTPULSE_MQTT_TLS")
-			os.Unsetenv("AGENTPULSE_MQTT_CA_CERT")
-			os.Unsetenv("AGENTPULSE_MQTT_CLIENT_CERT")
-			os.Unsetenv("AGENTPULSE_MQTT_CLIENT_KEY")
-			os.Unsetenv("AGENTPULSE_MQTT_TLS_INSECURE")
-			os.Unsetenv("AGENTPULSE_MQTT_SERVER_NAME")
-		}()
+	// 2. Legacy TLS env is ignored
+	t.Run("tls env ignored", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_TLS", "true")
+		t.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
+		t.Setenv("AGENTPULSE_MQTT_CLIENT_CERT", "/env/client.crt")
+		t.Setenv("AGENTPULSE_MQTT_CLIENT_KEY", "/env/client.key")
+		t.Setenv("AGENTPULSE_MQTT_TLS_INSECURE", "1")
+		t.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
+		missing := filepath.Join(t.TempDir(), "missing.yaml")
 
 		cmd := cli.NewRootCmd()
-		cmd.SetArgs([]string{"doctor"})
-		_ = cmd.Execute()
+		cmd.SetArgs([]string{"version", "--config", missing})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		cfg := cli.ResolveMQTTConfigForTest(cmd)
-		if !cfg.TLSEnable {
-			t.Errorf("expected TLSEnable=true from env")
+		if cfg.TLSEnable {
+			t.Errorf("expected TLSEnable to stay false when only legacy env is set")
 		}
-		if cfg.CACertFile != "/env/ca.pem" {
-			t.Errorf("expected CACertFile='/env/ca.pem', got %q", cfg.CACertFile)
-		}
-		if cfg.ClientCertFile != "/env/client.crt" {
-			t.Errorf("expected ClientCertFile='/env/client.crt', got %q", cfg.ClientCertFile)
-		}
-		if cfg.ClientKeyFile != "/env/client.key" {
-			t.Errorf("expected ClientKeyFile='/env/client.key', got %q", cfg.ClientKeyFile)
-		}
-		if !cfg.InsecureSkipVerify {
-			t.Errorf("expected InsecureSkipVerify=true from env")
-		}
-		if cfg.ServerName != "env.sni" {
-			t.Errorf("expected ServerName='env.sni', got %q", cfg.ServerName)
+		if cfg.CACertFile != "" || cfg.ClientCertFile != "" || cfg.ClientKeyFile != "" || cfg.ServerName != "" || cfg.InsecureSkipVerify {
+			t.Errorf("legacy TLS env must be ignored, got %+v", cfg)
 		}
 	})
 
-	// 3. Flags override env
-	t.Run("tls flags override env", func(t *testing.T) {
-		os.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
-		os.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
-		defer func() {
-			os.Unsetenv("AGENTPULSE_MQTT_CA_CERT")
-			os.Unsetenv("AGENTPULSE_MQTT_SERVER_NAME")
-		}()
+	// 3. Flags still apply when legacy env is set
+	t.Run("tls flags override leftover env", func(t *testing.T) {
+		t.Setenv("AGENTPULSE_MQTT_CA_CERT", "/env/ca.pem")
+		t.Setenv("AGENTPULSE_MQTT_SERVER_NAME", "env.sni")
 
 		cmd := cli.NewRootCmd()
 		cmd.SetArgs([]string{
-			"doctor",
+			"version",
 			"--mqtt-ca-cert", "/flag/ca.pem",
 			"--mqtt-server-name", "flag.sni",
 		})
-		_ = cmd.Execute()
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
 		cfg := cli.ResolveMQTTConfigForTest(cmd)
 		if cfg.CACertFile != "/flag/ca.pem" {
-			t.Errorf("expected CACertFile to be overridden by flag, got %q", cfg.CACertFile)
+			t.Errorf("expected CACertFile from flag, got %q", cfg.CACertFile)
 		}
 		if cfg.ServerName != "flag.sni" {
-			t.Errorf("expected ServerName to be overridden by flag, got %q", cfg.ServerName)
+			t.Errorf("expected ServerName from flag, got %q", cfg.ServerName)
 		}
 	})
 
@@ -1002,55 +1020,30 @@ func TestRootCommand_050ProductBoundaries(t *testing.T) {
 	}
 }
 
-func TestJobsCommand_Output(t *testing.T) {
-	t.Run("table output", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		buf := new(bytes.Buffer)
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"jobs"})
+func TestJobsCommand_RequiresBroker(t *testing.T) {
+	for _, args := range [][]string{{"jobs"}, {"jobs", "--json"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := cli.NewRootCmd()
+			buf := new(bytes.Buffer)
+			cmd.SetOut(buf)
+			cmd.SetErr(buf)
+			cmd.SetArgs(args)
 
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error running jobs: %v", err)
-		}
-
-		out := buf.String()
-		if !strings.Contains(out, "AgentPulse 全网任务列表") {
-			t.Errorf("expected jobs header, got:\n%s", out)
-		}
-	})
-
-	t.Run("json output", func(t *testing.T) {
-		cmd := cli.NewRootCmd()
-		buf := new(bytes.Buffer)
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
-		cmd.SetArgs([]string{"jobs", "--json"})
-
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error running jobs --json: %v", err)
-		}
-
-		out := buf.String()
-		if !strings.Contains(out, `"id":`) && !strings.Contains(out, `[]`) {
-			t.Errorf("expected JSON array or job objects, got:\n%s", out)
-		}
-	})
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "未配置 MQTT Broker URL") {
+				t.Fatalf("expected missing broker error, got %v", err)
+			}
+			if strings.Contains(buf.String(), "mock") {
+				t.Errorf("jobs output must not mention mock, got: %s", buf.String())
+			}
+		})
+	}
 }
 
 func TestRootCommand_NoConfigFails(t *testing.T) {
-	origURL := os.Getenv("AGENTPULSE_MQTT_URL")
-	origStore := os.Getenv("AGENTPULSE_STORE")
-	os.Unsetenv("AGENTPULSE_MQTT_URL")
-	os.Unsetenv("AGENTPULSE_STORE")
-	defer func() {
-		if origURL != "" {
-			os.Setenv("AGENTPULSE_MQTT_URL", origURL)
-		}
-		if origStore != "" {
-			os.Setenv("AGENTPULSE_STORE", origStore)
-		}
-	}()
+	// 旧环境变量不能代替配置文件，也不能打开模拟存储。
+	t.Setenv("AGENTPULSE_MQTT_URL", "tcp://127.0.0.1:1883")
+	t.Setenv("AGENTPULSE_STORE", "mock")
 
 	tmpDir := t.TempDir()
 	emptyConfig := filepath.Join(tmpDir, "nonexistent-config.yaml")
@@ -1089,19 +1082,16 @@ func TestRootCommand_NoConfigFails(t *testing.T) {
 		}
 	})
 
-	t.Run("explicit --store mock is still allowed", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // immediately cancel plain watch
-
+	t.Run("store mock flag is rejected", func(t *testing.T) {
 		cmd := cli.NewRootCmd()
-		cmd.SetContext(ctx)
 		buf := new(bytes.Buffer)
 		cmd.SetOut(buf)
 		cmd.SetErr(buf)
 		cmd.SetArgs([]string{"--config", emptyConfig, "--store", "mock", "--plain"})
 
-		if err := cmd.Execute(); err != nil {
-			t.Fatalf("unexpected error running explicit mock: %v", err)
+		err := cmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), "unknown flag") {
+			t.Fatalf("expected --store=mock to be rejected, got %v", err)
 		}
 	})
 }
@@ -1182,6 +1172,3 @@ func TestDispatchCommand_HelpAndSetInterspersed(t *testing.T) {
 		}
 	})
 }
-
-
-

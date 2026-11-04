@@ -1,7 +1,6 @@
 package config_test
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -119,27 +118,6 @@ func TestProbeAgent(t *testing.T) {
 	})
 	if nonExistent.Ok {
 		t.Errorf("expected nonexistent binary to be ok: false")
-	}
-}
-
-func TestLegacyEnvVars(t *testing.T) {
-	t.Setenv("AGENTPULSE_MOCK_TEST_VAR", "1")
-	found := config.CheckLegacyEnvVars()
-	var hasIt bool
-	for _, v := range found {
-		if v == "AGENTPULSE_MOCK_TEST_VAR" {
-			hasIt = true
-			break
-		}
-	}
-	if !hasIt {
-		t.Error("expected CheckLegacyEnvVars to detect AGENTPULSE_MOCK_TEST_VAR")
-	}
-
-	var buf bytes.Buffer
-	config.WarnLegacyEnvVars(&buf)
-	if !strings.Contains(buf.String(), "AGENTPULSE_MOCK_TEST_VAR") {
-		t.Errorf("expected warning output to contain var name, got %q", buf.String())
 	}
 }
 

@@ -37,13 +37,7 @@ func newListCmd() *cobra.Command {
 			}
 
 			if onlineOnly {
-				var filtered []model.Machine
-				for _, m := range machines {
-					if m.Online {
-						filtered = append(filtered, m)
-					}
-				}
-				machines = filtered
+				machines = selectOnlineMachines(machines)
 			}
 
 			if jsonOutput {
@@ -89,4 +83,15 @@ func newListCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output list in JSON format")
 	cmd.Flags().BoolVar(&onlineOnly, "online", false, "Filter machines to show only currently online nodes")
 	return cmd
+}
+
+// selectOnlineMachines keeps nodes whose latest heartbeat says they are online.
+func selectOnlineMachines(machines []model.Machine) []model.Machine {
+	var filtered []model.Machine
+	for _, m := range machines {
+		if m.Online {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
 }

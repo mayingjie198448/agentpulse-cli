@@ -92,14 +92,12 @@ func newDoctorCmd() *cobra.Command {
 
 			// 5. Broker 连通性测试 & doctor 后发 Announce
 			fmt.Fprintln(out, "\n[数据层与 Broker 探测]:")
-			stType, err := determineStoreType(cmd)
 			var brokerOnline bool
-			var mqttCfg mqtt.Config
+			mqttCfg := resolveMQTTConfig(cmd)
 
-			if err != nil {
-				fmt.Fprintf(out, "  [ERROR] Store 配置异常: %v\n", err)
-			} else if stType == "mqtt" {
-				mqttCfg = resolveMQTTConfig(cmd)
+			if mqttCfg.BrokerURL == "" {
+				fmt.Fprintln(out, "  [WARN] 未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
+			} else {
 				authInfo := "anonymous"
 				if mqttCfg.Username != "" {
 					authInfo = fmt.Sprintf(`username %q`, mqttCfg.Username)
@@ -130,9 +128,6 @@ func newDoctorCmd() *cobra.Command {
 					fmt.Fprintln(out, "  [OK] Broker 连接正常")
 					brokerOnline = true
 				}
-			} else {
-				fmt.Fprintln(out, "  [OK] 数据存储: 内存模拟模式 (mock store)")
-				fmt.Fprintln(out, "  [INFO] 运行 'agentpulse config' 或指定 --mqtt-url 可切换至真实 MQTT Broker")
 			}
 
 			// Doctor 后发 announce

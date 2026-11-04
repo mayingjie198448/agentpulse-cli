@@ -26,11 +26,11 @@ type tickMsg time.Time
 
 // Model is the Bubble Tea application state for `agentpulse watch`.
 type Model struct {
-	store          store.Store
-	ctx            context.Context
-	cancel         context.CancelFunc
-	eventCh        <-chan model.Event
-	paused         bool
+	store   store.Store
+	ctx     context.Context
+	cancel  context.CancelFunc
+	eventCh <-chan model.Event
+	paused  bool
 
 	// Dimensions
 	width  int
@@ -306,7 +306,6 @@ func (m *Model) renderHeader() string {
 	logo := HeaderLogoStyle.Render("⚡ AgentPulse")
 	ver := HeaderVersionStyle.Render(version.Version)
 	target := HeaderSubtitleStyle.Render("Cross-Machine Monitor • agy & OpenCode")
-	mockBadge := HeaderMockBadgeStyle.Render("● MOCK STREAM")
 
 	var runningCount, doneCount, failedCount int
 	for _, j := range m.jobs {
@@ -338,7 +337,7 @@ func (m *Model) renderHeader() string {
 
 	clock := lipgloss.NewStyle().Foreground(ColorDimText).Render(time.Now().Format("2006-01-02 15:04:05"))
 
-	topRow := lipgloss.JoinHorizontal(lipgloss.Center, logo, ver, target, "   ", mockBadge)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Center, logo, ver, target)
 	statusRow := lipgloss.JoinHorizontal(lipgloss.Center, stats, "     ", clock)
 
 	headerBox := lipgloss.NewStyle().

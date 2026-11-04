@@ -394,11 +394,11 @@ flowchart TD
 
 ---
 
-## 5. MockStore 到 MQTT Store 的映射实现指南
+## 5. store.Store 到 MQTT Store 的映射
 
-> **实现进度**：`internal/store/mqtt.Store` 已在 v0.2.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。
+> **实现进度**：`internal/store/mqtt.Store` 已在 v0.2.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。0.5.1 起产品路径不再提供内存模拟 Store；未配置 Broker 时命令报错，并引导运行 `agentpulse config` 或传入 `--mqtt-url`。
 
-当前 CLI 依赖 `internal/store.Store` 接口，默认由 `internal/mock.MockStore` 支撑交互测试。落地 MQTT 驱动（`internal/store/mqtt.Store`）后，该接口方法的映射关系如下：
+CLI 通过 `internal/store.Store` 接口访问全网状态，由 `internal/store/mqtt.Store` 实现。接口方法与 MQTT 主题的映射关系如下：
 
 ### 5.1 接口方法与 MQTT 主题映射表
 
@@ -448,7 +448,7 @@ flowchart LR
 #### 冷启动保留消息静默收敛窗口 (Cold-Start Retained Settle)
 在 MQTT 规范中，客户端完成 `SubscribeMultiple` 握手（SUBACK）仅代表订阅意图确认；Broker 托管的 Retained 保留消息（如机器状态与作业状态）需在网络层异步发送至客户端。
 为了避免一次性查询命令（如 `agentpulse list`、`agentpulse logs`）在刚建立连接后因保留消息飞行延迟而得到空结果，`mqtt.New()` 在订阅成功后默认执行短暂可配置的静默等待：
-- **默认时长**：`SettleTimeout = 200ms`（可通过配置或 `--mqtt-settle-timeout` / `AGENTPULSE_MQTT_SETTLE_TIMEOUT` 调整）。
+- **默认时长**：`SettleTimeout = 200ms`（可通过 `--mqtt-settle-timeout` 调整）。
 - **收益**：避免冷启动初次 `ListMachines` / `ListJobs` 假空，同时维持极低的 CLI 响应延迟。
 
 ---
@@ -474,20 +474,20 @@ flowchart LR
 
 - **URL Scheme 自动识别**：
   - Broker URL 采用 `tls://`、`ssl://`、`mqtts://` 或 `tcps://`（例如 `tls://broker.example:8883`）时，CLI 与守护进程会自动开启 TLS 传输握手，无需额外参数。
-  - 亦可通过 `--mqtt-tls` 标志或环境变量 `AGENTPULSE_MQTT_TLS=true` 显式强制启用 TLS。
+  - 亦可通过配置文件 `broker.tls: true` 或 `--mqtt-tls` 标志显式强制启用 TLS。
 
-- **CLI 标志与环境变量支持**：
-  | 配置项 | CLI 标志 | 环境变量 | 说明与默认值 |
+- **配置文件与 CLI 标志**（不读取 `AGENTPULSE_*` 环境变量）：
+  | 配置项 | config.yaml | CLI 标志 | 说明与默认值 |
   | :--- | :--- | :--- | :--- |
-  | **强制启用 TLS** | `--mqtt-tls` | `AGENTPULSE_MQTT_TLS` | 布尔值（默认 `false`；若 Broker URL 为 `tls://` 等安全 scheme 则自动置为 `true`） |
-  | **自定义 CA 证书** | `--mqtt-ca-cert` | `AGENTPULSE_MQTT_CA_CERT` | 根 CA 证书 PEM 文件路径（用于自签名或企业自建 PKI 验签；留空则使用系统根证书库） |
-  | **客户端证书 (mTLS)** | `--mqtt-client-cert` | `AGENTPULSE_MQTT_CLIENT_CERT` | mTLS 双向认证客户端证书 PEM 文件路径 |
-  | **客户端私钥 (mTLS)** | `--mqtt-client-key` | `AGENTPULSE_MQTT_CLIENT_KEY` | mTLS 双向认证客户端私钥 PEM 文件路径（必须与 client-cert 成对提供） |
-  | **跳过服务端证书校验** | `--mqtt-tls-insecure` | `AGENTPULSE_MQTT_TLS_INSECURE` | 布尔值（默认 `false`；**危险**，详见下文警告） |
-  | **TLS SNI 覆盖** | `--mqtt-server-name` | `AGENTPULSE_MQTT_SERVER_NAME` | 自定义 TLS SNI 服务器名称（用于通过 IP 连接时匹配证书域名） |
+  | **强制启用 TLS** | `broker.tls` | `--mqtt-tls` | 布尔值（默认 `false`；若 Broker URL 为 `tls://` 等安全 scheme 则自动置为 `true`） |
+  | **自定义 CA 证书** | `broker.ca_cert` | `--mqtt-ca-cert` | 根 CA 证书 PEM 文件路径（用于自签名或企业自建 PKI 验签；留空则使用系统根证书库） |
+  | **客户端证书 (mTLS)** | `broker.client_cert` | `--mqtt-client-cert` | mTLS 双向认证客户端证书 PEM 文件路径 |
+  | **客户端私钥 (mTLS)** | `broker.client_key` | `--mqtt-client-key` | mTLS 双向认证客户端私钥 PEM 文件路径（必须与 client-cert 成对提供） |
+  | **跳过服务端证书校验** | `broker.insecure_skip_verify` | `--mqtt-tls-insecure` | 布尔值（默认 `false`；**危险**，详见下文警告） |
+  | **TLS SNI 覆盖** | `broker.server_name` | `--mqtt-server-name` | 自定义 TLS SNI 服务器名称（用于通过 IP 连接时匹配证书域名） |
 
 > [!WARNING]
-> `--mqtt-tls-insecure` / `AGENTPULSE_MQTT_TLS_INSECURE` 会彻底跳过 Broker 证书链与主机名合法性校验，导致连接容易遭受中间人劫持（MITM）与凭据窥探。**严禁在生产或公网环境下使用**，仅允许在局域网沙箱实验室调试或临时排障。
+> `--mqtt-tls-insecure`（或配置文件中的 `broker.insecure_skip_verify: true`）会彻底跳过 Broker 证书链与主机名合法性校验，导致连接容易遭受中间人劫持（MITM）与凭据窥探。**严禁在生产或公网环境下使用**，仅允许在局域网沙箱实验室调试或临时排障。
 
 - **密码安全保护 (Zero-Leakage Guarantee)**：
   - MQTT 认证密码属于敏感机密，AgentPulse 保证密码在任何日志输出、终端错误堆栈以及 `agentpulse doctor` 诊断输出中均绝不打印展示（仅展示用户名）。
@@ -549,7 +549,7 @@ flowchart LR
 
 ## 7. 演进与落地路线 (Roadmap)
 
-- **第一阶段（已完成）**：建立 `model` 核心类型与 `store.Store` 接口抽象，完成 `internal/mock` 驱动与交互式 Bubble Tea TUI 界面验证。
+- **第一阶段（已完成）**：建立 `model` 核心类型与 `store.Store` 接口抽象，并用交互式 Bubble Tea TUI 验证。早期内存模拟驱动已从产品路径移除，配置只来自 `config.yaml` 与显式 CLI 标志。
 - **第二阶段（已完成）**：确立 MQTT 协议契约、主题层级、QoS 策略与安全运维边界（PR #2）。
 - **第三阶段（进行中，v0.2.0）**：
   1. 在 `internal/store/mqtt` 实现基于 `paho.mqtt.golang` 的生产级驱动（**已落地于 v0.2.0**）；

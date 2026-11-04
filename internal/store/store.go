@@ -9,11 +9,8 @@ import (
 // Store defines the unified abstraction for retrieving cross-machine agent states
 // and subscribing to real-time events.
 //
-// In Phase 1, this interface is satisfied by internal/mock.MockStore.
-// In future phases, an MQTT-backed implementation (e.g. internal/mqtt.Store)
-// or gRPC/HTTP adapters will implement this interface to connect to distributed
-// agy daemons and OpenCode runners across different machines without changing
-// the CLI commands or TUI view layer.
+// The product implementation is internal/store/mqtt.Store. Configuration comes
+// from config.yaml or explicit CLI flags; there is no in-memory simulation mode.
 type Store interface {
 	// ListMachines returns all registered machines and their current statuses.
 	ListMachines(ctx context.Context) ([]model.Machine, error)

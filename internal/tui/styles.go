@@ -45,12 +45,6 @@ var (
 				Foreground(ColorLightText).
 				Bold(true)
 
-	HeaderMockBadgeStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("#000000")).
-				Background(ColorAmber).
-				Padding(0, 1)
-
 	// Box / Card Containers
 	BoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

@@ -7,14 +7,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
-	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
@@ -56,7 +54,7 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newWatchCmd())
 	rootCmd.AddCommand(newVersionCmd())
 
-	// 收对外 listen/wrap/--store（保留为内部或隐藏兼容命令）
+	// listen/wrap 保留为隐藏兼容命令
 	listenCmd := newListenCmd()
 	listenCmd.Hidden = true
 	rootCmd.AddCommand(listenCmd)
@@ -82,167 +80,130 @@ func NewRootCmd() *cobra.Command {
 
 // runDualRoleDaemon starts the integrated heartbeat/announce/listener and watch monitor.
 func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
-	// 1. 降级告警检测
-	config.WarnLegacyEnvVars(cmd.ErrOrStderr())
-
-	// 2. 存储类型与 Broker 配置解析
-	stType, err := determineStoreType(cmd)
-	if err != nil {
-		return err
-	}
-
+	// Broker 只来自 config.yaml 与显式 CLI 标志。没有 Broker 时直接报错，不再进入内存模拟。
 	mqttCfg := resolveMQTTConfig(cmd)
-
-	hasExplicitMock := false
-	if cmd != nil {
-		if val, err := cmd.Flags().GetString("store"); err == nil && cmd.Flags().Changed("store") && strings.ToLower(strings.TrimSpace(val)) == "mock" {
-			hasExplicitMock = true
-		}
-	}
-	if strings.ToLower(strings.TrimSpace(os.Getenv("AGENTPULSE_STORE"))) == "mock" {
-		hasExplicitMock = true
-	}
-
-	if (mqttCfg.BrokerURL == "" || stType != "mqtt") && !hasExplicitMock {
+	if mqttCfg.BrokerURL == "" {
 		return fmt.Errorf("未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
 	}
 
-	if stType == "mqtt" {
-		if mqttCfg.BrokerURL == "" {
-			return fmt.Errorf("未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
-		}
-
-		baseClientID := mqttCfg.ClientID
-		if baseClientID == "" {
-			baseClientID = fmt.Sprintf("agentpulse-%d", time.Now().UnixNano())
-		}
-
-		listenerMQTT := mqttCfg
-		listenerMQTT.ClientID = baseClientID + "-listener"
-
-		announceMQTT := mqttCfg
-		announceMQTT.ClientID = baseClientID + "-announce"
-
-		storeMQTT := mqttCfg
-		storeMQTT.ClientID = baseClientID + "-store"
-
-		fileCfg, _, _ := loadActiveConfig(cmd)
-		machineID := ""
-		if fileCfg != nil && fileCfg.MachineID != "" {
-			machineID = fileCfg.MachineID
-		}
-		if machineID == "" {
-			host, _ := os.Hostname()
-			machineID = wrapper.SanitizeID(host)
-		}
-		if machineID == "" {
-			machineID = "machine-1"
-		}
-
-		ctx, cancel := context.WithCancel(cmd.Context())
-		defer cancel()
-
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		go func() {
-			select {
-			case <-sigCh:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-
-		// 构造本机 Announce 拓扑信息
-		var agentsToProbe []config.AgentConfig
-		if fileCfg != nil && len(fileCfg.Agents) > 0 {
-			agentsToProbe = fileCfg.Agents
-		} else {
-			agentsToProbe = config.DefaultAgents()
-		}
-		probedStatuses := config.ProbeAgents(agentsToProbe)
-		var announceAgents []model.AgentAnnounce
-		for _, st := range probedStatuses {
-			announceAgents = append(announceAgents, model.AgentAnnounce{
-				ID:     st.ID,
-				Alias:  st.Alias,
-				Ok:     st.Ok,
-				Detail: st.Detail,
-			})
-		}
-		host, _ := os.Hostname()
-		rev := 1
-		if fileCfg != nil && fileCfg.Rev > 0 {
-			rev = fileCfg.Rev
-		}
-		ann := model.MachineAnnounce{
-			V:         1,
-			MachineID: machineID,
-			TS:        time.Now().UTC(),
-			Rev:       rev,
-			Hostname:  host,
-			OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-			Agents:    announceAgents,
-		}
-
-		// 角色 1: 本机 Listener + 心跳守护进程
-		pMQTT := &listenerMQTT
-		isPlain := termutil.ShouldUsePlain(plainOutput)
-		listenerCfg := wrapper.ListenerConfig{
-			MachineID:                  machineID,
-			MachineName:                host,
-			HeartbeatInterval:          mqttCfg.HeartbeatCheckInterval,
-			StatusFile:                 wrapper.DefaultStatusFile,
-			MQTT:                       pMQTT,
-			DangerouslySkipPermissions: true,
-			Quiet:                      !isPlain,
-			Stdout:                     io.Discard,
-			Stderr:                     io.Discard,
-			OnMQTTConnected: func() {
-				opts := paho.NewClientOptions()
-				_ = mqtt.ApplyClientOptions(opts, announceMQTT)
-				c := paho.NewClient(opts)
-				if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
-					_ = mqtt.PublishAnnounce(c, ann)
-					c.Disconnect(100)
-				}
-			},
-		}
-		if isPlain {
-			listenerCfg.Stdout = cmd.OutOrStdout()
-			listenerCfg.Stderr = cmd.ErrOrStderr()
-		}
-
-		l, err := wrapper.NewListener(listenerCfg)
-		if err != nil {
-			return fmt.Errorf("初始化本机监听服务失败: %w", err)
-		}
-
-		go func() {
-			_ = l.Run(ctx)
-		}()
-
-		// 角色 2: 全网进度大盘订阅与渲染
-		st, err := mqtt.New(storeMQTT)
-		if err != nil {
-			return fmt.Errorf("连接 MQTT 监控大盘失败: %w", err)
-		}
-		defer st.Close()
-
-		if isPlain {
-			return runPlainWatch(ctx, st, 2*time.Second)
-		}
-
-		p := tea.NewProgram(tui.NewModel(st), tea.WithAltScreen(), tea.WithMouseCellMotion())
-		_, err = p.Run()
-		return err
+	baseClientID := mqttCfg.ClientID
+	if baseClientID == "" {
+		baseClientID = fmt.Sprintf("agentpulse-%d", time.Now().UnixNano())
 	}
 
-	// 内存模拟模式 (Mock store fallback)
-	st := mock.NewMockStore()
+	listenerMQTT := mqttCfg
+	listenerMQTT.ClientID = baseClientID + "-listener"
+
+	announceMQTT := mqttCfg
+	announceMQTT.ClientID = baseClientID + "-announce"
+
+	storeMQTT := mqttCfg
+	storeMQTT.ClientID = baseClientID + "-store"
+
+	fileCfg, _, _ := loadActiveConfig(cmd)
+	machineID := ""
+	if fileCfg != nil && fileCfg.MachineID != "" {
+		machineID = fileCfg.MachineID
+	}
+	if machineID == "" {
+		host, _ := os.Hostname()
+		machineID = wrapper.SanitizeID(host)
+	}
+	if machineID == "" {
+		machineID = "machine-1"
+	}
+
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	// 构造本机 Announce 拓扑信息
+	var agentsToProbe []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agentsToProbe = fileCfg.Agents
+	} else {
+		agentsToProbe = config.DefaultAgents()
+	}
+	probedStatuses := config.ProbeAgents(agentsToProbe)
+	var announceAgents []model.AgentAnnounce
+	for _, st := range probedStatuses {
+		announceAgents = append(announceAgents, model.AgentAnnounce{
+			ID:     st.ID,
+			Alias:  st.Alias,
+			Ok:     st.Ok,
+			Detail: st.Detail,
+		})
+	}
+	host, _ := os.Hostname()
+	rev := 1
+	if fileCfg != nil && fileCfg.Rev > 0 {
+		rev = fileCfg.Rev
+	}
+	ann := model.MachineAnnounce{
+		V:         1,
+		MachineID: machineID,
+		TS:        time.Now().UTC(),
+		Rev:       rev,
+		Hostname:  host,
+		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Agents:    announceAgents,
+	}
+
+	// 角色 1: 本机 Listener + 心跳守护进程
+	pMQTT := &listenerMQTT
+	isPlain := termutil.ShouldUsePlain(plainOutput)
+	listenerCfg := wrapper.ListenerConfig{
+		MachineID:                  machineID,
+		MachineName:                host,
+		HeartbeatInterval:          mqttCfg.HeartbeatCheckInterval,
+		StatusFile:                 wrapper.DefaultStatusFile,
+		MQTT:                       pMQTT,
+		DangerouslySkipPermissions: true,
+		Quiet:                      !isPlain,
+		Stdout:                     io.Discard,
+		Stderr:                     io.Discard,
+		OnMQTTConnected: func() {
+			opts := paho.NewClientOptions()
+			_ = mqtt.ApplyClientOptions(opts, announceMQTT)
+			c := paho.NewClient(opts)
+			if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
+				_ = mqtt.PublishAnnounce(c, ann)
+				c.Disconnect(100)
+			}
+		},
+	}
+	if isPlain {
+		listenerCfg.Stdout = cmd.OutOrStdout()
+		listenerCfg.Stderr = cmd.ErrOrStderr()
+	}
+
+	l, err := wrapper.NewListener(listenerCfg)
+	if err != nil {
+		return fmt.Errorf("初始化本机监听服务失败: %w", err)
+	}
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	// 角色 2: 全网进度大盘订阅与渲染
+	st, err := mqtt.New(storeMQTT)
+	if err != nil {
+		return fmt.Errorf("连接 MQTT 监控大盘失败: %w", err)
+	}
 	defer st.Close()
 
-	if termutil.ShouldUsePlain(plainOutput) {
-		return runPlainWatch(cmd.Context(), st, 2*time.Second)
+	if isPlain {
+		return runPlainWatch(ctx, st, 2*time.Second)
 	}
 
 	p := tea.NewProgram(tui.NewModel(st), tea.WithAltScreen(), tea.WithMouseCellMotion())
