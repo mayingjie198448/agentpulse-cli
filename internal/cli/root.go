@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -90,11 +91,40 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	mqttCfg := resolveMQTTConfig(cmd)
+
+	hasExplicitMock := false
+	if cmd != nil {
+		if val, err := cmd.Flags().GetString("store"); err == nil && cmd.Flags().Changed("store") && strings.ToLower(strings.TrimSpace(val)) == "mock" {
+			hasExplicitMock = true
+		}
+	}
+	if strings.ToLower(strings.TrimSpace(os.Getenv("AGENTPULSE_STORE"))) == "mock" {
+		hasExplicitMock = true
+	}
+
+	if (mqttCfg.BrokerURL == "" || stType != "mqtt") && !hasExplicitMock {
+		return fmt.Errorf("未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
+	}
+
 	if stType == "mqtt" {
-		mqttCfg := resolveMQTTConfig(cmd)
 		if mqttCfg.BrokerURL == "" {
 			return fmt.Errorf("未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
 		}
+
+		baseClientID := mqttCfg.ClientID
+		if baseClientID == "" {
+			baseClientID = fmt.Sprintf("agentpulse-%d", time.Now().UnixNano())
+		}
+
+		listenerMQTT := mqttCfg
+		listenerMQTT.ClientID = baseClientID + "-listener"
+
+		announceMQTT := mqttCfg
+		announceMQTT.ClientID = baseClientID + "-announce"
+
+		storeMQTT := mqttCfg
+		storeMQTT.ClientID = baseClientID + "-store"
 
 		fileCfg, _, _ := loadActiveConfig(cmd)
 		machineID := ""
@@ -155,7 +185,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		}
 
 		// 角色 1: 本机 Listener + 心跳守护进程
-		pMQTT := &mqttCfg
+		pMQTT := &listenerMQTT
 		isPlain := termutil.ShouldUsePlain(plainOutput)
 		listenerCfg := wrapper.ListenerConfig{
 			MachineID:                  machineID,
@@ -169,7 +199,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 			Stderr:                     io.Discard,
 			OnMQTTConnected: func() {
 				opts := paho.NewClientOptions()
-				_ = mqtt.ApplyClientOptions(opts, mqttCfg)
+				_ = mqtt.ApplyClientOptions(opts, announceMQTT)
 				c := paho.NewClient(opts)
 				if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
 					_ = mqtt.PublishAnnounce(c, ann)
@@ -192,7 +222,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		}()
 
 		// 角色 2: 全网进度大盘订阅与渲染
-		st, err := mqtt.New(mqttCfg)
+		st, err := mqtt.New(storeMQTT)
 		if err != nil {
 			return fmt.Errorf("连接 MQTT 监控大盘失败: %w", err)
 		}

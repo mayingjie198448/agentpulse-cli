@@ -36,7 +36,7 @@ func newDispatchCmd() *cobra.Command {
 	)
 
 	dispatchCmd := &cobra.Command{
-		Use:   "dispatch <别名|CLI> [--machine <id>] -- <参数…>",
+		Use:   "dispatch [--machine <id>] [--force] <别名|CLI> -- <参数…>",
 		Short: "远程派发任务至指定机器或自动匹配在线节点",
 		Long: `向 MQTT 消息中枢下发作业调度指令 (agentpulse/v1/machines/{machine_id}/commands/dispatch)。
 
@@ -52,13 +52,13 @@ func newDispatchCmd() *cobra.Command {
   agentpulse dispatch agy -- run --prompt "修复数据库连接池"
 
   # 指定目标机器派发:
-  agentpulse dispatch op --machine mac-studio -- -p "重构认证模块"
+  agentpulse dispatch --machine mac-studio op -- -p "重构认证模块"
 
   # 派发并实时跟踪进度与输出日志:
-  agentpulse dispatch agy --machine mac-studio --follow -- -p "运行测试集"
+  agentpulse dispatch --machine mac-studio --follow agy -- -p "运行测试集"
 
   # 强制派发给可能正在冷启动的机器:
-  agentpulse dispatch agy --machine gpu-box --force -- -p "预热模型"`,
+  agentpulse dispatch --machine gpu-box --force agy -- -p "预热模型"`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, rawArgs []string) error {

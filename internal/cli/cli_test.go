@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
+	"github.com/spf13/cobra"
 )
 
 func TestRootCommands(t *testing.T) {
@@ -1035,5 +1037,151 @@ func TestJobsCommand_Output(t *testing.T) {
 		}
 	})
 }
+
+func TestRootCommand_NoConfigFails(t *testing.T) {
+	origURL := os.Getenv("AGENTPULSE_MQTT_URL")
+	origStore := os.Getenv("AGENTPULSE_STORE")
+	os.Unsetenv("AGENTPULSE_MQTT_URL")
+	os.Unsetenv("AGENTPULSE_STORE")
+	defer func() {
+		if origURL != "" {
+			os.Setenv("AGENTPULSE_MQTT_URL", origURL)
+		}
+		if origStore != "" {
+			os.Setenv("AGENTPULSE_STORE", origStore)
+		}
+	}()
+
+	tmpDir := t.TempDir()
+	emptyConfig := filepath.Join(tmpDir, "nonexistent-config.yaml")
+
+	t.Run("bare root command without config returns error", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"--config", emptyConfig})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error when running bare root command without config, got nil")
+		}
+		expectedErr := "未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定"
+		if !strings.Contains(err.Error(), expectedErr) {
+			t.Errorf("expected error %q, got %q", expectedErr, err.Error())
+		}
+	})
+
+	t.Run("root command with --plain without config returns error", func(t *testing.T) {
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"--config", emptyConfig, "--plain"})
+
+		err := cmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error when running root command with --plain without config, got nil")
+		}
+		expectedErr := "未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定"
+		if !strings.Contains(err.Error(), expectedErr) {
+			t.Errorf("expected error %q, got %q", expectedErr, err.Error())
+		}
+	})
+
+	t.Run("explicit --store mock is still allowed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // immediately cancel plain watch
+
+		cmd := cli.NewRootCmd()
+		cmd.SetContext(ctx)
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"--config", emptyConfig, "--store", "mock", "--plain"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error running explicit mock: %v", err)
+		}
+	})
+}
+
+func TestDispatchCommand_HelpAndSetInterspersed(t *testing.T) {
+	cmd := cli.NewRootCmd()
+	var dispatchCmd *cobra.Command
+	for _, c := range cmd.Commands() {
+		if c.Name() == "dispatch" {
+			dispatchCmd = c
+			break
+		}
+	}
+	if dispatchCmd == nil {
+		t.Fatalf("dispatch command not found")
+	}
+
+	usage := dispatchCmd.UsageString()
+
+	// Verify Use string reflects flags before alias/command
+	expectedUse := "dispatch [--machine <id>] [--force] <别名|CLI> -- <参数…>"
+	if !strings.Contains(usage, expectedUse) {
+		t.Errorf("expected usage to contain %q, got:\n%s", expectedUse, usage)
+	}
+
+	// Verify examples in Long description put flags before alias/command
+	expectedExamples := []string{
+		"agentpulse dispatch --machine mac-studio op -- -p \"重构认证模块\"",
+		"agentpulse dispatch --machine mac-studio --follow agy -- -p \"运行测试集\"",
+		"agentpulse dispatch --machine gpu-box --force agy -- -p \"预热模型\"",
+	}
+	for _, ex := range expectedExamples {
+		if !strings.Contains(dispatchCmd.Long, ex) {
+			t.Errorf("expected Long description to contain example %q, got:\n%s", ex, dispatchCmd.Long)
+		}
+	}
+
+	// Verify flags parsed when placed before alias
+	t.Run("flags before alias correctly parsed", func(t *testing.T) {
+		rootCmd := cli.NewRootCmd()
+		rootCmd.SetArgs([]string{
+			"dispatch",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"--machine", "box-test-1",
+			"--force",
+			"agy",
+			"--", "-p", "test",
+		})
+		err := rootCmd.Execute()
+		if err == nil {
+			t.Fatalf("expected broker connection error, got nil")
+		}
+		// Confirm it did not complain about missing machine or unknown flag
+		if strings.Contains(err.Error(), "machine ID is required") {
+			t.Errorf("machine flag was not parsed properly: %v", err)
+		}
+		if strings.Contains(err.Error(), "unknown flag") {
+			t.Errorf("unexpected unknown flag error: %v", err)
+		}
+	})
+
+	// Verify SetInterspersed(false) behavior: flags after alias are not parsed as flags
+	t.Run("flags after alias are treated as positional arguments", func(t *testing.T) {
+		rootCmd := cli.NewRootCmd()
+		rootCmd.SetArgs([]string{
+			"dispatch",
+			"--mqtt-url", "tcp://127.0.0.1:18833",
+			"agy",
+			"--machine", "box-test-1",
+		})
+		err := rootCmd.Execute()
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		// Since --machine comes after "agy", machineFlag is empty, so dispatch tries auto-select and fails with machine ID required
+		if !strings.Contains(err.Error(), "machine ID is required") {
+			t.Errorf("expected 'machine ID is required' when flag is misplaced after alias, got: %v", err)
+		}
+	})
+}
+
 
 
