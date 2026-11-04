@@ -809,7 +809,7 @@ broker:
 		if cfg.SettleTimeout != 200*time.Millisecond {
 			t.Errorf("settle timeout: got %v", cfg.SettleTimeout)
 		}
-		if cfg.Timeout != 5*time.Second {
+		if cfg.Timeout != 10*time.Second {
 			t.Errorf("connect timeout: got %v", cfg.Timeout)
 		}
 	})

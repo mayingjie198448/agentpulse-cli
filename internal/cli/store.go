@@ -144,6 +144,12 @@ func getStore(cmd *cobra.Command) (store.Store, error) {
 
 // testMQTTConnection tries to establish a short-lived connection to verify broker reachability.
 func testMQTTConnection(cfg mqtt.Config, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = cfg.Timeout
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	doctorCfg := cfg
 	doctorCfg.ClientID = cfg.ClientID + "-doctor"
 	doctorCfg.Timeout = timeout

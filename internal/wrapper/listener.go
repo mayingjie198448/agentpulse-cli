@@ -377,7 +377,7 @@ func (l *Listener) setupMQTT() error {
 		cfg.KeepAlive = 30 * time.Second
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 5 * time.Second
+		cfg.Timeout = 10 * time.Second
 	}
 
 	opts := paho.NewClientOptions()
