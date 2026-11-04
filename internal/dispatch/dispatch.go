@@ -122,7 +122,7 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 			mqttCfg.ClientID = fmt.Sprintf("agentpulse-dispatch-%d", os.Getpid())
 		}
 		if mqttCfg.Timeout <= 0 {
-			mqttCfg.Timeout = 5 * time.Second
+			mqttCfg.Timeout = 10 * time.Second
 		}
 
 		opts := paho.NewClientOptions()

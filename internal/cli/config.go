@@ -156,9 +156,9 @@ func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
 		testCfg.Username = username
 		testCfg.Password = password
 		testCfg.TLSEnable = useTLS
-		testCfg.Timeout = 3 * time.Second
+		testCfg.Timeout = 10 * time.Second
 
-		testErr := testMQTTConnection(testCfg, 3*time.Second)
+		testErr := testMQTTConnection(testCfg, testCfg.Timeout)
 		if testErr == nil {
 			fmt.Fprintln(out, "[✓] Broker 连接测试成功！")
 			fmt.Fprintln(out)
@@ -242,7 +242,7 @@ func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
 	mqttCfg.Username = username
 	mqttCfg.Password = password
 	mqttCfg.TLSEnable = useTLS
-	mqttCfg.Timeout = 3 * time.Second
+	mqttCfg.Timeout = 10 * time.Second
 	mqttCfg.SettleTimeout = 500 * time.Millisecond
 
 	st, err := mqtt.New(mqttCfg)
@@ -252,7 +252,7 @@ func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
 		opts := paho.NewClientOptions()
 		_ = mqtt.ApplyClientOptions(opts, mqttCfg)
 		c := paho.NewClient(opts)
-		if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
+		if token := c.Connect(); token.WaitTimeout(mqttCfg.Timeout) && token.Error() == nil {
 			_ = mqtt.PublishAnnounce(c, initialAnnounce)
 			c.Disconnect(100)
 			fmt.Fprintln(out, "[✓] 已成功向 Broker 广播本机 Announce 注册信息")
@@ -354,7 +354,7 @@ func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
 	opts := paho.NewClientOptions()
 	_ = mqtt.ApplyClientOptions(opts, mqttCfg)
 	c := paho.NewClient(opts)
-	if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
+	if token := c.Connect(); token.WaitTimeout(mqttCfg.Timeout) && token.Error() == nil {
 		_ = mqtt.PublishAnnounce(c, finalAnnounce)
 		c.Disconnect(100)
 		fmt.Fprintln(out, "[✓] 已将最新本机 Agent 探测状态发布至 Broker Announce")

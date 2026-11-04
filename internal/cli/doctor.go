@@ -121,7 +121,11 @@ func newDoctorCmd() *cobra.Command {
 				}
 
 				fmt.Fprintf(out, "  [...] Broker 连通性测试中 (目标: %s)...\n", mqttCfg.BrokerURL)
-				testErr := testMQTTConnection(mqttCfg, 2*time.Second)
+				connTimeout := mqttCfg.Timeout
+				if connTimeout <= 0 {
+					connTimeout = 10 * time.Second
+				}
+				testErr := testMQTTConnection(mqttCfg, connTimeout)
 				if testErr != nil {
 					fmt.Fprintf(out, "  [WARN] Broker 测连失败: %v\n", testErr)
 				} else {
@@ -147,9 +151,12 @@ func newDoctorCmd() *cobra.Command {
 				if doctorAnnounceCfg.ClientID != "" {
 					doctorAnnounceCfg.ClientID += "-announce"
 				}
+				if doctorAnnounceCfg.Timeout <= 0 {
+					doctorAnnounceCfg.Timeout = 10 * time.Second
+				}
 				_ = mqtt.ApplyClientOptions(opts, doctorAnnounceCfg)
 				c := paho.NewClient(opts)
-				if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
+				if token := c.Connect(); token.WaitTimeout(doctorAnnounceCfg.Timeout) && token.Error() == nil {
 					if err := mqtt.PublishAnnounce(c, ann); err == nil {
 						fmt.Fprintf(out, "  [✓] 已同步最新 Announce 广播至 Broker (v1, rev %d, %d 个 CLI)\n", ann.Rev, len(ann.Agents))
 					}

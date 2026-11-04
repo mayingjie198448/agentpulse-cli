@@ -565,6 +565,37 @@ func TestMQTTStore_ColdStartRetainedSettle(t *testing.T) {
 	}
 }
 
+func TestMQTTStore_TimeoutConfigDefaultsAndValidation(t *testing.T) {
+	// 1. Verify DefaultConfig Timeout is 10s
+	cfg := mqttstore.DefaultConfig()
+	if cfg.Timeout != 10*time.Second {
+		t.Errorf("expected DefaultConfig Timeout 10s, got %v", cfg.Timeout)
+	}
+
+	// 2. Validate fills zero values with defaults
+	zeroCfg := mqttstore.Config{
+		BrokerURL: "tcp://broker.example:1883",
+	}
+	if err := zeroCfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if zeroCfg.Timeout != 10*time.Second {
+		t.Errorf("expected Validate to default Timeout to 10s, got %v", zeroCfg.Timeout)
+	}
+
+	// 3. Custom value is preserved
+	customCfg := mqttstore.Config{
+		BrokerURL: "tcp://broker.example:1883",
+		Timeout:   3 * time.Second,
+	}
+	if err := customCfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if customCfg.Timeout != 3*time.Second {
+		t.Errorf("expected custom Timeout 3s, got %v", customCfg.Timeout)
+	}
+}
+
 func TestMQTTStore_HeartbeatConfigDefaultsAndValidation(t *testing.T) {
 	// 1. Verify default values
 	cfg := mqttstore.DefaultConfig()
