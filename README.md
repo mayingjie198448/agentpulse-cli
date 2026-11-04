@@ -72,9 +72,9 @@ go build -o agentpulse ./cmd/agentpulse
 bash scripts/build-release.sh
 ```
 产物将输出至 `dist/`：
-- `agentpulse-0.5.0-darwin-arm64` / `agentpulse-0.5.0-darwin-amd64`
-- `agentpulse-0.5.0-linux-arm64` / `agentpulse-0.5.0-linux-amd64`
-- `agentpulse-0.5.0-windows-amd64.exe`
+- `agentpulse-0.5.1-darwin-arm64` / `agentpulse-0.5.1-darwin-amd64`
+- `agentpulse-0.5.1-linux-arm64` / `agentpulse-0.5.1-linux-amd64`
+- `agentpulse-0.5.1-windows-amd64.exe`
 - `SHA256SUMS`
 
 ### 可选：本地打包 Mac .app（Apple Silicon）
@@ -87,7 +87,7 @@ bash scripts/build-release.sh
 
 ---
 
-## 🚀 Usage (0.5.0 命令面体系)
+## 🚀 Usage (0.5.1 命令面体系)
 
 ### 1. 常驻单进程双角色 (`agentpulse`)
 
@@ -219,7 +219,7 @@ agentpulse watch job-agy-01
 
 ---
 
-### 8. 多机怎么跑 (Multi-Machine Quickstart in 0.5.0)
+### 8. 多机怎么跑 (Multi-Machine Quickstart in 0.5.1)
 
 AgentPulse 支持跨多台物理机/虚拟机分布式协同跑 AI Agent。假设所有节点均接入 **Tailscale**（或等价私有网络），经私网均可直达集中 MQTT Broker：
 
