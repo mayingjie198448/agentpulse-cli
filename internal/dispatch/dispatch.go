@@ -107,7 +107,7 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		client = cfg.MQTTClient
 	} else {
 		if cfg.MQTT == nil || cfg.MQTT.BrokerURL == "" {
-			return nil, fmt.Errorf("MQTT broker URL is required for dispatch (pass --mqtt-url or set AGENTPULSE_MQTT_URL)")
+			return nil, fmt.Errorf("MQTT broker URL is required for dispatch (pass --mqtt-url or set broker.url in config.yaml)")
 		}
 
 		if !cfg.Quiet {
@@ -461,7 +461,7 @@ func verifyTargetMachineOnClient(ctx context.Context, client paho.Client, machin
 				}
 			}
 		})
-		if annToken.WaitTimeout(5 * time.Second) && annToken.Error() == nil {
+		if annToken.WaitTimeout(5*time.Second) && annToken.Error() == nil {
 			defer func() {
 				unsub := client.Unsubscribe(announceTopic)
 				if unsub != nil {

@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,27 +154,6 @@ func SaveConfig(path string, cfg *Config) error {
 	return nil
 }
 
-// CheckLegacyEnvVars checks for deprecated AGENTPULSE_* environment variables.
-func CheckLegacyEnvVars() []string {
-	var found []string
-	for _, env := range os.Environ() {
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) > 0 && strings.HasPrefix(parts[0], "AGENTPULSE_") {
-			found = append(found, parts[0])
-		}
-	}
-	return found
-}
-
-// WarnLegacyEnvVars checks for legacy AGENTPULSE_* env vars and writes a warning to w.
-func WarnLegacyEnvVars(w io.Writer) {
-	found := CheckLegacyEnvVars()
-	if len(found) > 0 {
-		fmt.Fprintf(w, "[警告] 检测到旧的环境变量: %s。0.5.0 起请迁移至配置文件 (%s)；新逻辑以配置文件为准。\n",
-			strings.Join(found, ", "), DefaultConfigPath())
-	}
-}
-
 // ProbeAgent probes whether the given agent CLI executable is available.
 func ProbeAgent(ag AgentConfig) AgentStatus {
 	st := AgentStatus{
@@ -231,8 +209,9 @@ func ProbeAgents(agents []AgentConfig) []AgentStatus {
 	return statuses
 }
 
-// FilterChildProcessEnv filters out sensitive credentials (like broker passwords or AGENTPULSE_MQTT_PASSWORD)
-// from the environment variables before launching a child process.
+// FilterChildProcessEnv strips credential-bearing variables before a child process starts.
+// Product configuration is not read from the environment. Leftover AGENTPULSE_MQTT_* and
+// AGENTPULSE_BROKER_* values are still removed so a wrapped agent cannot inherit broker material.
 func FilterChildProcessEnv(env []string) []string {
 	var filtered []string
 	for _, kv := range env {

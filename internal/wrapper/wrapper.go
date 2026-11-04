@@ -540,13 +540,13 @@ func (w *Wrapper) publishLog(level model.LogLevel, message string) {
 	w.mu.Unlock()
 
 	entry := struct {
-		Timestamp time.Time      `json:"timestamp"`
-		JobID     string         `json:"job_id"`
-		MachineID string         `json:"machine_id"`
+		Timestamp time.Time        `json:"timestamp"`
+		JobID     string           `json:"job_id"`
+		MachineID string           `json:"machine_id"`
 		Engine    model.EngineType `json:"engine"`
-		Level     model.LogLevel `json:"level"`
-		Message   string         `json:"message"`
-		Seq       int64          `json:"seq"`
+		Level     model.LogLevel   `json:"level"`
+		Message   string           `json:"message"`
+		Seq       int64            `json:"seq"`
 	}{
 		Timestamp: time.Now().UTC(),
 		JobID:     jobID,
@@ -755,11 +755,9 @@ func (lw *lineWriter) Flush() {
 
 // Helpers for node and environment detection
 
-// DetectMachineID determines the node identifier from environment or hostname.
+// DetectMachineID returns the sanitized local hostname.
+// An explicit --machine flag or config.yaml machine_id is applied by the caller.
 func DetectMachineID() string {
-	if env := os.Getenv("AGENTPULSE_MACHINE_ID"); env != "" {
-		return SanitizeID(env)
-	}
 	if host, err := os.Hostname(); err == nil && host != "" {
 		return SanitizeID(host)
 	}
@@ -850,12 +848,8 @@ func inferTitle(args []string, command string) string {
 	return InferTitle(args, command)
 }
 
-// DetectLocalIP attempts to detect the local or Tailscale outbound IP address.
+// DetectLocalIP attempts to detect the local outbound IP address.
 func DetectLocalIP() string {
-	if env := os.Getenv("AGENTPULSE_IP"); env != "" {
-		return env
-	}
-
 	// UDP probe outbound routing table without sending traffic
 	conn, err := net.Dial("udp", "192.0.2.1:80")
 	if err == nil {
@@ -890,4 +884,3 @@ func BuildCommandArgs(command string, args []string) []string {
 	}
 	return parts
 }
-

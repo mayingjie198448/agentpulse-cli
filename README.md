@@ -7,13 +7,13 @@ Licensed under the [MIT License](LICENSE).
 ---
 
 > [!IMPORTANT]
-> **Dual Backend Architecture: Mock (Default) & MQTT Store (v0.2.0)**
-> AgentPulse runs out-of-the-box with an internal in-memory simulation engine (`internal/mock`).
-> To connect to a live Mosquitto / MQTT broker (lands in release/0.2.0), specify `--mqtt-url` or set `AGENTPULSE_MQTT_URL`.
+> **MQTT Store**
+> Broker settings come from `config.yaml` or explicit flags such as `--mqtt-url`.
+> Commands that read the network store exit with an error when no broker is configured and tell you to run `agentpulse config`.
 
 ---
 
-## ⚡ Architecture: Mock vs. MQTT Store
+## ⚡ Architecture
 
 ```
                     ┌────────────────────────────┐
@@ -24,29 +24,26 @@ Licensed under the [MIT License](LICENSE).
                                   ▼
                     ┌────────────────────────────┐
                     │     store.Store (API)      │
-                    └──────┬──────────────┬──────┘
-                           │              │
-        ┌──────────────────┴──┐        ┌──┴──────────────────┐
-        │  [Default: Mock]    │        │  [Active: MQTT]     │
-        │ internal/mock.Store │        │ internal/store/mqtt │
-        └─────────────────────┘        └──────────┬──────────┘
-                                                  │
-                                                  ▼
-                                       ┌─────────────────────┐
-                                       │    MQTT Broker      │
-                                       │ (agy / OpenCode bus)│
-                                       └─────────────────────┘
+                    └─────────────┬──────────────┘
+                                  │
+                                  ▼
+                    ┌────────────────────────────┐
+                    │   internal/store/mqtt      │
+                    └─────────────┬──────────────┘
+                                  │
+                                  ▼
+                    ┌────────────────────────────┐
+                    │        MQTT Broker         │
+                    │    (agy / OpenCode bus)    │
+                    └────────────────────────────┘
 ```
 
-- **Mock Store (Default)**:
-  - `internal/mock.MockStore` implements `store.Store` and simulates 4 distributed nodes (`ccdq`, `mac-mini`, `home-pc`, `macbook`).
-  - Running, done, and failed jobs across both `agy` and `OpenCode`.
-  - Realistic agent logs, subagent invocations, tool outputs, and progress bar ticks.
-- **MQTT Store (New in v0.2.0)**:
-  - `internal/store/mqtt.Store` connects to a remote MQTT broker (e.g. iStoreOS Mosquitto over Tailscale).
+- **MQTT Store**:
+  - `internal/store/mqtt.Store` connects to the broker configured in `config.yaml` or via `--mqtt-url` (for example `tls://broker.example:8883` or `tcp://127.0.0.1:1883`).
   - Subscribes to `agentpulse/v1/machines/+/status`, `.../jobs/+/status`, and `.../jobs/+/logs`.
   - In-memory aggregation with active job log ring buffer (~500 lines) and bounded event streaming (1024 cap) with non-blocking backpressure mitigation.
   - Automatic cold-start settle (~200ms configurable via `--mqtt-settle-timeout`) ensuring retained node and job states are populated on one-shot CLI commands (`list`, `logs`).
+  - There is no in-memory simulation mode and no `AGENTPULSE_*` environment fallback. Without a broker URL the command returns: `未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定`.
 
 ---
 
@@ -75,9 +72,9 @@ go build -o agentpulse ./cmd/agentpulse
 bash scripts/build-release.sh
 ```
 产物将输出至 `dist/`：
-- `agentpulse-0.5.0-darwin-arm64` / `agentpulse-0.5.0-darwin-amd64`
-- `agentpulse-0.5.0-linux-arm64` / `agentpulse-0.5.0-linux-amd64`
-- `agentpulse-0.5.0-windows-amd64.exe`
+- `agentpulse-0.5.1-darwin-arm64` / `agentpulse-0.5.1-darwin-amd64`
+- `agentpulse-0.5.1-linux-arm64` / `agentpulse-0.5.1-linux-amd64`
+- `agentpulse-0.5.1-windows-amd64.exe`
 - `SHA256SUMS`
 
 ### 可选：本地打包 Mac .app（Apple Silicon）
@@ -90,7 +87,7 @@ bash scripts/build-release.sh
 
 ---
 
-## 🚀 Usage (0.5.0 命令面体系)
+## 🚀 Usage (0.5.1 命令面体系)
 
 ### 1. 常驻单进程双角色 (`agentpulse`)
 
@@ -113,7 +110,7 @@ agentpulse --config /path/to/custom-config.yaml
 
 ### 2. 交互式配置向导 (`config`)
 
-引导式完成客户端与 Broker 配置，取代旧版环境变量形式：
+引导式完成客户端与 Broker 配置，写入 `config.yaml`：
 - **步骤 1**：配置 MQTT Broker 地址与鉴权信息（自动测试连通性）；
 - **步骤 2**：确认/设定本机机器标识 `machine_id`；
 - **步骤 3**：安全保存配置文件并广播本机 Announce，扫描展示网内其他在线设备；
@@ -128,7 +125,7 @@ agentpulse config
   - 默认路径：`~/.config/agentpulse/config.yaml`（Windows 为 `%AppData%\agentpulse\config.yaml`）
   - 安全权限：目录权限 `0700`，文件权限 `0600`
   - 仅支持 `--config <path>` 显式覆盖；不再使用环境变量指向配置路径。
-  - 若检测到旧 `AGENTPULSE_*` 环境变量，自动输出降级告警引导迁移。
+  - MQTT、机器标识、状态文件等产品配置只来自该文件与显式 CLI 标志（如 `--mqtt-url`、`--config`）。不读取 `AGENTPULSE_*` 环境变量，启动时也不再扫描或告警。
 - **配置示例 Schema**：
   ```yaml
   version: 1
@@ -222,7 +219,7 @@ agentpulse watch job-agy-01
 
 ---
 
-### 8. 多机怎么跑 (Multi-Machine Quickstart in 0.5.0)
+### 8. 多机怎么跑 (Multi-Machine Quickstart in 0.5.1)
 
 AgentPulse 支持跨多台物理机/虚拟机分布式协同跑 AI Agent。假设所有节点均接入 **Tailscale**（或等价私有网络），经私网均可直达集中 MQTT Broker：
 
