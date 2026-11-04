@@ -2,14 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
-	"github.com/mayingjie198448/agentpulse-cli/internal/mock"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/spf13/cobra"
@@ -17,8 +13,6 @@ import (
 
 func registerStoreFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().String("config", "", "指定配置文件路径 (默认: ~/.config/agentpulse/config.yaml)")
-	cmd.PersistentFlags().String("store", "", "Data store backend ('mock' or 'mqtt', default: 'mock')")
-	_ = cmd.PersistentFlags().MarkHidden("store")
 
 	cmd.PersistentFlags().String("mqtt-url", "", "MQTT broker URL (e.g. tcp://broker.example:1883, tls://broker.example:8883)")
 	cmd.PersistentFlags().String("mqtt-client-id", "", "MQTT client ID")
@@ -52,7 +46,8 @@ func loadActiveConfig(cmd *cobra.Command) (*config.Config, string, error) {
 	return cfg, confPath, err
 }
 
-// resolveMQTTConfig aggregates MQTT options from config file, CLI flags, and environment variables.
+// resolveMQTTConfig aggregates MQTT options from the config file, then explicit CLI flags.
+// AGENTPULSE_* environment variables are not a configuration source.
 func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 	cfg := mqtt.DefaultConfig()
 
@@ -130,86 +125,6 @@ func resolveMQTTConfig(cmd *cobra.Command) mqtt.Config {
 		}
 	}
 
-	// 3. Environment variable fallbacks
-	if cfg.BrokerURL == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_URL"); env != "" {
-			cfg.BrokerURL = env
-		}
-	}
-	if env := os.Getenv("AGENTPULSE_MQTT_CLIENT_ID"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-client-id")) {
-		cfg.ClientID = env
-	}
-	if cfg.Username == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_USERNAME"); env != "" {
-			cfg.Username = env
-		}
-	}
-	if cfg.Password == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_PASSWORD"); env != "" {
-			cfg.Password = env
-		}
-	}
-	if env := os.Getenv("AGENTPULSE_MQTT_SETTLE_TIMEOUT"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-settle-timeout")) {
-		if d, err := time.ParseDuration(env); err == nil {
-			cfg.SettleTimeout = d
-		}
-	}
-	if env := os.Getenv("AGENTPULSE_MQTT_TIMEOUT"); env != "" {
-		if d, err := time.ParseDuration(env); err == nil {
-			cfg.Timeout = d
-		}
-	}
-	if env := os.Getenv("AGENTPULSE_MQTT_HEARTBEAT_TIMEOUT"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-heartbeat-timeout")) {
-		if d, err := time.ParseDuration(env); err == nil {
-			cfg.HeartbeatTimeout = d
-		} else if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
-			cfg.HeartbeatTimeout = time.Duration(sec) * time.Second
-		}
-	}
-	if env := os.Getenv("AGENTPULSE_MQTT_HEARTBEAT_CHECK_INTERVAL"); env != "" && (cmd == nil || !cmd.Flags().Changed("mqtt-heartbeat-check-interval")) {
-		if d, err := time.ParseDuration(env); err == nil {
-			cfg.HeartbeatCheckInterval = d
-		} else if sec, err := strconv.Atoi(env); err == nil && sec > 0 {
-			cfg.HeartbeatCheckInterval = time.Duration(sec) * time.Second
-		}
-	}
-
-	// TLS environment variable fallbacks
-	if !cfg.TLSEnable && (cmd == nil || !cmd.Flags().Changed("mqtt-tls")) {
-		if env := os.Getenv("AGENTPULSE_MQTT_TLS"); env != "" {
-			if b, err := strconv.ParseBool(strings.TrimSpace(env)); err == nil {
-				cfg.TLSEnable = b
-			}
-		}
-	}
-	if cfg.CACertFile == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_CA_CERT"); env != "" {
-			cfg.CACertFile = env
-		}
-	}
-	if cfg.ClientCertFile == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_CLIENT_CERT"); env != "" {
-			cfg.ClientCertFile = env
-		}
-	}
-	if cfg.ClientKeyFile == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_CLIENT_KEY"); env != "" {
-			cfg.ClientKeyFile = env
-		}
-	}
-	if !cfg.InsecureSkipVerify && (cmd == nil || !cmd.Flags().Changed("mqtt-tls-insecure")) {
-		if env := os.Getenv("AGENTPULSE_MQTT_TLS_INSECURE"); env != "" {
-			if b, err := strconv.ParseBool(strings.TrimSpace(env)); err == nil {
-				cfg.InsecureSkipVerify = b
-			}
-		}
-	}
-	if cfg.ServerName == "" {
-		if env := os.Getenv("AGENTPULSE_MQTT_SERVER_NAME"); env != "" {
-			cfg.ServerName = env
-		}
-	}
-
 	return cfg
 }
 
@@ -218,64 +133,13 @@ func ResolveMQTTConfigForTest(cmd *cobra.Command) mqtt.Config {
 	return resolveMQTTConfig(cmd)
 }
 
-// determineStoreType decides whether to run mock or mqtt store.
-func determineStoreType(cmd *cobra.Command) (string, error) {
-	var st string
-	if cmd != nil {
-		if val, err := cmd.Flags().GetString("store"); err == nil && val != "" {
-			st = strings.ToLower(strings.TrimSpace(val))
-		}
-	}
-	if st == "" {
-		st = strings.ToLower(strings.TrimSpace(os.Getenv("AGENTPULSE_STORE")))
-	}
-
-	if st != "" {
-		if st != "mock" && st != "mqtt" {
-			return "", fmt.Errorf("invalid store type %q: must be 'mock' or 'mqtt'", st)
-		}
-		return st, nil
-	}
-
-	// If no explicit store specified, check if broker URL is set in flags or config
-	var hasMQTTURL bool
-	if cmd != nil {
-		if val, err := cmd.Flags().GetString("mqtt-url"); err == nil && val != "" {
-			hasMQTTURL = true
-		}
-	}
-	if !hasMQTTURL {
-		if fileCfg, _, err := loadActiveConfig(cmd); err == nil && fileCfg != nil && fileCfg.Broker.URL != "" {
-			hasMQTTURL = true
-		}
-	}
-	if !hasMQTTURL && os.Getenv("AGENTPULSE_MQTT_URL") != "" {
-		hasMQTTURL = true
-	}
-
-	if hasMQTTURL {
-		return "mqtt", nil
-	}
-
-	return "mock", nil
-}
-
-// getStore creates and returns the configured store (mock or mqtt).
+// getStore returns the MQTT store. There is no in-memory simulation mode.
 func getStore(cmd *cobra.Command) (store.Store, error) {
-	stType, err := determineStoreType(cmd)
-	if err != nil {
-		return nil, err
+	cfg := resolveMQTTConfig(cmd)
+	if cfg.BrokerURL == "" {
+		return nil, fmt.Errorf("未配置 MQTT Broker URL。请运行 'agentpulse config' 初始化配置，或通过 --mqtt-url 指定")
 	}
-
-	if stType == "mqtt" {
-		cfg := resolveMQTTConfig(cmd)
-		if cfg.BrokerURL == "" {
-			return nil, fmt.Errorf("MQTT store enabled but no broker URL provided (pass --mqtt-url or run 'agentpulse config')")
-		}
-		return mqtt.New(cfg)
-	}
-
-	return mock.NewMockStore(), nil
+	return mqtt.New(cfg)
 }
 
 // testMQTTConnection tries to establish a short-lived connection to verify broker reachability.
@@ -301,5 +165,3 @@ func testMQTTConnection(cfg mqtt.Config, timeout time.Duration) error {
 	client.Disconnect(100)
 	return nil
 }
-
-

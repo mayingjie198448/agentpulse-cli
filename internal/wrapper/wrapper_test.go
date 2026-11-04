@@ -217,12 +217,12 @@ func TestWrapper_LocalExecution_Success(t *testing.T) {
 	statusFile := filepath.Join(tmpDir, "status.json")
 
 	w, err := wrapper.New(wrapper.Config{
-		MachineID:   "test-node",
-		JobID:       "job-test-01",
-		Engine:      model.EngineAgy,
-		Title:       "Echo test",
-		Args:        []string{"echo", "Hello from wrapped agy job"},
-		StatusFile:  statusFile,
+		MachineID:    "test-node",
+		JobID:        "job-test-01",
+		Engine:       model.EngineAgy,
+		Title:        "Echo test",
+		Args:         []string{"echo", "Hello from wrapped agy job"},
+		StatusFile:   statusFile,
 		MirrorStdout: nil,
 	})
 	if err != nil {
@@ -956,30 +956,28 @@ func TestSanitizeID(t *testing.T) {
 	}
 }
 
-func TestDetectMachineID_Precedence(t *testing.T) {
-	// 1. Env variable takes precedence over hostname
-	origEnv := os.Getenv("AGENTPULSE_MACHINE_ID")
-	defer func() {
-		if origEnv != "" {
-			os.Setenv("AGENTPULSE_MACHINE_ID", origEnv)
-		} else {
-			os.Unsetenv("AGENTPULSE_MACHINE_ID")
-		}
-	}()
-
-	os.Setenv("AGENTPULSE_MACHINE_ID", "Custom_Box_99")
-	got := wrapper.DetectMachineID()
-	if got != "custom-box-99" {
-		t.Errorf("expected custom-box-99 from env, got %q", got)
-	}
-
-	// 2. When env is empty, falls back to sanitized hostname
-	os.Unsetenv("AGENTPULSE_MACHINE_ID")
+func TestDetectMachineID_IgnoresEnv(t *testing.T) {
+	t.Setenv("AGENTPULSE_MACHINE_ID", "Custom_Box_99")
 	host, _ := os.Hostname()
 	expectedHostID := wrapper.SanitizeID(host)
-	gotHost := wrapper.DetectMachineID()
-	if gotHost != expectedHostID {
-		t.Errorf("expected sanitized hostname %q, got %q", expectedHostID, gotHost)
+	got := wrapper.DetectMachineID()
+	if got != expectedHostID {
+		t.Errorf("expected sanitized hostname %q, got %q", expectedHostID, got)
+	}
+	if got == "custom-box-99" && expectedHostID != "custom-box-99" {
+		t.Errorf("AGENTPULSE_MACHINE_ID must not override hostname, got %q", got)
+	}
+}
+
+func TestDetectLocalIP_IgnoresEnv(t *testing.T) {
+	const envIP = "192.0.2.55"
+	t.Setenv("AGENTPULSE_IP", envIP)
+	got := wrapper.DetectLocalIP()
+	if got == envIP {
+		t.Errorf("AGENTPULSE_IP must not override detected address, got %q", got)
+	}
+	if got == "" {
+		t.Error("expected a detected address")
 	}
 }
 

@@ -24,11 +24,7 @@ Snapshot defaults to .agentpulse/status.json or the path specified via --status-
 			out := cmd.OutOrStdout()
 
 			if statusFile == "" {
-				if env := os.Getenv("AGENTPULSE_STATUS_FILE"); env != "" {
-					statusFile = env
-				} else {
-					statusFile = wrapper.DefaultStatusFile
-				}
+				statusFile = wrapper.DefaultStatusFile
 			}
 
 			st, err := wrapper.ReadLocalStatus(statusFile)
@@ -90,7 +86,7 @@ Snapshot defaults to .agentpulse/status.json or the path specified via --status-
 		},
 	}
 
-	cmd.Flags().StringVar(&statusFile, "status-file", "", "Path to local status snapshot (or $AGENTPULSE_STATUS_FILE)")
+	cmd.Flags().StringVar(&statusFile, "status-file", "", "Path to local status snapshot (default: .agentpulse/status.json)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output status as JSON")
 
 	return cmd

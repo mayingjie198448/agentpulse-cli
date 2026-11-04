@@ -18,15 +18,11 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 
 	mqttCfg := resolveMQTTConfig(cmd)
 	if mqttCfg.BrokerURL == "" {
-		return fmt.Errorf("MQTT broker URL is required for listen mode (pass --mqtt-url or set AGENTPULSE_MQTT_URL)")
+		return fmt.Errorf("MQTT broker URL is required for listen mode (pass --mqtt-url or set broker.url in config.yaml)")
 	}
 
 	if statusFile == "" {
-		if env := os.Getenv("AGENTPULSE_STATUS_FILE"); env != "" {
-			statusFile = env
-		} else {
-			statusFile = wrapper.DefaultStatusFile
-		}
+		statusFile = wrapper.DefaultStatusFile
 	}
 
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -108,8 +104,7 @@ and serially executes incoming AI agent jobs (agy / opencode).
 
 Node identity resolution precedence:
   1. Explicit CLI flag (--machine / --machine-id)
-  2. AGENTPULSE_MACHINE_ID environment variable
-  3. Sanitized local hostname (lowercase alphanumeric with hyphens)
+  2. Sanitized local hostname (lowercase alphanumeric with hyphens)
 
 Examples:
   # Listen for remote dispatch on broker:
@@ -128,10 +123,10 @@ Examples:
 		},
 	}
 
-	listenCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: $AGENTPULSE_MACHINE_ID or sanitized hostname)")
+	listenCmd.Flags().StringVar(&machineFlag, "machine", "", "Machine ID override (default: sanitized hostname)")
 	listenCmd.Flags().StringVar(&machineIDFlag, "machine-id", "", "Machine ID override (alias for --machine)")
-	listenCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (or $AGENTPULSE_MACHINE_NAME)")
-	listenCmd.Flags().StringVar(&statusFile, "status-file", "", "Path to write local status snapshot (or $AGENTPULSE_STATUS_FILE)")
+	listenCmd.Flags().StringVar(&machineName, "machine-name", "", "Machine display name override (default: machine ID)")
+	listenCmd.Flags().StringVar(&statusFile, "status-file", "", "Path to write local status snapshot (default: .agentpulse/status.json)")
 	listenCmd.Flags().DurationVar(&heartbeatInterval, "heartbeat-interval", wrapper.DefaultHeartbeatInterval, "Interval between MQTT heartbeats")
 	listenCmd.Flags().BoolVar(&stub, "stub", false, "Run executed jobs in simulated stub mode")
 	listenCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when running agy commands")
