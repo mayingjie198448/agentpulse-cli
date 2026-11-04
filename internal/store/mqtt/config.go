@@ -20,7 +20,7 @@ type Config struct {
 	Username               string        // Optional MQTT broker username
 	Password               string        // Optional MQTT broker password
 	KeepAlive              time.Duration // MQTT keepalive interval (default: 30s)
-	Timeout                time.Duration // Connect and request timeout (default: 5s)
+	Timeout                time.Duration // Connect and request timeout (default: 10s)
 	LogCap                 int           // Maximum logs retained per job in ring buffer (default: 500)
 	BufferCap              int           // Buffer capacity for event subscribers (default: 1024)
 	HeartbeatTimeout       time.Duration // Max duration before marking node offline (default: 45s)
@@ -42,7 +42,7 @@ func DefaultConfig() Config {
 		BrokerURL:              "",
 		ClientID:               generateClientID(),
 		KeepAlive:              30 * time.Second,
-		Timeout:                5 * time.Second,
+		Timeout:                10 * time.Second,
 		LogCap:                 500,
 		BufferCap:              1024,
 		HeartbeatTimeout:       45 * time.Second,
@@ -206,7 +206,7 @@ func (c *Config) Validate() error {
 		c.KeepAlive = 30 * time.Second
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = 5 * time.Second
+		c.Timeout = 10 * time.Second
 	}
 	if c.LogCap <= 0 {
 		c.LogCap = 500

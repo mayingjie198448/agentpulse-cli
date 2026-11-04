@@ -175,7 +175,11 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 			opts := paho.NewClientOptions()
 			_ = mqtt.ApplyClientOptions(opts, announceMQTT)
 			c := paho.NewClient(opts)
-			if token := c.Connect(); token.WaitTimeout(2*time.Second) && token.Error() == nil {
+			waitTimeout := announceMQTT.Timeout
+			if waitTimeout <= 0 {
+				waitTimeout = 10 * time.Second
+			}
+			if token := c.Connect(); token.WaitTimeout(waitTimeout) && token.Error() == nil {
 				_ = mqtt.PublishAnnounce(c, ann)
 				c.Disconnect(100)
 			}
