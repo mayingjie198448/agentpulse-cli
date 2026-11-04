@@ -30,6 +30,12 @@ type Store interface {
 	// GetLogs returns the most recent logs for a specific job.
 	GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error)
 
+	// ListAnnounces returns all discovered machine announcements across the network.
+	ListAnnounces(ctx context.Context) ([]model.MachineAnnounce, error)
+
+	// GetAnnounce returns the announcement for a specific machine ID.
+	GetAnnounce(ctx context.Context, machineID string) (*model.MachineAnnounce, error)
+
 	// Subscribe returns an event channel receiving real-time state changes and logs.
 	Subscribe(ctx context.Context) (<-chan model.Event, error)
 

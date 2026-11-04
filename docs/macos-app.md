@@ -1,5 +1,10 @@
 # macOS App 打包指南 (Apple Silicon)
 
+> [!NOTE]
+> **发布资产调整说明（v0.5.0 起）**：
+> 从 0.5.0 版本开始，AgentPulse 官方发布（Release）资产调整为跨平台**裸二进制与 SHA256SUMS 校验文件**（通过 `scripts/build-release.sh` 构建）。
+> 本文介绍的 `AgentPulse.app` 打包脚本（`scripts/build-macos-app.sh`）保留作为 macOS 桌面环境下的本地开发者实验性封装工具，**不再作为发版必选项**。
+
 本文档介绍如何将 AgentPulse CLI 打包为适用于 Apple Silicon (macOS `darwin/arm64`) 的标准 macOS App Bundle (`AgentPulse.app`)。
 
 ---

@@ -34,6 +34,16 @@ func TestParseTopic(t *testing.T) {
 			jobID:     "job-agy-05",
 		},
 		{
+			topic:     "agentpulse/v1/mac-studio-m2/announce",
+			wantType:  topicAnnounce,
+			machineID: "mac-studio-m2",
+		},
+		{
+			topic:     "agentpulse/v1/machines/mac-studio-m2/announce",
+			wantType:  topicAnnounce,
+			machineID: "mac-studio-m2",
+		},
+		{
 			topic:     "agentpulse/v1/machines/mac-studio-m2/commands/dispatch",
 			wantType:  topicCommandDispatch,
 			machineID: "mac-studio-m2",

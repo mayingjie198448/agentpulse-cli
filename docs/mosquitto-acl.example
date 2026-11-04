@@ -31,6 +31,7 @@ user operator-alice
 topic read agentpulse/v1/machines/+/status
 topic read agentpulse/v1/machines/+/jobs/+/status
 topic read agentpulse/v1/machines/+/jobs/+/logs
+topic read agentpulse/v1/+/announce
 topic write agentpulse/v1/machines/+/commands/dispatch
 topic readwrite agentpulse/v1/notifications/alerts
 
@@ -38,6 +39,7 @@ user operator-bob
 topic read agentpulse/v1/machines/+/status
 topic read agentpulse/v1/machines/+/jobs/+/status
 topic read agentpulse/v1/machines/+/jobs/+/logs
+topic read agentpulse/v1/+/announce
 topic write agentpulse/v1/machines/+/commands/dispatch
 topic readwrite agentpulse/v1/notifications/alerts
 
@@ -55,11 +57,13 @@ topic readwrite agentpulse/v1/notifications/alerts
 # Worker Node 1: mac-studio
 user node-mac-studio
 topic readwrite agentpulse/v1/machines/mac-studio/#
+topic readwrite agentpulse/v1/mac-studio/announce
 topic write agentpulse/v1/notifications/alerts
 
 # Worker Node 2: linux-gpu
 user node-linux-gpu
 topic readwrite agentpulse/v1/machines/linux-gpu/#
+topic readwrite agentpulse/v1/linux-gpu/announce
 topic write agentpulse/v1/notifications/alerts
 
 # ------------------------------------------------------------------------------
@@ -71,4 +75,5 @@ topic write agentpulse/v1/notifications/alerts
 # enumerating every node identity:
 #
 # pattern readwrite agentpulse/v1/machines/%u/#
+# pattern readwrite agentpulse/v1/%u/announce
 # pattern write agentpulse/v1/notifications/alerts

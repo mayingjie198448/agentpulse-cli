@@ -333,6 +333,67 @@ flowchart TD
 
 ---
 
+### 4.6 机器与 Agent CLI 拓扑广播 (Machine & Agent Announce, New in v0.5.0)
+
+- **主题**：`agentpulse/v1/{machine_id}/announce`（支持 `agentpulse/v1/machines/{machine_id}/announce` 兼容模式）
+- **发布者**：各机器在 `config` 保存完成、`doctor` 诊断完成、或常驻主程序启动时
+- **QoS 与 Retained**：**QoS 1**，**Retained true**
+- **订阅者**：全网节点与 CLI，用于动态维护集群机器与 Agent CLI 支持拓扑（扁平表展示与 dispatch 门禁决策）
+
+#### 字段定义
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `v` | integer | 协议格式版本（当前为 `1`） |
+| `machine_id` | string | 发布机器标识（小写规范化 ID） |
+| `ts` | string (RFC 3339) | 广播时间戳 |
+| `rev` | integer | 机器配置变更版本号（每次更新自增） |
+| `hostname` | string | 机器主机名 |
+| `os` | string | 系统与架构标识（如 `darwin/arm64`、`linux/amd64`） |
+| `agents` | array[object] | 本机探测就绪的 Agent CLI 列表（**禁止包含密码、Token、绝对路径等敏感信息**） |
+| `agents[].id` | string | Agent 唯一标识（如 `"agy"`, `"opencode"`, `"codex"`） |
+| `agents[].alias` | array[string] | 该 Agent 本机支持的派发调用别名 |
+| `agents[].ok` | boolean | 该 Agent 在本机是否可用（在 PATH 中找到或配置可用） |
+| `agents[].detail` | string | 诊断描述（如可执行文件路径或未安装说明） |
+
+#### 冲突解决与安全性约束
+- **版本比对**：同一 `machine_id` 收到不同广播时，根据 `rev`（若相等则比对 `ts`）保留最新记录。
+- **只读合并**：其他机器接收到 Announce 仅在内存中更新拓扑缓存，绝对不得覆写本地配置文件。
+- **敏感信息剔除**：严禁在 Announce Payload 中注入 Broker 密码、私钥、Token 或子进程环境变量。
+
+#### JSON 示例：机器 Announce 广播
+```json
+{
+  "v": 1,
+  "machine_id": "mac-studio-m2",
+  "ts": "2026-11-03T12:00:00Z",
+  "rev": 3,
+  "hostname": "mac-studio.local",
+  "os": "darwin/arm64",
+  "agents": [
+    {
+      "id": "agy",
+      "alias": ["agy"],
+      "ok": true,
+      "detail": "/usr/local/bin/agy"
+    },
+    {
+      "id": "opencode",
+      "alias": ["op", "opencode"],
+      "ok": true,
+      "detail": "/usr/local/bin/opencode"
+    },
+    {
+      "id": "codex",
+      "alias": ["codex"],
+      "ok": false,
+      "detail": "未在 PATH 中找到可执行文件"
+    }
+  ]
+}
+```
+
+---
+
 ## 5. MockStore 到 MQTT Store 的映射实现指南
 
 > **实现进度**：`internal/store/mqtt.Store` 已在 v0.2.0 (`feat/mqtt-store`) 完成落地，支持三类通配主题订阅、内存聚合与 500 条日志环形缓冲。

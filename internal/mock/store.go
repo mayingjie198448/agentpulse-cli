@@ -19,6 +19,7 @@ type MockStore struct {
 	machines    map[string]*model.Machine
 	jobs        map[string]*model.Job
 	logs        map[string][]model.LogEntry
+	announces   map[string]*model.MachineAnnounce
 	subscribers map[chan model.Event]struct{}
 	stopCh      chan struct{}
 	closed      bool
@@ -32,6 +33,7 @@ func NewMockStore() *MockStore {
 		machines:    make(map[string]*model.Machine),
 		jobs:        make(map[string]*model.Job),
 		logs:        make(map[string][]model.LogEntry),
+		announces:   make(map[string]*model.MachineAnnounce),
 		subscribers: make(map[chan model.Event]struct{}),
 		stopCh:      make(chan struct{}),
 	}
@@ -78,6 +80,56 @@ func NewMockStore() *MockStore {
 
 	for _, m := range machines {
 		s.machines[m.ID] = m
+	}
+
+	// 1.1 Initial Machine Announces (0.5.0 spec)
+	s.announces["ccdq"] = &model.MachineAnnounce{
+		V:         1,
+		MachineID: "ccdq",
+		TS:        now,
+		Rev:       1,
+		Hostname:  "ccdq-srv",
+		OS:        "linux/amd64",
+		Agents: []model.AgentAnnounce{
+			{ID: "agy", Alias: []string{"agy"}, Ok: true, Detail: "/usr/local/bin/agy"},
+			{ID: "opencode", Alias: []string{"op", "opencode"}, Ok: true, Detail: "/usr/local/bin/opencode"},
+		},
+	}
+	s.announces["mac-mini"] = &model.MachineAnnounce{
+		V:         1,
+		MachineID: "mac-mini",
+		TS:        now,
+		Rev:       1,
+		Hostname:  "mac-mini.local",
+		OS:        "darwin/arm64",
+		Agents: []model.AgentAnnounce{
+			{ID: "agy", Alias: []string{"agy"}, Ok: true, Detail: "/opt/homebrew/bin/agy"},
+			{ID: "opencode", Alias: []string{"op", "opencode"}, Ok: true, Detail: "/opt/homebrew/bin/opencode"},
+			{ID: "codex", Alias: []string{"codex"}, Ok: false, Detail: "not found in PATH"},
+		},
+	}
+	s.announces["home-pc"] = &model.MachineAnnounce{
+		V:         1,
+		MachineID: "home-pc",
+		TS:        now,
+		Rev:       1,
+		Hostname:  "HOME-DESKTOP",
+		OS:        "windows/amd64",
+		Agents: []model.AgentAnnounce{
+			{ID: "opencode", Alias: []string{"op", "opencode"}, Ok: true, Detail: "C:\\bin\\opencode.exe"},
+			{ID: "codex", Alias: []string{"codex"}, Ok: true, Detail: "C:\\bin\\codex.exe"},
+		},
+	}
+	s.announces["macbook"] = &model.MachineAnnounce{
+		V:         1,
+		MachineID: "macbook",
+		TS:        now.Add(-14 * time.Minute),
+		Rev:       1,
+		Hostname:  "MacBook-Air.local",
+		OS:        "darwin/arm64",
+		Agents: []model.AgentAnnounce{
+			{ID: "agy", Alias: []string{"agy"}, Ok: true, Detail: "/usr/local/bin/agy"},
+		},
 	}
 
 	// 2. Initial Jobs across machines and engines
@@ -290,6 +342,33 @@ func (s *MockStore) GetLogs(ctx context.Context, jobID string, limit int) ([]mod
 	copied := make([]model.LogEntry, limit)
 	copy(copied, entries[start:])
 	return copied, nil
+}
+
+// ListAnnounces returns all mock machine announcements.
+func (s *MockStore) ListAnnounces(ctx context.Context) ([]model.MachineAnnounce, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]model.MachineAnnounce, 0, len(s.announces))
+	order := []string{"ccdq", "mac-mini", "home-pc", "macbook"}
+	for _, id := range order {
+		if ann, ok := s.announces[id]; ok {
+			result = append(result, *ann)
+		}
+	}
+	return result, nil
+}
+
+// GetAnnounce returns a mock machine announcement by machineID.
+func (s *MockStore) GetAnnounce(ctx context.Context, machineID string) (*model.MachineAnnounce, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if ann, ok := s.announces[machineID]; ok {
+		cp := *ann
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("announcement not found for machine: %s", machineID)
 }
 
 // Subscribe opens a channel for simulated events.

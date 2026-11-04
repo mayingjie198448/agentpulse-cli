@@ -20,6 +20,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
@@ -394,12 +395,13 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 
 	cmd := exec.CommandContext(ctx, bin, w.cfg.Args[1:]...)
 	cmd.Dir = w.cfg.Cwd
+	cmdEnv := config.FilterChildProcessEnv(os.Environ())
 	if len(w.cfg.Env) > 0 {
-		cmd.Env = os.Environ()
 		for k, v := range w.cfg.Env {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+			cmdEnv = append(cmdEnv, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
+	cmd.Env = config.FilterChildProcessEnv(cmdEnv)
 
 	stdoutWriter := newLineWriter(func(line string) {
 		w.handleOutputLine(line, false)

@@ -148,6 +148,8 @@ func matchTopic(filter, topic string) bool {
 		return parseTopic(topic).typ == topicJobStatus
 	case TopicJobsLogs:
 		return parseTopic(topic).typ == topicJobLog
+	case TopicAnnounceWildcard, TopicMachinesAnnounceWildcard:
+		return parseTopic(topic).typ == topicAnnounce
 	default:
 		return filter == topic || filter == "#"
 	}

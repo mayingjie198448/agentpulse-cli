@@ -25,6 +25,7 @@ type Store struct {
 	machines    map[string]*model.Machine
 	jobs        map[string]*model.Job
 	logs        map[string]*logRingBuffer
+	announces   map[string]*model.MachineAnnounce
 	subscribers map[chan model.Event]struct{}
 	closeCh     chan struct{}
 	closed      bool
@@ -42,6 +43,7 @@ func New(cfg Config) (*Store, error) {
 		machines:    make(map[string]*model.Machine),
 		jobs:        make(map[string]*model.Job),
 		logs:        make(map[string]*logRingBuffer),
+		announces:   make(map[string]*model.MachineAnnounce),
 		subscribers: make(map[chan model.Event]struct{}),
 		closeCh:     make(chan struct{}),
 	}
@@ -56,9 +58,11 @@ func New(cfg Config) (*Store, error) {
 	// Resubscribe automatically upon reconnection
 	opts.SetOnConnectHandler(func(c paho.Client) {
 		filters := map[string]byte{
-			TopicMachinesStatus: 1,
-			TopicJobsStatus:     1,
-			TopicJobsLogs:       0,
+			TopicMachinesStatus:           1,
+			TopicJobsStatus:               1,
+			TopicJobsLogs:                 0,
+			TopicAnnounceWildcard:         1,
+			TopicMachinesAnnounceWildcard: 1,
 		}
 		c.SubscribeMultiple(filters, s.onMQTTMessage)
 	})
@@ -76,9 +80,11 @@ func New(cfg Config) (*Store, error) {
 
 	// Explicit initial subscription
 	filters := map[string]byte{
-		TopicMachinesStatus: 1,
-		TopicJobsStatus:     1,
-		TopicJobsLogs:       0,
+		TopicMachinesStatus:           1,
+		TopicJobsStatus:               1,
+		TopicJobsLogs:                 0,
+		TopicAnnounceWildcard:         1,
+		TopicMachinesAnnounceWildcard: 1,
 	}
 	subToken := client.SubscribeMultiple(filters, s.onMQTTMessage)
 	if !subToken.WaitTimeout(cfg.Timeout) {
@@ -119,15 +125,18 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 		machines:    make(map[string]*model.Machine),
 		jobs:        make(map[string]*model.Job),
 		logs:        make(map[string]*logRingBuffer),
+		announces:   make(map[string]*model.MachineAnnounce),
 		subscribers: make(map[chan model.Event]struct{}),
 		closeCh:     make(chan struct{}),
 	}
 
 	if client != nil {
 		filters := map[string]byte{
-			TopicMachinesStatus: 1,
-			TopicJobsStatus:     1,
-			TopicJobsLogs:       0,
+			TopicMachinesStatus:           1,
+			TopicJobsStatus:               1,
+			TopicJobsLogs:                 0,
+			TopicAnnounceWildcard:         1,
+			TopicMachinesAnnounceWildcard: 1,
 		}
 		token := client.SubscribeMultiple(filters, s.onMQTTMessage)
 		if token != nil {
@@ -164,6 +173,8 @@ func (s *Store) HandleMessage(topic string, payload []byte) {
 		s.handleJobStatus(pt, payload)
 	case topicJobLog:
 		s.handleJobLog(pt, payload)
+	case topicAnnounce:
+		s.handleAnnounce(pt, payload)
 	}
 }
 
@@ -288,6 +299,50 @@ func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
 	})
 }
 
+func (s *Store) handleAnnounce(pt parsedTopic, payload []byte) {
+	var ann model.MachineAnnounce
+	if err := json.Unmarshal(payload, &ann); err != nil {
+		return
+	}
+	if ann.MachineID == "" {
+		ann.MachineID = pt.machineID
+	}
+	if ann.TS.IsZero() {
+		ann.TS = time.Now().UTC()
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+
+	// Conflict resolution per 0.5.0 spec:
+	// "同 machine_id 冲突比 rev（或 ts）；他机只读合并，不写进自己的 config"
+	existing, exists := s.announces[ann.MachineID]
+	if exists && existing != nil {
+		if ann.Rev < existing.Rev {
+			s.mu.Unlock()
+			return
+		}
+		if ann.Rev == existing.Rev && !ann.TS.After(existing.TS) {
+			s.mu.Unlock()
+			return
+		}
+	}
+
+	stored := ann
+	s.announces[ann.MachineID] = &stored
+	s.mu.Unlock()
+
+	broadcastAnn := ann
+	s.broadcast(model.Event{
+		Type:      model.EventAnnounceUpdated,
+		Announce:  &broadcastAnn,
+		Timestamp: time.Now(),
+	})
+}
+
 // ListMachines returns all cached machines, ordered online first, then by ID.
 func (s *Store) ListMachines(ctx context.Context) ([]model.Machine, error) {
 	s.checkStaleMachines()
@@ -384,6 +439,48 @@ func (s *Store) GetLogs(ctx context.Context, jobID string, limit int) ([]model.L
 		return []model.LogEntry{}, nil
 	}
 	return nil, fmt.Errorf("no logs found for job: %s", jobID)
+}
+
+// ListAnnounces returns all discovered machine announcements across the network.
+func (s *Store) ListAnnounces(ctx context.Context) ([]model.MachineAnnounce, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]model.MachineAnnounce, 0, len(s.announces))
+	for _, ann := range s.announces {
+		result = append(result, *ann)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].MachineID < result[j].MachineID
+	})
+	return result, nil
+}
+
+// GetAnnounce returns the announcement for a specific machine ID.
+func (s *Store) GetAnnounce(ctx context.Context, machineID string) (*model.MachineAnnounce, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ann, ok := s.announces[machineID]
+	if !ok || ann == nil {
+		return nil, fmt.Errorf("announcement not found for machine %q", machineID)
+	}
+	cp := *ann
+	return &cp, nil
+}
+
+// PublishAnnounce publishes an announcement payload to agentpulse/v1/{machine_id}/announce.
+func PublishAnnounce(client paho.Client, ann model.MachineAnnounce) error {
+	topic := MachineAnnounceTopic(ann.MachineID)
+	data, err := json.Marshal(ann)
+	if err != nil {
+		return fmt.Errorf("failed to marshal announce: %w", err)
+	}
+	token := client.Publish(topic, 1, true, data)
+	if !token.WaitTimeout(5 * time.Second) {
+		return fmt.Errorf("publish announce to %s timed out", topic)
+	}
+	return token.Error()
 }
 
 // Subscribe returns an event channel receiving real-time state changes and logs.
