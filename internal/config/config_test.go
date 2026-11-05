@@ -119,6 +119,20 @@ func TestProbeAgent(t *testing.T) {
 	if nonExistent.Ok {
 		t.Errorf("expected nonexistent binary to be ok: false")
 	}
+
+	// Probe disabled agent
+	disabled := false
+	disabledAgent := config.ProbeAgent(config.AgentConfig{
+		ID:      cmdName,
+		Alias:   []string{cmdName},
+		Enabled: &disabled,
+	})
+	if disabledAgent.Ok {
+		t.Errorf("expected disabled agent to be ok: false")
+	}
+	if !strings.Contains(disabledAgent.Detail, "禁用") {
+		t.Errorf("expected detail to mention 禁用, got %s", disabledAgent.Detail)
+	}
 }
 
 func TestFilterChildProcessEnv(t *testing.T) {

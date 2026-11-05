@@ -35,9 +35,18 @@ type BrokerConfig struct {
 
 // AgentConfig represents an AI agent CLI registered on the local machine.
 type AgentConfig struct {
-	ID    string   `yaml:"id"`
-	Path  string   `yaml:"path,omitempty"`
-	Alias []string `yaml:"alias,omitempty"`
+	ID      string   `yaml:"id"`
+	Path    string   `yaml:"path,omitempty"`
+	Alias   []string `yaml:"alias,omitempty"`
+	Enabled *bool    `yaml:"enabled,omitempty"`
+}
+
+// IsEnabled returns true if the agent is enabled (defaults to true if unspecified).
+func (a AgentConfig) IsEnabled() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
 }
 
 // AgentStatus represents the probed runtime status of a registered agent.
@@ -162,6 +171,12 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 		Path:  ag.Path,
 	}
 
+	if !ag.IsEnabled() {
+		st.Ok = false
+		st.Detail = "已禁用"
+		return st
+	}
+
 	// If explicit path configured
 	if ag.Path != "" {
 		resolved, err := exec.LookPath(ag.Path)
@@ -249,6 +264,9 @@ func ResolveAgentBinary(cfg *Config, cmdOrAlias string) string {
 
 	// 1. Check if matches configured agent ID or alias
 	for _, ag := range agents {
+		if !ag.IsEnabled() {
+			continue
+		}
 		match := false
 		if strings.EqualFold(ag.ID, target) {
 			match = true

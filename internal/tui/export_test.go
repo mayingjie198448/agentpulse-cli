@@ -21,3 +21,18 @@ func (m *Model) SelectedJobIdxForTest() int {
 func (m *Model) LogsForTest() map[string][]model.LogEntry {
 	return m.logs
 }
+
+// BrokerConnectedForTest returns the broker connection state for test assertions.
+func (m *Model) BrokerConnectedForTest() bool {
+	return m.brokerConnected
+}
+
+// ActivePaneForTest returns the active pane for test assertions.
+func (m *Model) ActivePaneForTest() ActivePane {
+	return m.activePane
+}
+
+// AutoScrollForTest returns the autoscroll state for test assertions.
+func (m *Model) AutoScrollForTest() bool {
+	return m.autoScroll
+}

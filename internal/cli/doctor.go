@@ -58,7 +58,11 @@ func newDoctorCmd() *cobra.Command {
 				if err == nil {
 					permStr = fmt.Sprintf("权限: %#o", info.Mode().Perm())
 				}
-				fmt.Fprintf(out, "[OK] 配置文件: %s (%s, machine_id=%s, rev=%d)\n", confPath, permStr, fileCfg.MachineID, fileCfg.Rev)
+				if fileCfg.MachineID == "" {
+					fmt.Fprintf(out, "[WARN] 配置文件: %s (%s, 未配置 machine_id，请运行 'agentpulse config' 配置)\n", confPath, permStr)
+				} else {
+					fmt.Fprintf(out, "[OK] 配置文件: %s (%s, machine_id=%s, rev=%d)\n", confPath, permStr, fileCfg.MachineID, fileCfg.Rev)
+				}
 			}
 
 			// 4. 本机 Agent CLI 探测
@@ -77,7 +81,9 @@ func newDoctorCmd() *cobra.Command {
 				if aliases == "" {
 					aliases = st.ID
 				}
-				if st.Ok {
+				if !st.Ok && strings.Contains(st.Detail, "禁用") {
+					fmt.Fprintf(out, "  [-] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
+				} else if st.Ok {
 					fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
 				} else {
 					fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
