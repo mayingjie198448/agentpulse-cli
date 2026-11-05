@@ -43,24 +43,45 @@ type Model struct {
 	logs           map[string][]model.LogEntry
 
 	// Views
-	activePane ActivePane
-	viewport   viewport.Model
-	autoScroll bool
-	ready      bool
+	activePane      ActivePane
+	viewport        viewport.Model
+	autoScroll      bool
+	ready           bool
+	brokerConnected bool
+}
+
+// BrokerConnected returns true if the MQTT broker is currently connected.
+func (m *Model) BrokerConnected() bool {
+	return m.brokerConnected
+}
+
+// ActivePane returns the currently active pane.
+func (m *Model) ActivePane() ActivePane {
+	return m.activePane
+}
+
+// AutoScroll returns true if live stream following is active.
+func (m *Model) AutoScroll() bool {
+	return m.autoScroll
 }
 
 // NewModel creates a new TUI model connected to the given store.
 func NewModel(st store.Store) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Model{
-		store:          st,
-		ctx:            ctx,
-		cancel:         cancel,
-		paused:         false,
-		selectedJobIdx: 0,
-		logs:           make(map[string][]model.LogEntry),
-		activePane:     PaneJobs,
-		autoScroll:     true,
+		store:           st,
+		ctx:             ctx,
+		cancel:          cancel,
+		paused:          false,
+		selectedJobIdx:  0,
+		logs:            make(map[string][]model.LogEntry),
+		activePane:      PaneJobs,
+		autoScroll:      true,
+		brokerConnected: false,
+	}
+
+	if st != nil {
+		m.brokerConnected = st.IsConnected()
 	}
 
 	// Fetch initial state
@@ -128,6 +149,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activePane = PaneJobs
 			}
 
+		case "enter":
+			if m.activePane == PaneJobs && len(m.jobs) > 0 {
+				m.autoScroll = true
+				m.ensureLogsLoadedForSelectedJob()
+				m.updateViewportContent()
+				m.activePane = PaneLogs
+			} else if m.activePane == PaneLogs {
+				m.activePane = PaneJobs
+			}
+
 		case "space", " ":
 			m.paused = !m.paused
 
@@ -149,6 +180,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activePane == PaneJobs && len(m.jobs) > 0 {
 				if m.selectedJobIdx > 0 {
 					m.selectedJobIdx--
+					m.autoScroll = true
+					m.ensureLogsLoadedForSelectedJob()
 					m.updateViewportContent()
 				}
 			} else if m.activePane == PaneLogs {
@@ -160,6 +193,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activePane == PaneJobs && len(m.jobs) > 0 {
 				if m.selectedJobIdx < len(m.jobs)-1 {
 					m.selectedJobIdx++
+					m.autoScroll = true
+					m.ensureLogsLoadedForSelectedJob()
 					m.updateViewportContent()
 				}
 			} else if m.activePane == PaneLogs {
@@ -248,6 +283,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitForEvent(m.eventCh))
 
 	case tickMsg:
+		if m.store != nil {
+			m.brokerConnected = m.store.IsConnected()
+		}
 		cmds = append(cmds, clockTick())
 	}
 
@@ -258,6 +296,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) ensureLogsLoadedForSelectedJob() {
+	if len(m.jobs) == 0 || m.selectedJobIdx >= len(m.jobs) {
+		return
+	}
+	curJob := m.jobs[m.selectedJobIdx]
+	if _, ok := m.logs[curJob.ID]; !ok && m.store != nil {
+		if lgs, err := m.store.GetLogs(m.ctx, curJob.ID, 50); err == nil {
+			m.logs[curJob.ID] = lgs
+		}
+	}
 }
 
 func (m *Model) updateViewportContent() {
@@ -315,13 +365,36 @@ func (m *Model) View() string {
 	)
 }
 
+// JobStatusGlyph returns a stylized status glyph and label for the given job.
+func JobStatusGlyph(j model.Job) string {
+	if j.NeedsAttention() {
+		if j.Status == model.StatusFailed {
+			return lipgloss.NewStyle().Foreground(ColorRed).Bold(true).Render("✖ FAIL")
+		}
+		return lipgloss.NewStyle().Foreground(ColorAmber).Bold(true).Render("▲ ATTN")
+	}
+	switch j.Status {
+	case model.StatusRunning:
+		return lipgloss.NewStyle().Foreground(ColorGreen).Bold(true).Render(fmt.Sprintf("● %2.0f%%", j.Progress))
+	case model.StatusDone:
+		return lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("✓ DONE")
+	case model.StatusQueued:
+		return lipgloss.NewStyle().Foreground(ColorMuted).Render("◌ WAIT")
+	default:
+		return lipgloss.NewStyle().Foreground(ColorDimText).Render(string(j.Status))
+	}
+}
+
 func (m *Model) renderHeader() string {
 	logo := HeaderLogoStyle.Render("⚡ AgentPulse")
 	ver := HeaderVersionStyle.Render(version.Version)
 	target := HeaderSubtitleStyle.Render("Cross-Machine Monitor • agy & OpenCode")
 
-	var runningCount, doneCount, failedCount int
+	var runningCount, doneCount, failedCount, attentionCount int
 	for _, j := range m.jobs {
+		if j.NeedsAttention() {
+			attentionCount++
+		}
 		switch j.Status {
 		case model.StatusRunning:
 			runningCount++
@@ -339,12 +412,32 @@ func (m *Model) renderHeader() string {
 		}
 	}
 
+	brokerOnline := m.brokerConnected
+	if m.store != nil {
+		brokerOnline = m.store.IsConnected()
+	}
+
+	var brokerBadge string
+	if brokerOnline {
+		brokerBadge = lipgloss.NewStyle().Foreground(ColorGreen).Bold(true).Render("Broker: ● connected")
+	} else {
+		brokerBadge = lipgloss.NewStyle().Foreground(ColorRed).Bold(true).Render("Broker: ○ disconnected")
+	}
+
+	var attentionText string
+	if attentionCount > 0 {
+		attentionText = lipgloss.NewStyle().Foreground(ColorRed).Bold(true).Render(fmt.Sprintf("%d needs attention", attentionCount))
+	} else {
+		attentionText = lipgloss.NewStyle().Foreground(ColorDimText).Render("0 needs attention")
+	}
+
 	statsText := fmt.Sprintf(
-		"Nodes: %d/%d online  |  Jobs: %s  %s  %s",
+		"Nodes: %d/%d online  |  Jobs: %s  %s  %s  |  %s",
 		onlineMachines, len(m.machines),
 		lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d running", runningCount)),
+		attentionText,
 		lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("%d done", doneCount)),
-		lipgloss.NewStyle().Foreground(ColorRed).Render(fmt.Sprintf("%d failed", failedCount)),
+		brokerBadge,
 	)
 	stats := HeaderStatsStyle.Render(statsText)
 
@@ -364,7 +457,7 @@ func (m *Model) renderHeader() string {
 }
 
 func (m *Model) renderBody() string {
-	leftColWidth := 40
+	leftColWidth := 44
 	rightColWidth := m.width - leftColWidth - 4
 	if rightColWidth < 30 {
 		rightColWidth = 30
@@ -410,7 +503,7 @@ func (m *Model) renderMachinesBox(width int) string {
 
 func (m *Model) renderJobsBox(width int) string {
 	var b strings.Builder
-	title := BoxTitleStyle.Render("⚡ JOBS (↑/↓ or j/k to select)")
+	title := BoxTitleStyle.Render("⚡ JOBS (j/k 移动, enter 追踪)")
 	b.WriteString(title + "\n")
 
 	if len(m.jobs) == 0 {
@@ -426,20 +519,10 @@ func (m *Model) renderJobsBox(width int) string {
 				engineBadge = OpenCodeBadge
 			}
 
-			var statusText string
-			switch j.Status {
-			case model.StatusRunning:
-				statusText = lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%2.0f%%", j.Progress))
-			case model.StatusDone:
-				statusText = lipgloss.NewStyle().Foreground(ColorPrimary).Render("DONE")
-			case model.StatusFailed:
-				statusText = lipgloss.NewStyle().Foreground(ColorRed).Render("FAIL")
-			default:
-				statusText = string(j.Status)
-			}
+			statusText := JobStatusGlyph(j)
 
-			idStr := fmt.Sprintf("%-14s", j.ID)
-			machStr := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("@%-8s", j.MachineID))
+			idStr := fmt.Sprintf("%-12s", j.ID)
+			machStr := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("@%-7s", j.MachineID))
 
 			line := fmt.Sprintf("%s %s %s %s", engineBadge, idStr, machStr, statusText)
 
@@ -486,6 +569,8 @@ func (m *Model) renderJobDetailBox(width int) string {
 		statusBadge = StatusDoneBadge
 	case model.StatusFailed:
 		statusBadge = StatusFailedBadge
+	default:
+		statusBadge = JobStatusGlyph(curJob)
 	}
 
 	metaRow := fmt.Sprintf("%s  Engine: %s  Node: %s  Status: %s",
@@ -507,7 +592,19 @@ func (m *Model) renderJobDetailBox(width int) string {
 	durationText := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("Elapsed: %s", curJob.DurationStr))
 	b.WriteString(fmt.Sprintf("%s   %s\n", progressBar, durationText))
 
-	if curJob.Error != "" {
+	if curJob.NeedsAttention() {
+		msg := "Attention: 该任务需要人工跟进"
+		if curJob.Error != "" {
+			msg = fmt.Sprintf("Attention: %s", curJob.Error)
+		} else if curJob.Status == model.StatusFailed {
+			msg = "Attention: 任务执行失败"
+		}
+		attentionBanner := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorRed).
+			Render("⚠ " + msg)
+		b.WriteString(attentionBanner + "\n")
+	} else if curJob.Error != "" {
 		errText := lipgloss.NewStyle().Foreground(ColorRed).Render("Error: " + curJob.Error)
 		b.WriteString(errText + "\n")
 	}
@@ -523,9 +620,9 @@ func (m *Model) renderLogsBox(width int) string {
 		curJobID = m.jobs[m.selectedJobIdx].ID
 	}
 
-	autoScrollStatus := "[autoscroll: ON]"
+	autoScrollStatus := "[FOLLOWING]"
 	if !m.autoScroll {
-		autoScrollStatus = "[autoscroll: OFF]"
+		autoScrollStatus = "[FOLLOW: OFF]"
 	}
 
 	header := fmt.Sprintf("📜 LIVE LOG STREAM (%s)  %s", curJobID,
@@ -541,18 +638,19 @@ func (m *Model) renderLogsBox(width int) string {
 }
 
 func (m *Model) renderFooter() string {
-	pauseText := "Pause"
+	pauseText := "暂停"
 	if m.paused {
-		pauseText = "Resume (PAUSED)"
+		pauseText = "继续 (PAUSED)"
 	}
 
 	keys := []string{
-		fmt.Sprintf("%s %s", FooterKeyStyle.Render("q"), FooterDescStyle.Render("Quit")),
-		fmt.Sprintf("%s %s", FooterKeyStyle.Render("↑/↓, j/k"), FooterDescStyle.Render("Navigate")),
-		fmt.Sprintf("%s %s", FooterKeyStyle.Render("tab"), FooterDescStyle.Render("Switch Pane")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("q"), FooterDescStyle.Render("退出")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("tab"), FooterDescStyle.Render("切换面板")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("j/k"), FooterDescStyle.Render("选择任务")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("enter"), FooterDescStyle.Render("追踪/聚焦")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("space"), FooterDescStyle.Render(pauseText)),
-		fmt.Sprintf("%s %s", FooterKeyStyle.Render("a"), FooterDescStyle.Render("Toggle Autoscroll")),
-		fmt.Sprintf("%s %s", FooterKeyStyle.Render("c"), FooterDescStyle.Render("Clear Logs")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("a"), FooterDescStyle.Render("自动滚动")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("c"), FooterDescStyle.Render("清空日志")),
 	}
 
 	bar := strings.Join(keys, "  •  ")
