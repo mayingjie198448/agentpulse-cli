@@ -40,12 +40,7 @@ const (
 )
 
 // LocalStatus represents the on-disk JSON snapshot of local wrapper state.
-type LocalStatus struct {
-	Machine   model.Machine `json:"machine"`
-	Job       model.Job     `json:"job"`
-	PID       int           `json:"pid,omitempty"`
-	UpdatedAt time.Time     `json:"updated_at"`
-}
+type LocalStatus = model.LocalStatus
 
 // Config configures the execution of a thin wrapper instance.
 type Config struct {
