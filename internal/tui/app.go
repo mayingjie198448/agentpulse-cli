@@ -203,29 +203,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.paused {
 			switch msg.Type {
 			case model.EventMachineUpdated:
-				if msg.Machine != nil {
+				if msg.Machine != nil && msg.Machine.ID != "" {
+					found := false
 					for i, existing := range m.machines {
 						if existing.ID == msg.Machine.ID {
 							m.machines[i] = *msg.Machine
+							found = true
 							break
 						}
+					}
+					if !found {
+						m.machines = append(m.machines, *msg.Machine)
 					}
 				}
 
 			case model.EventJobUpdated:
-				if msg.Job != nil {
+				if msg.Job != nil && msg.Job.ID != "" {
+					found := false
 					for i, existing := range m.jobs {
 						if existing.ID == msg.Job.ID {
 							m.jobs[i] = *msg.Job
+							found = true
 							break
 						}
+					}
+					if !found {
+						m.jobs = append(m.jobs, *msg.Job)
+					}
+					if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) && m.jobs[m.selectedJobIdx].ID == msg.Job.ID {
+						m.updateViewportContent()
 					}
 				}
 
 			case model.EventLogAdded:
 				if msg.Log != nil {
 					m.logs[msg.Log.JobID] = append(m.logs[msg.Log.JobID], *msg.Log)
-					if len(m.jobs) > 0 && m.jobs[m.selectedJobIdx].ID == msg.Log.JobID {
+					if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) && m.jobs[m.selectedJobIdx].ID == msg.Log.JobID {
 						m.updateViewportContent()
 					}
 				}
