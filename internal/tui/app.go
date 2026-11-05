@@ -213,23 +213,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		// Header is ~4 lines, footer is ~2 lines, borders ~4 lines
-		availHeight := m.height - 15
-		if availHeight < 8 {
-			availHeight = 8
-		}
-
 		rightWidth := m.width - 44
+		if m.width < 100 {
+			rightWidth = m.width - 38
+		}
 		if rightWidth < 30 {
 			rightWidth = 30
 		}
+		vpWidth := rightWidth - BoxStyle.GetHorizontalFrameSize()
+		if vpWidth < 10 {
+			vpWidth = 10
+		}
+
+		availHeight := m.height - 15
+		if availHeight < 4 {
+			availHeight = 4
+		}
 
 		if !m.ready {
-			m.viewport = viewport.New(rightWidth, availHeight)
+			m.viewport = viewport.New(vpWidth, availHeight)
 			m.viewport.SetContent("")
 			m.ready = true
 		} else {
-			m.viewport.Width = rightWidth
+			m.viewport.Width = vpWidth
 			m.viewport.Height = availHeight
 		}
 		m.updateViewportContent()
@@ -350,19 +356,40 @@ func (m *Model) updateViewportContent() {
 	}
 }
 
-// View renders the TUI layout
+// View renders the TUI layout, enforcing strict height budgeting so the header is never pushed off screen.
 func (m *Model) View() string {
-	if m.width == 0 {
+	if m.width == 0 || m.height == 0 {
 		return "Initializing AgentPulse..."
 	}
 
 	header := m.renderHeader()
-	body := m.renderBody()
 	footer := m.renderFooter()
 
-	return AppContainerStyle.Render(
+	headerHeight := lipgloss.Height(header)
+	footerHeight := lipgloss.Height(footer)
+
+	availBodyHeight := m.height - headerHeight - footerHeight
+	if availBodyHeight < 0 {
+		availBodyHeight = 0
+	}
+
+	body := m.renderBody(availBodyHeight)
+
+	out := AppContainerStyle.Render(
 		lipgloss.JoinVertical(lipgloss.Left, header, body, footer),
 	)
+
+	// Hard safety guarantee: if the final rendered output exceeds m.height,
+	// clip excess lines from the bottom so the header and top lines are never pushed off.
+	if m.height > 0 {
+		lines := strings.Split(out, "\n")
+		if len(lines) > m.height {
+			lines = lines[:m.height]
+			out = strings.Join(lines, "\n")
+		}
+	}
+
+	return out
 }
 
 // JobStatusGlyph returns a stylized status glyph and label for the given job.
@@ -431,85 +458,223 @@ func (m *Model) renderHeader() string {
 		attentionText = lipgloss.NewStyle().Foreground(ColorDimText).Render("0 needs attention")
 	}
 
-	statsText := fmt.Sprintf(
-		"Nodes: %d/%d online  |  Jobs: %s  %s  %s  |  %s",
-		onlineMachines, len(m.machines),
-		lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d running", runningCount)),
-		attentionText,
-		lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("%d done", doneCount)),
-		brokerBadge,
-	)
-	stats := HeaderStatsStyle.Render(statsText)
-
 	clock := lipgloss.NewStyle().Foreground(ColorDimText).Render(time.Now().Format("2006-01-02 15:04:05"))
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Center, logo, ver, target)
-	statusRow := lipgloss.JoinHorizontal(lipgloss.Center, stats, "     ", clock)
+
+	var statusContent string
+	if m.width < 95 {
+		// On narrow terminals, put broker badge on its own line so it is never broken
+		nodesAndJobs := fmt.Sprintf(
+			"Nodes: %d/%d online  |  Jobs: %s  %s  %s",
+			onlineMachines, len(m.machines),
+			lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d running", runningCount)),
+			attentionText,
+			lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("%d done", doneCount)),
+		)
+		statusContent = lipgloss.JoinVertical(lipgloss.Left,
+			HeaderStatsStyle.Render(nodesAndJobs),
+			lipgloss.JoinHorizontal(lipgloss.Center, brokerBadge, "     ", clock),
+		)
+	} else if m.width < 120 {
+		statsText := fmt.Sprintf(
+			"Nodes: %d/%d online  |  Jobs: %s  %s  %s  |  %s",
+			onlineMachines, len(m.machines),
+			lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d running", runningCount)),
+			attentionText,
+			lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("%d done", doneCount)),
+			brokerBadge,
+		)
+		statusContent = HeaderStatsStyle.Render(statsText)
+	} else {
+		statsText := fmt.Sprintf(
+			"Nodes: %d/%d online  |  Jobs: %s  %s  %s  |  %s",
+			onlineMachines, len(m.machines),
+			lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("%d running", runningCount)),
+			attentionText,
+			lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("%d done", doneCount)),
+			brokerBadge,
+		)
+		statusContent = lipgloss.JoinHorizontal(lipgloss.Center, HeaderStatsStyle.Render(statsText), "     ", clock)
+	}
+
+	headerWidth := m.width - 2
+	if headerWidth < 10 {
+		headerWidth = 10
+	}
 
 	headerBox := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder(), false, false, true, false).
 		BorderForeground(ColorBorder).
 		PaddingBottom(1).
-		Width(m.width - 2).
-		Render(lipgloss.JoinVertical(lipgloss.Left, topRow, statusRow))
+		Width(headerWidth).
+		Render(lipgloss.JoinVertical(lipgloss.Left, topRow, statusContent))
 
 	return headerBox
 }
 
-func (m *Model) renderBody() string {
+func (m *Model) renderBody(availHeight int) string {
+	if availHeight <= 0 {
+		return ""
+	}
+
 	leftColWidth := 44
+	if m.width < 100 {
+		leftColWidth = 38
+	}
+	if leftColWidth < 25 {
+		leftColWidth = 25
+	}
+
 	rightColWidth := m.width - leftColWidth - 4
 	if rightColWidth < 30 {
 		rightColWidth = 30
 	}
 
-	// Left column: Machines + Job selector
-	leftCol := lipgloss.JoinVertical(lipgloss.Left,
-		m.renderMachinesBox(leftColWidth),
-		m.renderJobsBox(leftColWidth),
-	)
+	leftCol := m.renderLeftColumn(leftColWidth, availHeight)
+	rightCol := m.renderRightColumn(rightColWidth, availHeight)
 
-	// Right column: Current Job details + Logs viewer
-	rightCol := lipgloss.JoinVertical(lipgloss.Left,
-		m.renderJobDetailBox(rightColWidth),
-		m.renderLogsBox(rightColWidth),
-	)
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+	return lipgloss.NewStyle().MaxHeight(availHeight).Render(body)
 }
 
-func (m *Model) renderMachinesBox(width int) string {
+func (m *Model) renderLeftColumn(width, availHeight int) string {
+	if availHeight <= 0 {
+		return ""
+	}
+
+	naturalMachHeight := 4 + len(m.machines)
+	if len(m.machines) == 0 {
+		naturalMachHeight = 5
+	}
+	naturalJobsHeight := 4 + len(m.jobs)
+	if len(m.jobs) == 0 {
+		naturalJobsHeight = 5
+	}
+
+	var machBoxHeight, jobsBoxHeight int
+	if naturalMachHeight+naturalJobsHeight <= availHeight {
+		machBoxHeight = naturalMachHeight
+		jobsBoxHeight = availHeight - machBoxHeight
+	} else {
+		machBoxHeight = naturalMachHeight
+		if machBoxHeight > availHeight/3 {
+			machBoxHeight = availHeight / 3
+		}
+		if machBoxHeight < 4 {
+			machBoxHeight = 4
+		}
+		jobsBoxHeight = availHeight - machBoxHeight
+		if jobsBoxHeight < 4 {
+			jobsBoxHeight = 4
+		}
+	}
+
+	machBox := m.renderMachinesBox(width, machBoxHeight)
+	jobsBox := m.renderJobsBox(width, jobsBoxHeight)
+
+	col := lipgloss.JoinVertical(lipgloss.Left, machBox, jobsBox)
+	return lipgloss.NewStyle().MaxHeight(availHeight).Render(col)
+}
+
+func (m *Model) renderRightColumn(width, availHeight int) string {
+	if availHeight <= 0 {
+		return ""
+	}
+
+	detailBox := m.renderJobDetailBox(width)
+	detailHeight := lipgloss.Height(detailBox)
+
+	if detailHeight >= availHeight {
+		return lipgloss.NewStyle().MaxHeight(availHeight).Render(detailBox)
+	}
+
+	logsHeight := availHeight - detailHeight
+	logsBox := m.renderLogsBox(width, logsHeight)
+
+	col := lipgloss.JoinVertical(lipgloss.Left, detailBox, logsBox)
+	return lipgloss.NewStyle().MaxHeight(availHeight).Render(col)
+}
+
+func (m *Model) renderMachinesBox(width, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+
 	var b strings.Builder
 	title := BoxTitleStyle.Render("🖥  MACHINES & NODES")
 	b.WriteString(title + "\n")
 
-	for _, mach := range m.machines {
-		statusBadge := OnlineBadge
-		if !mach.Online {
-			statusBadge = OfflineBadge
-		}
-
-		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorLightText)
-		name := nameStyle.Render(fmt.Sprintf("%-10s", mach.Name))
-		heartbeat := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("%-8s", mach.HeartbeatAgo()))
-		jobCount := lipgloss.NewStyle().Foreground(ColorHighlight).Render(fmt.Sprintf("[%d jobs]", mach.JobCount))
-
-		b.WriteString(fmt.Sprintf("%s %s %s %s\n", statusBadge, name, heartbeat, jobCount))
+	titleHeight := lipgloss.Height(title)
+	overhead := BoxStyle.GetVerticalFrameSize() + titleHeight
+	availRows := maxHeight - overhead
+	if availRows < 1 {
+		availRows = 1
 	}
 
-	style := BoxStyle.Width(width)
+	if len(m.machines) == 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(ColorDimText).Render("No machines connected"))
+	} else {
+		for i, mach := range m.machines {
+			if i >= availRows {
+				break
+			}
+			statusBadge := OnlineBadge
+			if !mach.Online {
+				statusBadge = OfflineBadge
+			}
+
+			nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorLightText)
+			name := nameStyle.Render(fmt.Sprintf("%-10s", mach.Name))
+			heartbeat := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("%-8s", mach.HeartbeatAgo()))
+			jobCount := lipgloss.NewStyle().Foreground(ColorHighlight).Render(fmt.Sprintf("[%d jobs]", mach.JobCount))
+
+			b.WriteString(fmt.Sprintf("%s %s %s %s\n", statusBadge, name, heartbeat, jobCount))
+		}
+	}
+
+	style := BoxStyle.Width(width).MaxHeight(maxHeight)
 	return style.Render(b.String())
 }
 
-func (m *Model) renderJobsBox(width int) string {
+func (m *Model) renderJobsBox(width, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
+
 	var b strings.Builder
 	title := BoxTitleStyle.Render("⚡ JOBS (j/k 移动, enter 追踪)")
 	b.WriteString(title + "\n")
 
+	titleHeight := lipgloss.Height(title)
+	overhead := BoxStyle.GetVerticalFrameSize() + titleHeight
+	availRows := maxHeight - overhead
+	if availRows < 1 {
+		availRows = 1
+	}
+
 	if len(m.jobs) == 0 {
 		b.WriteString(lipgloss.NewStyle().Foreground(ColorDimText).Render("No active jobs"))
 	} else {
-		for i, j := range m.jobs {
+		startIdx := 0
+		endIdx := len(m.jobs)
+		if len(m.jobs) > availRows {
+			startIdx = m.selectedJobIdx - availRows/2
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			endIdx = startIdx + availRows
+			if endIdx > len(m.jobs) {
+				endIdx = len(m.jobs)
+				startIdx = endIdx - availRows
+				if startIdx < 0 {
+					startIdx = 0
+				}
+			}
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			j := m.jobs[i]
 			isSelected := i == m.selectedJobIdx
 
 			var engineBadge string
@@ -537,9 +702,9 @@ func (m *Model) renderJobsBox(width int) string {
 		}
 	}
 
-	style := BoxStyle.Width(width)
+	style := BoxStyle.Width(width).MaxHeight(maxHeight)
 	if m.activePane == PaneJobs {
-		style = BoxFocusedStyle.Width(width)
+		style = BoxFocusedStyle.Width(width).MaxHeight(maxHeight)
 	}
 	return style.Render(b.String())
 }
@@ -581,10 +746,23 @@ func (m *Model) renderJobDetailBox(width int) string {
 	b.WriteString(metaRow + "\n")
 
 	// Info row: CWD and Command
+	cwd := curJob.Cwd
+	cmd := curJob.Command
+	maxTextLen := width - 18
+	if maxTextLen < 15 {
+		maxTextLen = 15
+	}
+	if len(cwd) > maxTextLen {
+		cwd = "..." + cwd[len(cwd)-maxTextLen+3:]
+	}
+	if len(cmd) > maxTextLen {
+		cmd = cmd[:maxTextLen-3] + "..."
+	}
+
 	cwdText := lipgloss.NewStyle().Foreground(ColorDimText).Render("Working Dir: ") +
-		lipgloss.NewStyle().Foreground(ColorLightText).Render(curJob.Cwd)
+		lipgloss.NewStyle().Foreground(ColorLightText).Render(cwd)
 	cmdText := lipgloss.NewStyle().Foreground(ColorDimText).Render("Command: ") +
-		lipgloss.NewStyle().Foreground(ColorLightText).Render(curJob.Command)
+		lipgloss.NewStyle().Foreground(ColorLightText).Render(cmd)
 	b.WriteString(cwdText + "\n" + cmdText + "\n")
 
 	// Progress bar
@@ -612,11 +790,13 @@ func (m *Model) renderJobDetailBox(width int) string {
 	return BoxStyle.Width(width).Render(b.String())
 }
 
-func (m *Model) renderLogsBox(width int) string {
-	var b strings.Builder
+func (m *Model) renderLogsBox(width, maxHeight int) string {
+	if maxHeight <= 0 {
+		return ""
+	}
 
 	curJobID := "None"
-	if len(m.jobs) > 0 {
+	if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) {
 		curJobID = m.jobs[m.selectedJobIdx].ID
 	}
 
@@ -627,12 +807,31 @@ func (m *Model) renderLogsBox(width int) string {
 
 	header := fmt.Sprintf("📜 LIVE LOG STREAM (%s)  %s", curJobID,
 		lipgloss.NewStyle().Foreground(ColorDimText).Render(autoScrollStatus))
-	b.WriteString(BoxTitleStyle.Render(header) + "\n")
+
+	titleStr := BoxTitleStyle.Render(header)
+	titleLines := lipgloss.Height(titleStr)
+	overhead := BoxStyle.GetVerticalFrameSize() + titleLines
+
+	vpHeight := maxHeight - overhead
+	if vpHeight < 1 {
+		vpHeight = 1
+	}
+
+	vpWidth := width - BoxStyle.GetHorizontalFrameSize()
+	if vpWidth < 10 {
+		vpWidth = 10
+	}
+
+	m.viewport.Width = vpWidth
+	m.viewport.Height = vpHeight
+
+	var b strings.Builder
+	b.WriteString(titleStr + "\n")
 	b.WriteString(m.viewport.View())
 
-	style := BoxStyle.Width(width)
+	style := BoxStyle.Width(width).MaxHeight(maxHeight)
 	if m.activePane == PaneLogs {
-		style = BoxFocusedStyle.Width(width)
+		style = BoxFocusedStyle.Width(width).MaxHeight(maxHeight)
 	}
 	return style.Render(b.String())
 }
@@ -653,8 +852,16 @@ func (m *Model) renderFooter() string {
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("c"), FooterDescStyle.Render("清空日志")),
 	}
 
-	bar := strings.Join(keys, "  •  ")
-	return FooterContainerStyle.Render(bar)
+	sep := "  •  "
+	if m.width < 90 {
+		sep = " • "
+	}
+	bar := strings.Join(keys, sep)
+	style := FooterContainerStyle
+	if m.width > 2 {
+		style = style.Width(m.width - 2)
+	}
+	return style.Render(bar)
 }
 
 // renderProgressBar draws a colored bar like [████████░░░░░░░░] 50%

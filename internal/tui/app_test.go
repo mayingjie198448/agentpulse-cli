@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -456,5 +457,135 @@ func TestTUIModel_BrokerDisconnectedStatus(t *testing.T) {
 	view := tm.View()
 	if !strings.Contains(view, "Broker: ○ disconnected") {
 		t.Errorf("expected view to show 'Broker: ○ disconnected', got:\n%s", view)
+	}
+}
+
+func TestTUIModel_HeightBudgetingRegression(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+			{ID: "node-2", Name: "node-2", Online: false},
+		},
+		jobs: []model.Job{
+			{ID: "job-run", MachineID: "node-1", Engine: model.EngineAgy, Status: model.StatusRunning, Progress: 42, Title: "Running Task"},
+			{ID: "job-fail", MachineID: "node-1", Engine: model.EngineOpenCode, Status: model.StatusFailed, Error: "command crashed", Title: "Failing Task"},
+			{ID: "job-attn", MachineID: "node-2", Engine: model.EngineAgy, Status: "waiting_input", Title: "Needs Input Task"},
+			{ID: "job-done", MachineID: "node-2", Engine: model.EngineAgy, Status: model.StatusDone, Progress: 100, Title: "Finished Task"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-run":  {{JobID: "job-run", Level: model.LevelInfo, Message: "running step 1"}},
+			"job-fail": {{JobID: "job-fail", Level: model.LevelError, Message: "unexpected exit code"}},
+		},
+	}
+	defer st.Close()
+
+	// Test typical terminal heights and widths
+	heights := []int{24, 30, 40, 50, 80, 120, 200}
+	widths := []int{80, 100, 120, 160, 200}
+
+	for _, h := range heights {
+		for _, w := range widths {
+			m := tui.NewModel(st)
+			var tm tea.Model = m
+			tm, _ = tm.Update(tea.WindowSizeMsg{Width: w, Height: h})
+
+			v := tm.View()
+			lines := strings.Split(v, "\n")
+			if len(lines) > h {
+				t.Errorf("w=%d, h=%d: View() produced %d lines, exceeding terminal height %d", w, h, len(lines), h)
+			}
+
+			// Required header strings must always be present and not pushed off or clipped
+			for _, req := range []string{"AgentPulse", "Nodes:", "needs attention", "Broker"} {
+				if !strings.Contains(v, req) {
+					t.Errorf("w=%d, h=%d: View() missing expected header content %q", w, h, req)
+				}
+			}
+		}
+	}
+}
+
+func TestTUIModel_HeightBudgeting_LargeDatasetAndNavigation(t *testing.T) {
+	var machs []model.Machine
+	for i := 0; i < 20; i++ {
+		machs = append(machs, model.Machine{
+			ID:     fmt.Sprintf("node-%02d", i),
+			Name:   fmt.Sprintf("node-%02d", i),
+			Online: i%2 == 0,
+		})
+	}
+
+	var jobs []model.Job
+	for i := 0; i < 40; i++ {
+		jobs = append(jobs, model.Job{
+			ID:        fmt.Sprintf("job-%03d", i),
+			MachineID: fmt.Sprintf("node-%02d", i%20),
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Title:     fmt.Sprintf("Long Project Job Description %d", i),
+			Cwd:       "/deep/nested/path/to/project/repo/internal/package",
+			Command:   "go test -v -race ./...",
+		})
+	}
+
+	st := &fakeStore{machines: machs, jobs: jobs}
+	defer st.Close()
+
+	for _, h := range []int{24, 40, 80} {
+		for _, w := range []int{80, 120} {
+			m := tui.NewModel(st)
+			var tm tea.Model = m
+			tm, _ = tm.Update(tea.WindowSizeMsg{Width: w, Height: h})
+
+			// Navigate down 20 jobs to test list windowing
+			for k := 0; k < 20; k++ {
+				tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+			}
+
+			v := tm.View()
+			lines := strings.Split(v, "\n")
+			if len(lines) > h {
+				t.Errorf("large dataset w=%d, h=%d: View() produced %d lines, exceeding %d", w, h, len(lines), h)
+			}
+			if !strings.Contains(v, "AgentPulse") || !strings.Contains(v, "Nodes:") {
+				t.Errorf("large dataset w=%d, h=%d: View() missing header content", w, h)
+			}
+		}
+	}
+}
+
+func TestTUIModel_TeaProgramSimulation(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-pty", Name: "node-pty", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-pty", MachineID: "node-pty", Engine: model.EngineAgy, Status: model.StatusRunning, Progress: 50, Title: "PTY Sim Task"},
+		},
+	}
+	defer st.Close()
+
+	in := bytes.NewBuffer([]byte{})
+	out := &bytes.Buffer{}
+
+	m := tui.NewModel(st)
+	p := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithoutCatchPanics())
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		p.Send(tea.WindowSizeMsg{Width: 100, Height: 40})
+		time.Sleep(30 * time.Millisecond)
+		p.Quit()
+	}()
+
+	if _, err := p.Run(); err != nil {
+		t.Fatalf("tea program execution failed: %v", err)
+	}
+
+	output := out.String()
+	for _, req := range []string{"AgentPulse", "Nodes:", "Broker"} {
+		if !strings.Contains(output, req) {
+			t.Errorf("simulated program output missing %q", req)
+		}
 	}
 }
