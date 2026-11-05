@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -90,6 +91,71 @@ func TestDoctorCommand_Output(t *testing.T) {
 		}
 		if !strings.Contains(out, "Broker 连通性测试中") && !strings.Contains(out, "Checking connectivity") {
 			t.Errorf("expected checking connectivity line, got: %s", out)
+		}
+	})
+
+	// 3. Missing machine_id in config
+	t.Run("missing machine_id warns clearly", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "config.yaml")
+		cfg := &config.Config{
+			Version: 1,
+			Broker: config.BrokerConfig{
+				URL: "tcp://127.0.0.1:18833",
+			},
+		}
+		_ = config.SaveConfig(cfgPath, cfg)
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--config", cfgPath})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "未配置 machine_id") {
+			t.Errorf("expected missing machine_id warning, got: %s", out)
+		}
+	})
+
+	// 4. Disabled agent shows [-]
+	t.Run("disabled agent shows [-]", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "config.yaml")
+		disabled := false
+		cfg := &config.Config{
+			Version:   1,
+			MachineID: "test-node",
+			Broker: config.BrokerConfig{
+				URL: "tcp://127.0.0.1:18833",
+			},
+			Agents: []config.AgentConfig{
+				{
+					ID:      "test-disabled",
+					Alias:   []string{"td"},
+					Enabled: &disabled,
+				},
+			},
+		}
+		_ = config.SaveConfig(cfgPath, cfg)
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--config", cfgPath})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		out := buf.String()
+		if !strings.Contains(out, "[-] test-disabled") {
+			t.Errorf("expected disabled agent marker '[-] test-disabled', got: %s", out)
 		}
 	})
 }

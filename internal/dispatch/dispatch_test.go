@@ -856,6 +856,7 @@ func (f *fakeDispatchStore) ListJobs(ctx context.Context) ([]model.Job, error) {
 func (f *fakeDispatchStore) GetJob(ctx context.Context, id string) (*model.Job, error) { return nil, nil }
 func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) { return nil, nil }
 func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) { return nil, nil }
+func (f *fakeDispatchStore) IsConnected() bool { return true }
 func (f *fakeDispatchStore) Close() error { return nil }
 
 func TestDispatch_TargetMachineGate(t *testing.T) {

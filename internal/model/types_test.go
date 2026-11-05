@@ -120,3 +120,61 @@ func TestMachineAnnounce(t *testing.T) {
 		t.Error("expected unknown agent to return false")
 	}
 }
+
+func TestJob_NeedsAttention(t *testing.T) {
+	tests := []struct {
+		name string
+		job  model.Job
+		want bool
+	}{
+		{
+			name: "running normal",
+			job:  model.Job{Status: model.StatusRunning, Progress: 50},
+			want: false,
+		},
+		{
+			name: "done normal",
+			job:  model.Job{Status: model.StatusDone, Progress: 100},
+			want: false,
+		},
+		{
+			name: "failed status",
+			job:  model.Job{Status: model.StatusFailed, Error: "process exited with code 1"},
+			want: true,
+		},
+		{
+			name: "waiting input status",
+			job:  model.Job{Status: "waiting_input", Title: "Need confirmation"},
+			want: true,
+		},
+		{
+			name: "stuck status",
+			job:  model.Job{Status: "stuck"},
+			want: true,
+		},
+		{
+			name: "waiting status",
+			job:  model.Job{Status: "waiting"},
+			want: true,
+		},
+		{
+			name: "running with unexpected error message",
+			job:  model.Job{Status: model.StatusRunning, Error: "network timeout during tool execution"},
+			want: true,
+		},
+		{
+			name: "queued normal",
+			job:  model.Job{Status: model.StatusQueued},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.job.NeedsAttention()
+			if got != tt.want {
+				t.Errorf("job.NeedsAttention() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

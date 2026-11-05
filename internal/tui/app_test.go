@@ -15,9 +15,10 @@ import (
 
 // fakeStore is local test data. It is not wired to any CLI flag.
 type fakeStore struct {
-	machines []model.Machine
-	jobs     []model.Job
-	logs     map[string][]model.LogEntry
+	machines     []model.Machine
+	jobs         []model.Job
+	logs         map[string][]model.LogEntry
+	disconnected bool
 }
 
 var _ store.Store = (*fakeStore)(nil)
@@ -69,6 +70,10 @@ func (f *fakeStore) GetAnnounce(context.Context, string) (*model.MachineAnnounce
 func (f *fakeStore) Subscribe(context.Context) (<-chan model.Event, error) {
 	ch := make(chan model.Event)
 	return ch, nil
+}
+
+func (f *fakeStore) IsConnected() bool {
+	return !f.disconnected
 }
 
 func (f *fakeStore) Close() error { return nil }
@@ -294,5 +299,162 @@ func TestTUIModel_AppendWhenEmpty(t *testing.T) {
 	multiView := tm.View()
 	if !strings.Contains(multiView, "node-linux-02") || !strings.Contains(multiView, "job-dispatched-02") {
 		t.Fatalf("expected multiView to contain node-linux-02 and job-dispatched-02, got: %s", multiView)
+	}
+}
+
+func TestTUIModel_HeaderAndStatusGlyphs(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+			{ID: "node-2", Name: "node-2", Online: false},
+		},
+		jobs: []model.Job{
+			{ID: "job-run", MachineID: "node-1", Engine: model.EngineAgy, Status: model.StatusRunning, Progress: 42, Title: "Running Task"},
+			{ID: "job-fail", MachineID: "node-1", Engine: model.EngineOpenCode, Status: model.StatusFailed, Error: "command crashed", Title: "Failing Task"},
+			{ID: "job-attn", MachineID: "node-2", Engine: model.EngineAgy, Status: "waiting_input", Title: "Needs Input Task"},
+			{ID: "job-done", MachineID: "node-2", Engine: model.EngineAgy, Status: model.StatusDone, Progress: 100, Title: "Finished Task"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-run":  {{JobID: "job-run", Level: model.LevelInfo, Message: "running step 1"}},
+			"job-fail": {{JobID: "job-fail", Level: model.LevelError, Message: "unexpected exit code"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	view := tm.View()
+
+	// 1. Header checks: online machine count, running job count, needs attention count, broker status
+	if !strings.Contains(view, "1/2 online") {
+		t.Errorf("expected view to contain '1/2 online', got:\n%s", view)
+	}
+	if !strings.Contains(view, "1 running") {
+		t.Errorf("expected view to contain '1 running', got:\n%s", view)
+	}
+	if !strings.Contains(view, "2 needs attention") {
+		t.Errorf("expected view to contain '2 needs attention', got:\n%s", view)
+	}
+	if !strings.Contains(view, "Broker: ● connected") {
+		t.Errorf("expected view to show broker connected, got:\n%s", view)
+	}
+
+	// 2. Status glyphs in JOBS panel
+	if !strings.Contains(view, "● 42%") {
+		t.Errorf("expected view to contain running glyph '● 42%%%%', got:\n%s", view)
+	}
+	if !strings.Contains(view, "✖ FAIL") {
+		t.Errorf("expected view to contain failed glyph '✖ FAIL', got:\n%s", view)
+	}
+	if !strings.Contains(view, "▲ ATTN") {
+		t.Errorf("expected view to contain attention glyph '▲ ATTN', got:\n%s", view)
+	}
+	if !strings.Contains(view, "✓ DONE") {
+		t.Errorf("expected view to contain done glyph '✓ DONE', got:\n%s", view)
+	}
+
+	// 3. Footer Chinese hints
+	if !strings.Contains(view, "退出") ||
+		!strings.Contains(view, "切换面板") ||
+		!strings.Contains(view, "选择任务") ||
+		!strings.Contains(view, "追踪/聚焦") ||
+		!strings.Contains(view, "自动滚动") {
+		t.Errorf("expected Chinese hints in footer, got:\n%s", view)
+	}
+}
+
+func TestTUIModel_FollowStreamAndEnterKey(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-01", MachineID: "node-1", Engine: model.EngineAgy, Status: model.StatusRunning, Progress: 10, Title: "Job One"},
+			{ID: "job-02", MachineID: "node-1", Engine: model.EngineOpenCode, Status: model.StatusFailed, Error: "fatal error", Title: "Job Two"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-01": {{JobID: "job-01", Level: model.LevelInfo, Message: "job 1 log A"}},
+			"job-02": {{JobID: "job-02", Level: model.LevelError, Message: "job 2 log B"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Initial selection is job-01, autoScroll is true (following live stream)
+	if m.SelectedJobIdxForTest() != 0 {
+		t.Fatalf("expected initial selectedJobIdx 0, got %d", m.SelectedJobIdxForTest())
+	}
+	if !m.AutoScrollForTest() {
+		t.Fatalf("expected autoScroll to be true by default")
+	}
+	if m.ActivePaneForTest() != tui.PaneJobs {
+		t.Fatalf("expected activePane to be PaneJobs initially")
+	}
+
+	view1 := tm.View()
+	if !strings.Contains(view1, "[FOLLOWING]") {
+		t.Errorf("expected view to indicate [FOLLOWING], got:\n%s", view1)
+	}
+	if !strings.Contains(view1, "job 1 log A") {
+		t.Errorf("expected initial logs for job-01, got:\n%s", view1)
+	}
+
+	// Press 'j' to navigate to job-02
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if m.SelectedJobIdxForTest() != 1 {
+		t.Fatalf("expected selectedJobIdx 1 after 'j', got %d", m.SelectedJobIdxForTest())
+	}
+	if !m.AutoScrollForTest() {
+		t.Fatalf("expected autoScroll to remain true (following stream) when navigating to new job")
+	}
+	view2 := tm.View()
+	if !strings.Contains(view2, "job 2 log B") {
+		t.Errorf("expected view to follow job-02 stream, got:\n%s", view2)
+	}
+	if !strings.Contains(view2, "⚠ Attention: fatal error") {
+		t.Errorf("expected attention banner in detail box for job-02, got:\n%s", view2)
+	}
+
+	// Press 'enter': should switch active pane to PaneLogs and keep autoScroll
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.ActivePaneForTest() != tui.PaneLogs {
+		t.Fatalf("expected activePane to switch to PaneLogs on Enter, got %v", m.ActivePaneForTest())
+	}
+	if !m.AutoScrollForTest() {
+		t.Fatalf("expected autoScroll to remain true on Enter")
+	}
+
+	// Press 'enter' again from PaneLogs: should switch back to PaneJobs
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.ActivePaneForTest() != tui.PaneJobs {
+		t.Fatalf("expected activePane to switch back to PaneJobs on Enter, got %v", m.ActivePaneForTest())
+	}
+}
+
+func TestTUIModel_BrokerDisconnectedStatus(t *testing.T) {
+	st := &fakeStore{
+		disconnected: true,
+		machines: []model.Machine{
+			{ID: "node-1", Online: true},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+
+	if m.BrokerConnectedForTest() {
+		t.Fatalf("expected brokerConnected to be false for disconnected store")
+	}
+
+	view := tm.View()
+	if !strings.Contains(view, "Broker: ○ disconnected") {
+		t.Errorf("expected view to show 'Broker: ○ disconnected', got:\n%s", view)
 	}
 }
