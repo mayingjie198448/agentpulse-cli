@@ -8,14 +8,14 @@ import (
 )
 
 func TestVersionInfo(t *testing.T) {
-	if version.Version != "0.5.2" {
-		t.Fatalf("expected version.Version to be 0.5.2, got %s", version.Version)
+	if version.Version != "0.5.3" {
+		t.Fatalf("expected version.Version to be 0.5.3, got %s", version.Version)
 	}
 	info := version.Info()
-	if !strings.Contains(info, "agentpulse 0.5.2") {
-		t.Errorf("expected Info() to contain 'agentpulse 0.5.2', got %q", info)
+	if !strings.Contains(info, "agentpulse 0.5.3") {
+		t.Errorf("expected Info() to contain 'agentpulse 0.5.3', got %q", info)
 	}
-	if !strings.Contains(info, "2026-11-04") {
-		t.Errorf("expected Info() to contain BuildDate '2026-11-04', got %q", info)
+	if !strings.Contains(info, "2026-11-05") {
+		t.Errorf("expected Info() to contain BuildDate '2026-11-05', got %q", info)
 	}
 }
