@@ -102,7 +102,7 @@ func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
 	}
 
 	fmt.Fprintln(out, "============================================================")
-	fmt.Fprintln(out, "AgentPulse 0.5.2 交互式配置向导")
+	fmt.Fprintln(out, "AgentPulse 0.5.3 交互式配置向导")
 	fmt.Fprintf(out, "目标配置文件: %s\n", configPath)
 	fmt.Fprintln(out, "============================================================")
 	fmt.Fprintln(out)

@@ -4,11 +4,11 @@ import "fmt"
 
 var (
 	// Version is the current release version of AgentPulse CLI.
-	Version = "0.5.2"
+	Version = "0.5.3"
 	// GitCommit is set at build time via -ldflags.
 	GitCommit = "dev"
 	// BuildDate is set at build time via -ldflags.
-	BuildDate = "2026-11-04"
+	BuildDate = "2026-11-05"
 )
 
 // Info returns formatted version info.
