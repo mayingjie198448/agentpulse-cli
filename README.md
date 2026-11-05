@@ -111,10 +111,10 @@ agentpulse --config /path/to/custom-config.yaml
 ### 2. 交互式配置向导 (`config`)
 
 引导式完成客户端与 Broker 配置，写入 `config.yaml`：
-- **步骤 1**：配置 MQTT Broker 地址与鉴权信息（自动测试连通性）；
-- **步骤 2**：确认/设定本机机器标识 `machine_id`；
-- **步骤 3**：安全保存配置文件并广播本机 Announce，扫描展示网内其他在线设备；
-- **步骤 4**：探测本机 PATH 中安装的 Agent CLI（`agy`、`opencode`、`codex`）并注册别名。
+- **步骤 1**：设定本机机器标识 `machine_id`；
+- **步骤 2**：配置 MQTT Broker 地址与鉴权信息（支持 TLS / 账号密码）；
+- **步骤 3**：配置本机 Agent CLI 路径、别名及启用状态（`agy`、`opencode`、`codex` 等）；
+- **保存与自检**：安全保存 0600 权限 yaml 配置文件并立即运行连通性与本地 CLI 探测自检（复用 `doctor` 逻辑）。已存在配置时支持分段编辑（Broker / Agents / machine_id）并回车保留当前值。
 
 ```bash
 # 运行配置向导
@@ -139,6 +139,7 @@ agentpulse config
     - id: agy
       path: ""
       alias: [agy]
+      enabled: true
     - id: opencode
       path: ""
       alias: [op, opencode]

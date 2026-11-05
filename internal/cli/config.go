@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -20,18 +19,19 @@ import (
 
 func newConfigCmd() *cobra.Command {
 	var configFilePath string
+	var section string
 
 	cmd := &cobra.Command{
 		Use:   "config",
-		Short: "交互式配置向导（设置 Broker、机器标识及本机 Agent）",
-		Long: `运行交互式向导，按顺序配置：
-  1. MQTT Broker 地址与鉴权信息（自动测连）
-  2. 本机机器标识 machine_id
-  3. 保存配置并发送 Announce 广播，扫描展示网内其他设备与 CLI
-  4. 探测本机常见 Agent（agy、opencode、codex）并配置别名
+		Short: "交互式配置向导（设置机器标识、Broker 及本机 Agent）",
+		Long: `运行交互式向导，配置 AgentPulse：
+  1. 本机机器标识 machine_id
+  2. MQTT Broker 地址与鉴权信息（自动测连）
+  3. 本机 Agent CLI 路径、别名及启用状态（仅限本机）
+  4. 写入 0600 权限 yaml 配置文件并立即运行连通性与 CLI 探测验证
 
-配置文件默认保存至 ~/.config/agentpulse/config.yaml（Windows 为 %AppData%\agentpulse\config.yaml），
-目录权限为 0700，文件权限为 0600。`,
+若配置文件已存在，支持分段编辑（Broker / Agents / machine_id），显示当前值且按回车可保留。
+配置文件默认保存至 ~/.config/agentpulse/config.yaml（Windows 为 %AppData%\agentpulse\config.yaml）。`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -40,10 +40,11 @@ func newConfigCmd() *cobra.Command {
 					configFilePath = fl
 				}
 			}
-			return RunConfigWizard(cmd.InOrStdin(), cmd.OutOrStdout(), configFilePath)
+			return RunConfigWizardWithSection(cmd.InOrStdin(), cmd.OutOrStdout(), configFilePath, section)
 		},
 	}
 
+	cmd.Flags().StringVar(&section, "section", "", "直接编辑指定配置分段 (broker, agents, machine_id, all)")
 	return cmd
 }
 
@@ -93,282 +94,343 @@ func promptBool(reader *bufio.Reader, out io.Writer, prompt string, defaultVal b
 	return defaultVal
 }
 
-// RunConfigWizard executes the interactive 4-step configuration wizard.
+// RunConfigWizard executes the interactive configuration wizard.
 func RunConfigWizard(in io.Reader, out io.Writer, configPath string) error {
+	return RunConfigWizardWithSection(in, out, configPath, "")
+}
+
+// RunConfigWizardWithSection executes the wizard, optionally jumping straight to a specific section.
+func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, section string) error {
 	reader := bufio.NewReader(in)
 
 	if configPath == "" {
 		configPath = config.DefaultConfigPath()
 	}
 
-	fmt.Fprintln(out, "============================================================")
-	fmt.Fprintln(out, "AgentPulse 0.5.3 交互式配置向导")
-	fmt.Fprintf(out, "目标配置文件: %s\n", configPath)
-	fmt.Fprintln(out, "============================================================")
-	fmt.Fprintln(out)
+	existingCfg, loadErr := config.LoadConfig(configPath)
+	configExists := (loadErr == nil && existingCfg != nil)
 
-	// Load existing configuration if available
-	existingCfg, _ := config.LoadConfig(configPath)
-	if existingCfg == nil {
-		existingCfg = &config.Config{
-			Version: 1,
-			Rev:     1,
-			Broker: config.BrokerConfig{
-				URL: "tls://broker.example:8883",
-				TLS: true,
-			},
-			Agents: config.DefaultAgents(),
+	cfg := &config.Config{
+		Version: 1,
+		Rev:     1,
+	}
+	if configExists {
+		cfg.Version = existingCfg.Version
+		cfg.Rev = existingCfg.Rev + 1
+		cfg.MachineID = existingCfg.MachineID
+		cfg.Broker = existingCfg.Broker
+		cfg.Agents = existingCfg.Agents
+	} else {
+		cfg.Broker = config.BrokerConfig{
+			URL: "tls://broker.example:8883",
+			TLS: true,
 		}
+		cfg.Agents = config.DefaultAgents()
 	}
 
-	// ------------------------------------------------------------
-	// 步骤 1: Broker 配置（含测连）
-	// ------------------------------------------------------------
-	fmt.Fprintln(out, "[步骤 1/4] 配置 MQTT Broker 连接")
-	fmt.Fprintln(out, "------------------------------------------------------------")
+	fmt.Fprintln(out, "============================================================")
+	fmt.Fprintln(out, "AgentPulse 交互式配置向导")
+	fmt.Fprintf(out, "目标配置文件: %s\n", configPath)
+	fmt.Fprintln(out, "============================================================")
 
-	var brokerURL, username, password string
-	var useTLS bool
-
-	for {
-		defaultURL := existingCfg.Broker.URL
-		if defaultURL == "" {
-			defaultURL = "tls://broker.example:8883"
+	// If config exists and no explicit section passed, show current values and prompt menu
+	if configExists && section == "" {
+		fmt.Fprintln(out, "检测到已存在配置文件。当前配置概览:")
+		fmt.Fprintf(out, "  • 机器标识 (machine_id): %s\n", cfg.MachineID)
+		authDesc := "匿名"
+		if cfg.Broker.Username != "" {
+			authDesc = fmt.Sprintf("用户名: %s", cfg.Broker.Username)
 		}
-		brokerURL = promptLine(reader, out, "MQTT Broker 地址 (支持 tls://, mqtts://, tcp://)", defaultURL)
+		fmt.Fprintf(out, "  • MQTT Broker: %s (%s, TLS: %v)\n", cfg.Broker.URL, authDesc, cfg.Broker.TLS)
 
-		defaultUser := existingCfg.Broker.Username
-		username = promptLine(reader, out, "用户名 (无鉴权请留空)", defaultUser)
-
-		defaultPass := existingCfg.Broker.Password
-		password = promptLine(reader, out, "密码 (无密码请留空)", defaultPass)
-
-		defaultTLS := existingCfg.Broker.TLS
-		if strings.HasPrefix(brokerURL, "tls://") || strings.HasPrefix(brokerURL, "mqtts://") || strings.Contains(brokerURL, ":8883") {
-			defaultTLS = true
+		var agentSummary []string
+		for _, ag := range cfg.Agents {
+			if ag.IsEnabled() {
+				agentSummary = append(agentSummary, ag.ID)
+			} else {
+				agentSummary = append(agentSummary, ag.ID+"(已禁用)")
+			}
 		}
-		useTLS = promptBool(reader, out, "启用 TLS 加密连接", defaultTLS)
-
-		// Test connection
-		fmt.Fprintf(out, "\n[...] 正在测试 Broker 连接 (%s)...\n", brokerURL)
-		testCfg := mqtt.DefaultConfig()
-		testCfg.BrokerURL = brokerURL
-		testCfg.Username = username
-		testCfg.Password = password
-		testCfg.TLSEnable = useTLS
-		testCfg.Timeout = 10 * time.Second
-
-		testErr := testMQTTConnection(testCfg, testCfg.Timeout)
-		if testErr == nil {
-			fmt.Fprintln(out, "[✓] Broker 连接测试成功！")
-			fmt.Fprintln(out)
-			break
+		if len(agentSummary) == 0 {
+			agentSummary = []string{"无"}
 		}
+		fmt.Fprintf(out, "  • 本机 Agent: %s\n\n", strings.Join(agentSummary, ", "))
 
-		fmt.Fprintf(out, "[!] 连接测试失败: %v\n", testErr)
-		if !promptBool(reader, out, "是否重新输入 Broker 信息？", true) {
-			fmt.Fprintln(out, "[WARN] 保留当前 Broker 配置，请后续通过 'agentpulse doctor' 验证网络。")
-			fmt.Fprintln(out)
-			break
+		fmt.Fprintln(out, "请选择配置模式 (按回车默认编辑全部):")
+		fmt.Fprintln(out, "  1) 完整重新配置 (按步骤配置全部项目)")
+		fmt.Fprintln(out, "  2) 仅编辑 MQTT Broker 配置")
+		fmt.Fprintln(out, "  3) 仅编辑 本机 Agent CLI 配置")
+		fmt.Fprintln(out, "  4) 仅编辑 机器标识 (machine_id)")
+		choice := promptLine(reader, out, "请选择 [1/2/3/4]", "1")
+		switch choice {
+		case "2", "broker":
+			section = "broker"
+		case "3", "agents":
+			section = "agents"
+		case "4", "machine_id", "machine":
+			section = "machine_id"
+		default:
+			section = "all"
 		}
 		fmt.Fprintln(out)
 	}
 
-	// ------------------------------------------------------------
-	// 步骤 2: machine_id 配置
-	// ------------------------------------------------------------
-	fmt.Fprintln(out, "[步骤 2/4] 配置本机标识 machine_id")
-	fmt.Fprintln(out, "------------------------------------------------------------")
+	section = strings.ToLower(strings.TrimSpace(section))
+	switch section {
+	case "broker":
+		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
+	case "agents":
+		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, true)
+	case "machine_id":
+		cfg.MachineID = configureMachineIDSection(reader, out, cfg.MachineID)
+	default:
+		// Guided all
+		fmt.Fprintln(out, "[步骤 1/3] 配置本机机器标识 (machine_id)")
+		cfg.MachineID = configureMachineIDSection(reader, out, cfg.MachineID)
 
-	defaultMachineID := existingCfg.MachineID
+		fmt.Fprintln(out, "[步骤 2/3] 配置 MQTT Broker 连接与鉴权")
+		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
+
+		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (agy, opencode 等)")
+		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, false)
+	}
+
+	// Write 0600 yaml
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		return fmt.Errorf("保存配置文件失败: %w", err)
+	}
+	fmt.Fprintf(out, "[✓] 配置文件已安全保存至: %s (权限: 0600)\n\n", configPath)
+
+	// Immediately verify: broker connect + CLI probe (reusing doctor logic)
+	VerifyConfigDiagnostics(out, cfg)
+
+	fmt.Fprintln(out, "============================================================")
+	fmt.Fprintln(out, "🎉 AgentPulse 配置完成！")
+	fmt.Fprintf(out, "配置文件路径: %s\n", configPath)
+	fmt.Fprintln(out, "后续建议操作:")
+	fmt.Fprintln(out, "  1. 运行 'agentpulse doctor' 验证本机环境与全网拓扑")
+	fmt.Fprintln(out, "  2. 运行 'agentpulse' 启动常驻心跳与监控大盘")
+	fmt.Fprintln(out, "  3. 运行 'agentpulse dispatch <别名|CLI> -- <参数>' 远程派发任务")
+	fmt.Fprintln(out, "============================================================")
+
+	return nil
+}
+
+func configureMachineIDSection(reader *bufio.Reader, out io.Writer, currentID string) string {
+	fmt.Fprintln(out, "------------------------------------------------------------")
+	defaultMachineID := currentID
 	if defaultMachineID == "" {
 		host, err := os.Hostname()
 		if err == nil && host != "" {
 			defaultMachineID = wrapper.SanitizeID(host)
 		} else {
-			defaultMachineID = "macbook"
+			defaultMachineID = "machine-1"
 		}
 	}
 
-	rawMachineID := promptLine(reader, out, "本机机器标识 (小写字母、数字及连字符)", defaultMachineID)
-	machineID := wrapper.SanitizeID(rawMachineID)
+	rawID := promptLine(reader, out, "本机机器标识 (小写字母、数字及连字符)", defaultMachineID)
+	machineID := wrapper.SanitizeID(rawID)
 	if machineID == "" {
 		machineID = "machine-1"
 	}
 	fmt.Fprintf(out, "[✓] 机器标识已确认为: %s\n\n", machineID)
+	return machineID
+}
 
-	// ------------------------------------------------------------
-	// 步骤 3: 保存配置并发送 Announce，展示网内设备/CLI
-	// ------------------------------------------------------------
-	fmt.Fprintln(out, "[步骤 3/4] 保存初始配置并发现网内设备")
+func configureBrokerSection(reader *bufio.Reader, out io.Writer, current config.BrokerConfig) config.BrokerConfig {
 	fmt.Fprintln(out, "------------------------------------------------------------")
-
-	cfg := &config.Config{
-		Version:   1,
-		MachineID: machineID,
-		Rev:       existingCfg.Rev + 1,
-		Broker: config.BrokerConfig{
-			URL:      brokerURL,
-			Username: username,
-			Password: password,
-			TLS:      useTLS,
-		},
-		Agents: existingCfg.Agents,
+	defaultURL := current.URL
+	if defaultURL == "" {
+		defaultURL = "tls://broker.example:8883"
 	}
-	if cfg.Rev <= 0 {
-		cfg.Rev = 1
+	brokerURL := promptLine(reader, out, "MQTT Broker 地址 (支持 tls://, mqtts://, tcp://)", defaultURL)
+
+	defaultUser := current.Username
+	username := promptLine(reader, out, "用户名 (无鉴权请留空)", defaultUser)
+
+	defaultPass := current.Password
+	password := promptLine(reader, out, "密码 (无密码请留空)", defaultPass)
+
+	defaultTLS := current.TLS
+	if strings.HasPrefix(brokerURL, "tls://") || strings.HasPrefix(brokerURL, "mqtts://") || strings.Contains(brokerURL, ":8883") {
+		defaultTLS = true
 	}
-
-	if err := config.SaveConfig(configPath, cfg); err != nil {
-		return fmt.Errorf("保存配置文件失败: %w", err)
-	}
-	fmt.Fprintf(out, "[✓] 配置文件已安全保存至: %s (权限: 0600)\n", configPath)
-
-	// Publish initial Announce & discover other machines
-	host, _ := os.Hostname()
-	initialAnnounce := model.MachineAnnounce{
-		V:         1,
-		MachineID: machineID,
-		TS:        time.Now().UTC(),
-		Rev:       cfg.Rev,
-		Hostname:  host,
-		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Agents:    nil,
-	}
-
-	// Try to connect to broker and scan network
-	mqttCfg := mqtt.DefaultConfig()
-	mqttCfg.BrokerURL = brokerURL
-	mqttCfg.Username = username
-	mqttCfg.Password = password
-	mqttCfg.TLSEnable = useTLS
-	mqttCfg.Timeout = 10 * time.Second
-	mqttCfg.SettleTimeout = 500 * time.Millisecond
-
-	st, err := mqtt.New(mqttCfg)
-	if err == nil {
-		defer st.Close()
-		// Publish announce
-		opts := paho.NewClientOptions()
-		_ = mqtt.ApplyClientOptions(opts, mqttCfg)
-		c := paho.NewClient(opts)
-		if token := c.Connect(); token.WaitTimeout(mqttCfg.Timeout) && token.Error() == nil {
-			_ = mqtt.PublishAnnounce(c, initialAnnounce)
-			c.Disconnect(100)
-			fmt.Fprintln(out, "[✓] 已成功向 Broker 广播本机 Announce 注册信息")
-		}
-
-		// Query discovered machines and announces
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		discoveredAnnounces, _ := st.ListAnnounces(ctx)
-		discoveredMachines, _ := st.ListMachines(ctx)
-
-		var otherNodes []string
-		for _, a := range discoveredAnnounces {
-			if a.MachineID != machineID {
-				var agentSummaries []string
-				for _, ag := range a.Agents {
-					sym := "✗"
-					if ag.Ok {
-						sym = "✓"
-					}
-					agentSummaries = append(agentSummaries, fmt.Sprintf("%s:%s", ag.ID, sym))
-				}
-				summary := "无 CLI 上报"
-				if len(agentSummaries) > 0 {
-					summary = strings.Join(agentSummaries, " ")
-				}
-				otherNodes = append(otherNodes, fmt.Sprintf("  • %-12s (%s, %s) CLI: [%s]", a.MachineID, a.Hostname, a.OS, summary))
-			}
-		}
-
-		if len(otherNodes) > 0 {
-			fmt.Fprintf(out, "\n[网内已发现 %d 台其他设备]:\n", len(otherNodes))
-			for _, n := range otherNodes {
-				fmt.Fprintln(out, n)
-			}
-		} else if len(discoveredMachines) > 1 {
-			fmt.Fprintf(out, "\n[网内发现 %d 台在线节点，正在等待其 CLI Announce 上报]:\n", len(discoveredMachines)-1)
-			for _, m := range discoveredMachines {
-				if m.ID != machineID {
-					fmt.Fprintf(out, "  • %-12s (在线: %v, 心跳: %s)\n", m.ID, m.Online, m.HeartbeatAgo())
-				}
-			}
-		} else {
-			fmt.Fprintln(out, "\n[提示] 当前网内暂无其他在线设备（其他机器启动 agentpulse 后将自动发现并汇入拓扑）。")
-		}
-	} else {
-		fmt.Fprintf(out, "[提示] 未能连上 Broker 扫描拓扑 (%v)；稍后启动服务时将自动重试。\n", err)
-	}
+	useTLS := promptBool(reader, out, "启用 TLS 加密连接", defaultTLS)
 	fmt.Fprintln(out)
 
-	// ------------------------------------------------------------
-	// 步骤 4: 本机 agents + 别名探测与配置
-	// ------------------------------------------------------------
-	fmt.Fprintln(out, "[步骤 4/4] 本机 Agent CLI 探测与别名配置")
+	return config.BrokerConfig{
+		URL:      brokerURL,
+		Username: username,
+		Password: password,
+		TLS:      useTLS,
+	}
+}
+
+func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents []config.AgentConfig, forceCustomize bool) []config.AgentConfig {
 	fmt.Fprintln(out, "------------------------------------------------------------")
-	fmt.Fprintln(out, "正在探测本机 PATH 中的常见 Agent (agy, opencode, codex)...")
+	fmt.Fprintln(out, "正在探测本机 PATH 中的常见 Agent...")
 
-	defaultAgents := config.DefaultAgents()
-	probed := config.ProbeAgents(defaultAgents)
+	if len(currentAgents) == 0 {
+		currentAgents = config.DefaultAgents()
+	}
 
-	var agentAnnounces []model.AgentAnnounce
+	probed := config.ProbeAgents(currentAgents)
 	for _, p := range probed {
 		mark := "✗ 未找到"
 		if p.Ok {
 			mark = fmt.Sprintf("✓ 可用 (%s)", p.Detail)
+		} else if strings.Contains(p.Detail, "禁用") {
+			mark = "[-] 已禁用"
 		}
-		fmt.Fprintf(out, "  • %-10s [别名: %-16s] : %s\n", p.ID, strings.Join(p.Alias, ", "), mark)
+		aliases := strings.Join(p.Alias, ", ")
+		fmt.Fprintf(out, "  • %-10s [别名: %-14s] : %s\n", p.ID, aliases, mark)
+	}
+	fmt.Fprintln(out)
 
-		agentAnnounces = append(agentAnnounces, model.AgentAnnounce{
+	customize := forceCustomize
+	if !customize {
+		customize = promptBool(reader, out, "是否逐项配置/自定义本机 Agent CLI（路径、别名及启用状态）？", false)
+	}
+	if !customize {
+		fmt.Fprintln(out, "[✓] 已保留当前 Agent 配置。")
+		fmt.Fprintln(out)
+		return currentAgents
+	}
+
+	var updatedAgents []config.AgentConfig
+	for _, ag := range currentAgents {
+		fmt.Fprintf(out, "\n配置 Agent: %s\n", ag.ID)
+		enabled := promptBool(reader, out, fmt.Sprintf("  是否启用 %s", ag.ID), ag.IsEnabled())
+		var path string
+		var aliases []string
+		if enabled {
+			path = promptLine(reader, out, "  可执行文件路径 (留空自动搜索 PATH)", ag.Path)
+			defaultAliases := strings.Join(ag.Alias, ", ")
+			aliasStr := promptLine(reader, out, "  命令别名 (多个别名用逗号隔开)", defaultAliases)
+			for _, a := range strings.Split(aliasStr, ",") {
+				trimmed := strings.TrimSpace(a)
+				if trimmed != "" {
+					aliases = append(aliases, trimmed)
+				}
+			}
+		} else {
+			path = ag.Path
+			aliases = ag.Alias
+		}
+		updatedAgents = append(updatedAgents, config.AgentConfig{
+			ID:      ag.ID,
+			Path:    path,
+			Alias:   aliases,
+			Enabled: &enabled,
+		})
+	}
+
+	// Optional add more agents
+	for {
+		addMore := promptBool(reader, out, "是否添加其他本地 Agent CLI？", false)
+		if !addMore {
+			break
+		}
+		customID := promptLine(reader, out, "Agent ID (如 myagent)", "")
+		if customID == "" {
+			break
+		}
+		path := promptLine(reader, out, "可执行文件路径 (留空搜索 PATH)", "")
+		aliasStr := promptLine(reader, out, "命令别名 (逗号分隔)", customID)
+		var aliases []string
+		for _, a := range strings.Split(aliasStr, ",") {
+			trimmed := strings.TrimSpace(a)
+			if trimmed != "" {
+				aliases = append(aliases, trimmed)
+			}
+		}
+		t := true
+		updatedAgents = append(updatedAgents, config.AgentConfig{
+			ID:      customID,
+			Path:    path,
+			Alias:   aliases,
+			Enabled: &t,
+		})
+	}
+
+	fmt.Fprintln(out, "[✓] 本机 Agent 配置已更新。")
+	fmt.Fprintln(out)
+	return updatedAgents
+}
+
+// VerifyConfigDiagnostics runs the doctor verification logic:
+// broker connectivity test + local agent CLI probe.
+func VerifyConfigDiagnostics(out io.Writer, cfg *config.Config) (brokerOk bool, allAgentsOk bool) {
+	fmt.Fprintln(out, "============================================================")
+	fmt.Fprintln(out, "正在运行配置验证 (Doctor 自检)...")
+	fmt.Fprintln(out, "============================================================")
+
+	// 1. Broker connect
+	fmt.Fprintf(out, "[1/2] 测试 MQTT Broker 连通性 (%s)...\n", cfg.Broker.URL)
+	mqttCfg := mqtt.DefaultConfig()
+	mqttCfg.BrokerURL = cfg.Broker.URL
+	mqttCfg.Username = cfg.Broker.Username
+	mqttCfg.Password = cfg.Broker.Password
+	mqttCfg.TLSEnable = cfg.Broker.TLS
+	mqttCfg.Timeout = 5 * time.Second
+
+	testErr := testMQTTConnection(mqttCfg, mqttCfg.Timeout)
+	if testErr == nil {
+		fmt.Fprintln(out, "  [✓] Broker 连通性测试通过！")
+		brokerOk = true
+	} else {
+		fmt.Fprintf(out, "  [!] Broker 连通性测试失败: %v (可稍后运行 'agentpulse doctor' 重新自检)\n", testErr)
+	}
+
+	// 2. CLI probe
+	fmt.Fprintln(out, "\n[2/2] 本机 Agent CLI 探测...")
+	agents := cfg.Agents
+	if len(agents) == 0 {
+		agents = config.DefaultAgents()
+	}
+	probed := config.ProbeAgents(agents)
+	allAgentsOk = true
+	var announceAgents []model.AgentAnnounce
+	for _, p := range probed {
+		aliases := strings.Join(p.Alias, ", ")
+		if !p.Ok && strings.Contains(p.Detail, "禁用") {
+			fmt.Fprintf(out, "  [-] %-10s [别名: %-14s] : %s\n", p.ID, aliases, p.Detail)
+		} else if p.Ok {
+			fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s] : 可用 (%s)\n", p.ID, aliases, p.Detail)
+		} else {
+			fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s] : %s\n", p.ID, aliases, p.Detail)
+			allAgentsOk = false
+		}
+		announceAgents = append(announceAgents, model.AgentAnnounce{
 			ID:     p.ID,
 			Alias:  p.Alias,
 			Ok:     p.Ok,
 			Detail: p.Detail,
 		})
 	}
+
+	// 3. Publish announce if broker connected and machineID set
+	if brokerOk && cfg.MachineID != "" {
+		host, _ := os.Hostname()
+		ann := model.MachineAnnounce{
+			V:         1,
+			MachineID: cfg.MachineID,
+			TS:        time.Now().UTC(),
+			Rev:       cfg.Rev,
+			Hostname:  host,
+			OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+			Agents:    announceAgents,
+		}
+		opts := paho.NewClientOptions()
+		_ = mqtt.ApplyClientOptions(opts, mqttCfg)
+		c := paho.NewClient(opts)
+		if token := c.Connect(); token.WaitTimeout(mqttCfg.Timeout) && token.Error() == nil {
+			_ = mqtt.PublishAnnounce(c, ann)
+			c.Disconnect(100)
+			fmt.Fprintln(out, "\n  [✓] 已将最新本机 Announce 注册信息发布至 Broker")
+		}
+	}
 	fmt.Fprintln(out)
 
-	keepAgents := promptBool(reader, out, "是否采用上述探测到的 Agent 作为本机注册配置？", true)
-	if keepAgents {
-		cfg.Agents = defaultAgents
-	}
-
-	// Update config with agents and re-save
-	if err := config.SaveConfig(configPath, cfg); err != nil {
-		return fmt.Errorf("保存配置失败: %w", err)
-	}
-
-	// Re-publish full announce with probed agents if connected
-	finalAnnounce := model.MachineAnnounce{
-		V:         1,
-		MachineID: machineID,
-		TS:        time.Now().UTC(),
-		Rev:       cfg.Rev,
-		Hostname:  host,
-		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Agents:    agentAnnounces,
-	}
-
-	opts := paho.NewClientOptions()
-	_ = mqtt.ApplyClientOptions(opts, mqttCfg)
-	c := paho.NewClient(opts)
-	if token := c.Connect(); token.WaitTimeout(mqttCfg.Timeout) && token.Error() == nil {
-		_ = mqtt.PublishAnnounce(c, finalAnnounce)
-		c.Disconnect(100)
-		fmt.Fprintln(out, "[✓] 已将最新本机 Agent 探测状态发布至 Broker Announce")
-	}
-
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, "============================================================")
-	fmt.Fprintln(out, "🎉 AgentPulse 配置完成！")
-	fmt.Fprintf(out, "配置文件路径: %s\n", configPath)
-	fmt.Fprintln(out, "后续建议操作:")
-	fmt.Fprintln(out, "  1. 运行 'agentpulse doctor' 验证本机环境与全网设备/CLI 扁平表")
-	fmt.Fprintln(out, "  2. 运行 'agentpulse' 启动常驻心跳、命令监听与监控一体进程")
-	fmt.Fprintln(out, "  3. 运行 'agentpulse dispatch <别名|CLI> -- <参数>' 远程派发任务")
-	fmt.Fprintln(out, "============================================================")
-
-	return nil
+	return brokerOk, allAgentsOk
 }
