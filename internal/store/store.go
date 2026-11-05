@@ -36,6 +36,9 @@ type Store interface {
 	// Subscribe returns an event channel receiving real-time state changes and logs.
 	Subscribe(ctx context.Context) (<-chan model.Event, error)
 
+	// IsConnected reports whether the underlying store connection is currently active.
+	IsConnected() bool
+
 	// Close shuts down background tickers or network connections cleanly.
 	Close() error
 }

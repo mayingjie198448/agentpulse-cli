@@ -66,6 +66,17 @@ type Job struct {
 	Error       string     `json:"error,omitempty"`
 }
 
+// NeedsAttention reports whether the job requires human attention or follow-up.
+// Job states that need follow-up include failed executions, jobs waiting for user input,
+// and stuck/error states mapped from existing job status and error fields.
+func (j Job) NeedsAttention() bool {
+	switch strings.ToLower(string(j.Status)) {
+	case string(StatusFailed), "error", "waiting", "waiting_input", "stuck":
+		return true
+	}
+	return j.Error != "" && j.Status != StatusDone
+}
+
 // LogLevel denotes the severity or category of a log line.
 type LogLevel string
 

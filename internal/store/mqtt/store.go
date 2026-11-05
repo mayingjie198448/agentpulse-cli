@@ -583,6 +583,16 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// IsConnected reports whether the underlying MQTT client is actively connected to the broker.
+func (s *Store) IsConnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.client == nil {
+		return false
+	}
+	return s.client.IsConnected()
+}
+
 func (s *Store) runHeartbeatChecker() {
 	s.checkStaleMachines()
 	ticker := time.NewTicker(s.cfg.HeartbeatCheckInterval)
