@@ -203,11 +203,65 @@ func GenerateAttachJobID(engine string, pid int, startTime time.Time) string {
 	return fmt.Sprintf("job-attach-%s-%d", engine, pid)
 }
 
+// commandContext, readProcFile, readProcLink, readProcDir, and openTailFile
+// are the process-discovery and log-tail IO seams. Tests wrap them so a
+// regression fails before any other PID's command line or log is read.
+var (
+	commandContext = exec.CommandContext
+	readProcFile   = os.ReadFile
+	readProcLink   = os.Readlink
+	readProcDir    = os.ReadDir
+	openTailFile   = os.Open
+)
+
+// psListArgs builds the ps invocation. An empty PID list is the production
+// full-table scan. A non-empty list must stay a targeted `ps -p` and must
+// not include -A.
+func psListArgs(pids []int) []string {
+	if len(pids) == 0 {
+		return []string{"-A", "-o", "pid=,ppid=,args="}
+	}
+	return []string{"-p", joinPIDList(pids), "-o", "pid=,ppid=,args="}
+}
+
+func joinPIDList(pids []int) string {
+	parts := make([]string, len(pids))
+	for i, pid := range pids {
+		parts[i] = strconv.Itoa(pid)
+	}
+	return strings.Join(parts, ",")
+}
+
+func normalizePIDs(pids []int) []int {
+	seen := make(map[int]bool, len(pids))
+	out := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		if pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		out = append(out, pid)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // DefaultProcessLister lists processes using standard POSIX ps.
 func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
-	cmd := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=,ppid=,args=")
+	return listWithPS(ctx, nil)
+}
+
+func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
+	pids = normalizePIDs(pids)
+	cmd := commandContext(ctx, "ps", psListArgs(pids)...)
 	out, err := cmd.Output()
 	if err != nil {
+		if len(pids) > 0 && len(bytes.TrimSpace(out)) == 0 {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return nil, nil
+			}
+		}
 		return nil, fmt.Errorf("failed to run ps: %w", err)
 	}
 
@@ -250,8 +304,248 @@ func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
 			Args: args,
 		})
 	}
-
 	return procs, nil
+}
+
+// listLinuxPIDs reads only the allowlisted PIDs. It does not walk /proc and
+// does not run ps, so other processes' command lines are never opened.
+func listLinuxPIDs(pids []int) ([]ProcessInfo, error) {
+	btime, clk, haveBoot := linuxBootTime()
+	var procs []ProcessInfo
+	for _, pid := range pids {
+		proc, ok := readLinuxProcess(pid, btime, clk, haveBoot)
+		if ok {
+			procs = append(procs, proc)
+		}
+	}
+	return procs, nil
+}
+
+func readLinuxProcess(pid int, btime, clk int64, haveBoot bool) (ProcessInfo, bool) {
+	raw, err := readProcFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ProcessInfo{}, false
+	}
+	args := splitCmdline(raw)
+	if len(args) == 0 {
+		return ProcessInfo{}, false
+	}
+	statRaw, err := readProcFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return ProcessInfo{}, false
+	}
+	ppid, startTicks, ok := parseProcStat(string(statRaw))
+	if !ok {
+		return ProcessInfo{}, false
+	}
+	info := ProcessInfo{PID: pid, PPID: ppid, Args: args}
+	if target, err := readProcLink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil && target != "" {
+		info.Cwd = target
+	}
+	if haveBoot && clk > 0 && startTicks >= 0 {
+		info.StartTime = time.Unix(btime+startTicks/clk, 0).UTC()
+	}
+	return info, true
+}
+
+func splitCmdline(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	parts := bytes.Split(raw, []byte{0})
+	args := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		args = append(args, string(part))
+	}
+	return args
+}
+
+// parseProcStat returns ppid and starttime ticks from /proc/pid/stat.
+// The comm field may contain spaces and parentheses, so parsing starts
+// after the last ')'.
+func parseProcStat(stat string) (ppid int, startTicks int64, ok bool) {
+	end := strings.LastIndex(stat, ")")
+	if end < 0 || end+2 >= len(stat) {
+		return 0, 0, false
+	}
+	fields := strings.Fields(stat[end+1:])
+	// state, ppid, ..., starttime is field 20 (index 19) after comm.
+	if len(fields) < 20 {
+		return 0, 0, false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	startTicks, err = strconv.ParseInt(fields[19], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return ppid, startTicks, true
+}
+
+func linuxBootTime() (btime int64, clk int64, ok bool) {
+	raw, err := readProcFile("/proc/stat")
+	if err != nil {
+		return 0, 100, false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "btime ") {
+			btime, err = strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "btime ")), 10, 64)
+			if err != nil || btime <= 0 {
+				return 0, 100, false
+			}
+			// Linux CLK_TCK is 100 on the architectures this program runs.
+			return btime, 100, true
+		}
+	}
+	return 0, 100, false
+}
+
+// openPathsOfPID returns files this PID itself has open.
+// It never inspects another PID.
+func openPathsOfPID(pid int) []string {
+	if pid <= 0 {
+		return nil
+	}
+	if runtime.GOOS == "linux" {
+		return linuxFDPaths(pid)
+	}
+	if runtime.GOOS == "darwin" {
+		return darwinLsofPaths(pid)
+	}
+	return nil
+}
+
+func linuxFDPaths(pid int) []string {
+	dir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := readProcDir(dir)
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var paths []string
+	for _, entry := range entries {
+		target, err := readProcLink(filepath.Join(dir, entry.Name()))
+		if err != nil || target == "" {
+			continue
+		}
+		target = strings.TrimSuffix(target, " (deleted)")
+		if !filepath.IsAbs(target) || seen[target] {
+			continue
+		}
+		seen[target] = true
+		paths = append(paths, target)
+	}
+	return paths
+}
+
+func darwinLsofPaths(pid int) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cmd := commandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-Fn")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "n") {
+			continue
+		}
+		path := strings.TrimPrefix(line, "n")
+		if !filepath.IsAbs(path) || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// fileNameHasPID reports whether name contains pid as a whole numeric token.
+func fileNameHasPID(name string, pid int) bool {
+	token := strconv.Itoa(pid)
+	if token == "" {
+		return false
+	}
+	rest := name
+	for {
+		i := strings.Index(rest, token)
+		if i < 0 {
+			return false
+		}
+		beforeOK := i == 0 || rest[i-1] < '0' || rest[i-1] > '9'
+		after := i + len(token)
+		afterOK := after == len(rest) || rest[after] < '0' || rest[after] > '9'
+		if beforeOK && afterOK {
+			return true
+		}
+		rest = rest[i+1:]
+	}
+}
+
+func pathUnderDir(path, dir string) bool {
+	if path == "" || dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	return true
+}
+
+// ownedLogFile selects a log for pid without opening any other PID's log.
+// Directory entries are names only. Content is opened later, and only for the
+// chosen path.
+func ownedLogFile(pid int, logDir string, nameOK func(string) bool) string {
+	if pid <= 0 || logDir == "" || nameOK == nil {
+		return ""
+	}
+	if entries, err := readProcDir(logDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !nameOK(entry.Name()) || !fileNameHasPID(entry.Name(), pid) {
+				continue
+			}
+			return filepath.Join(logDir, entry.Name())
+		}
+	}
+	for _, path := range openPathsOfPID(pid) {
+		if !pathUnderDir(path, logDir) {
+			continue
+		}
+		base := filepath.Base(path)
+		if nameOK(base) || strings.HasSuffix(base, ".log") {
+			return path
+		}
+	}
+	return ""
+}
+
+func waitOwnedLog(ctx context.Context, pid int, logDir string, nameOK func(string) bool) string {
+	for attempt := 0; attempt < 10; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ""
+		default:
+		}
+		if path := ownedLogFile(pid, logDir, nameOK); path != "" {
+			return path
+		}
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ""
+		case <-timer.C:
+		}
+	}
+	return ""
 }
 
 // ResolveProcessCwd probes the current working directory of a process.
@@ -261,7 +555,7 @@ func ResolveProcessCwd(pid int) string {
 	}
 
 	if runtime.GOOS == "linux" {
-		if target, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
+		if target, err := readProcLink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
 			return target
 		}
 	}
@@ -269,7 +563,7 @@ func ResolveProcessCwd(pid int) string {
 	if runtime.GOOS == "darwin" {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
+		cmd := commandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
 		out, err := cmd.Output()
 		if err == nil {
 			lines := strings.Split(string(out), "\n")
@@ -296,7 +590,7 @@ func ResolveProcessStartTime(pid int) time.Time {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
+	cmd := commandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
 	out, err := cmd.Output()
 	if err == nil {
 		str := strings.TrimSpace(string(out))
@@ -374,15 +668,16 @@ type AttachedJob struct {
 // AttachManager periodically scans local processes, attaches to bare agent CLI processes
 // (e.g. agy, opencode), and streams their status and output to MQTT.
 type AttachManager struct {
-	cfg          AttachManagerConfig
-	mu           sync.Mutex
-	mqttClient   paho.Client
-	activeJobs   map[int]*AttachedJob
-	knownPIDs    map[int]time.Time
-	pidAllowlist map[int]bool
-	stopCh       chan struct{}
-	doneCh       chan struct{}
-	started      atomic.Bool
+	cfg               AttachManagerConfig
+	mu                sync.Mutex
+	mqttClient        paho.Client
+	activeJobs        map[int]*AttachedJob
+	knownPIDs         map[int]time.Time
+	pidAllowlist      map[int]bool
+	usesDefaultLister bool
+	stopCh            chan struct{}
+	doneCh            chan struct{}
+	started           atomic.Bool
 }
 
 // NewAttachManager creates and initializes an AttachManager.
@@ -390,8 +685,10 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 	if cfg.ScanInterval <= 0 {
 		cfg.ScanInterval = 2 * time.Second
 	}
+	usesDefaultLister := false
 	if cfg.ProcessLister == nil {
 		cfg.ProcessLister = DefaultProcessLister
+		usesDefaultLister = true
 	}
 	if cfg.IsProcessAlive == nil {
 		cfg.IsProcessAlive = IsProcessAlive
@@ -433,13 +730,14 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 	}
 
 	return &AttachManager{
-		cfg:          cfg,
-		mqttClient:   cfg.MQTTClient,
-		activeJobs:   make(map[int]*AttachedJob),
-		knownPIDs:    make(map[int]time.Time),
-		pidAllowlist: allowlistMap,
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		cfg:               cfg,
+		mqttClient:        cfg.MQTTClient,
+		activeJobs:        make(map[int]*AttachedJob),
+		knownPIDs:         make(map[int]time.Time),
+		pidAllowlist:      allowlistMap,
+		usesDefaultLister: usesDefaultLister,
+		stopCh:            make(chan struct{}),
+		doneCh:            make(chan struct{}),
 	}
 }
 
@@ -530,8 +828,35 @@ func (m *AttachManager) run(ctx context.Context) {
 	}
 }
 
+// discoverProcesses lists candidate processes.
+// A non-empty allowlist on the default lister is applied before any OS read:
+// Linux opens only those PIDs' proc files, and other systems run ps -p for
+// those PIDs only. An empty allowlist keeps the existing full-table ps.
+func (m *AttachManager) discoverProcesses(ctx context.Context) ([]ProcessInfo, error) {
+	m.mu.Lock()
+	pids := make([]int, 0, len(m.pidAllowlist))
+	for pid := range m.pidAllowlist {
+		pids = append(pids, pid)
+	}
+	useDefault := m.usesDefaultLister
+	lister := m.cfg.ProcessLister
+	m.mu.Unlock()
+
+	pids = normalizePIDs(pids)
+	if useDefault && len(pids) > 0 {
+		if runtime.GOOS == "linux" {
+			return listLinuxPIDs(pids)
+		}
+		return listWithPS(ctx, pids)
+	}
+	if lister == nil {
+		return nil, nil
+	}
+	return lister(ctx)
+}
+
 func (m *AttachManager) scan(ctx context.Context) {
-	procs, err := m.cfg.ProcessLister(ctx)
+	procs, err := m.discoverProcesses(ctx)
 	if err != nil {
 		if !m.cfg.Quiet && m.cfg.Stderr != nil {
 			fmt.Fprintf(m.cfg.Stderr, "[agentpulse attach] process scan error: %v\n", err)
@@ -907,53 +1232,16 @@ func (m *AttachManager) tailAgyLogs(ctx context.Context, aj *AttachedJob, home s
 		logDir = filepath.Join(home, ".gemini", "antigravity-cli", "log")
 	}
 
-	// Try to find the matching cli-*.log for this PID
+	// A non-empty allowlist on the default lister must not open sibling logs
+	// to see which PID they mention. Only this PID's own fd or a filename
+	// that already contains the PID is eligible.
 	var logFile string
-	pidPattern := fmt.Sprintf("pid %d", aj.pid)
-
-	for attempt := 0; attempt < 10; attempt++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		entries, err := os.ReadDir(logDir)
-		if err == nil {
-			type fileInfo struct {
-				name    string
-				modTime time.Time
-			}
-			var files []fileInfo
-			for _, e := range entries {
-				if strings.HasPrefix(e.Name(), "cli-") && strings.HasSuffix(e.Name(), ".log") {
-					if info, err := e.Info(); err == nil {
-						files = append(files, fileInfo{name: e.Name(), modTime: info.ModTime()})
-					}
-				}
-			}
-			sort.Slice(files, func(i, j int) bool {
-				return files[i].modTime.After(files[j].modTime)
-			})
-
-			// Inspect the newest 25 files
-			limit := 25
-			if len(files) < limit {
-				limit = len(files)
-			}
-			for i := 0; i < limit; i++ {
-				fp := filepath.Join(logDir, files[i].name)
-				if fileContainsPID(fp, pidPattern) {
-					logFile = fp
-					break
-				}
-			}
-		}
-
-		if logFile != "" {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
+	if m.logsRestricted() {
+		logFile = waitOwnedLog(ctx, aj.pid, logDir, func(name string) bool {
+			return strings.HasPrefix(name, "cli-") && strings.HasSuffix(name, ".log")
+		})
+	} else {
+		logFile = m.findAgyLogByContent(ctx, logDir, aj.pid)
 	}
 
 	if logFile == "" {
@@ -988,7 +1276,7 @@ func (m *AttachManager) tailAgyLogs(ctx context.Context, aj *AttachedJob, home s
 }
 
 func fileContainsPID(path, pidPattern string) bool {
-	f, err := os.Open(path)
+	f, err := openTailFile(path)
 	if err != nil {
 		return false
 	}
@@ -1044,10 +1332,86 @@ func (m *AttachManager) tailOpenCodeLogs(ctx context.Context, aj *AttachedJob, h
 	}
 
 	var logFile string
+	if m.logsRestricted() {
+		logFile = waitOwnedLog(ctx, aj.pid, logDir, func(name string) bool {
+			return strings.HasSuffix(name, ".log")
+		})
+	} else {
+		logFile = m.findNewestOpenCodeLog(ctx, logDir)
+	}
+
+	if logFile == "" {
+		return
+	}
+
+	tailFile(ctx, logFile, func(line string) {
+		m.handleOutputLine(aj, line, false)
+	})
+}
+
+func (m *AttachManager) logsRestricted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.usesDefaultLister && len(m.pidAllowlist) > 0
+}
+
+func (m *AttachManager) findAgyLogByContent(ctx context.Context, logDir string, pid int) string {
+	pidPattern := fmt.Sprintf("pid %d", pid)
+	for attempt := 0; attempt < 10; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ""
+		default:
+		}
+
+		entries, err := os.ReadDir(logDir)
+		if err == nil {
+			type fileInfo struct {
+				name    string
+				modTime time.Time
+			}
+			var files []fileInfo
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), "cli-") && strings.HasSuffix(e.Name(), ".log") {
+					if info, err := e.Info(); err == nil {
+						files = append(files, fileInfo{name: e.Name(), modTime: info.ModTime()})
+					}
+				}
+			}
+			sort.Slice(files, func(i, j int) bool {
+				return files[i].modTime.After(files[j].modTime)
+			})
+
+			// Inspect the newest 25 files. Unrestricted production scans keep
+			// this content match; allowlisted discovery does not.
+			limit := 25
+			if len(files) < limit {
+				limit = len(files)
+			}
+			for i := 0; i < limit; i++ {
+				fp := filepath.Join(logDir, files[i].name)
+				if fileContainsPID(fp, pidPattern) {
+					return fp
+				}
+			}
+		}
+
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ""
+		case <-timer.C:
+		}
+	}
+	return ""
+}
+
+func (m *AttachManager) findNewestOpenCodeLog(ctx context.Context, logDir string) string {
 	for attempt := 0; attempt < 5; attempt++ {
 		select {
 		case <-ctx.Done():
-			return
+			return ""
 		default:
 		}
 
@@ -1069,24 +1433,22 @@ func (m *AttachManager) tailOpenCodeLogs(ctx context.Context, aj *AttachedJob, h
 				return files[i].modTime.After(files[j].modTime)
 			})
 			if len(files) > 0 {
-				logFile = filepath.Join(logDir, files[0].name)
-				break
+				return filepath.Join(logDir, files[0].name)
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ""
+		case <-timer.C:
+		}
 	}
-
-	if logFile == "" {
-		return
-	}
-
-	tailFile(ctx, logFile, func(line string) {
-		m.handleOutputLine(aj, line, false)
-	})
+	return ""
 }
 
 func tailFile(ctx context.Context, path string, onLine func(line string)) {
-	f, err := os.Open(path)
+	f, err := openTailFile(path)
 	if err != nil {
 		return
 	}
