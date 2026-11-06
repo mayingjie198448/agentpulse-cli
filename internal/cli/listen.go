@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet bool, maxConcurrentJobs int) error {
+func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet bool, maxConcurrentJobs int, noAttach bool) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.OutOrStderr()
 
@@ -100,6 +100,11 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 
 	pMQTT := &mqttCfg
 
+	var agents []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agents = fileCfg.Agents
+	}
+
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
 		MachineID:                  machineID,
 		MachineName:                machineName,
@@ -109,6 +114,8 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 		Stub:                       stub,
 		DangerouslySkipPermissions: dangerouslySkipPermissions,
 		Quiet:                      quiet,
+		DisableBareAttach:          noAttach,
+		Agents:                     agents,
 		Stdout:                     out,
 		Stderr:                     errOut,
 		MaxConcurrentJobs:          maxConcurrentJobs,
@@ -174,6 +181,7 @@ func newListenCmd() *cobra.Command {
 		dangerouslySkipPermissions bool
 		quiet                      bool
 		maxConcurrentJobs          int
+		noAttach                   bool
 	)
 
 	listenCmd := &cobra.Command{
@@ -203,7 +211,7 @@ Examples:
 			if machineID == "" {
 				machineID = machineIDFlag
 			}
-			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, maxConcurrentJobs)
+			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, maxConcurrentJobs, noAttach)
 		},
 	}
 
@@ -216,6 +224,7 @@ Examples:
 	listenCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when running agy commands")
 	listenCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse listener header/footer banners")
 	listenCmd.Flags().IntVarP(&maxConcurrentJobs, "max-concurrent-jobs", "c", 0, "最大本地并发作业数 (默认从 config.yaml 读取，缺省为 1)")
+	listenCmd.Flags().BoolVar(&noAttach, "no-attach", false, "Disable automatic attachment of local bare agent CLI processes")
 
 	return listenCmd
 }
