@@ -248,9 +248,12 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 				} else {
 					fmt.Fprintln(out, "[✓] 已成功配置并启动 macOS 开机自启常驻守护进程 (LaunchAgent)")
 				}
-			} else {
-				if oldBroker.URL != cfg.Broker.URL {
-					_ = autostart.Restart(cfg, "", "")
+			} else if oldBroker != cfg.Broker {
+				fmt.Fprintln(out, "[!] 检测到 Broker 配置变更，正在重启常驻后台服务...")
+				if err := autostart.Restart(cfg, "", ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 重启常驻守护进程失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "  [✓] 已重启常驻守护进程并应用新 Broker 配置 (LaunchAgent)")
 				}
 			}
 		} else {

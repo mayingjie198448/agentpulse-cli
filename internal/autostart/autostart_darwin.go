@@ -20,6 +20,24 @@ var (
 	execCommand         = exec.Command
 )
 
+// SetTestOverrides allows unit tests to redirect LaunchAgents/Logs dirs to temp dirs
+// and mock exec.Command without affecting the user's real LaunchAgent.
+func SetTestOverrides(launchAgentsDir, logsDir string, cmdFn func(name string, args ...string) *exec.Cmd) func() {
+	oldLaunch := testLaunchAgentsDir
+	oldLogs := testLogsDir
+	oldExec := execCommand
+	testLaunchAgentsDir = launchAgentsDir
+	testLogsDir = logsDir
+	if cmdFn != nil {
+		execCommand = cmdFn
+	}
+	return func() {
+		testLaunchAgentsDir = oldLaunch
+		testLogsDir = oldLogs
+		execCommand = oldExec
+	}
+}
+
 // IsSupported returns true on macOS where LaunchAgents are supported.
 func IsSupported() bool {
 	return true

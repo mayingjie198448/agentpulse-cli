@@ -2,7 +2,9 @@ package mqtt_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1119,5 +1121,309 @@ func TestMQTTStore_Refresh_Transactional_SubscribeFails(t *testing.T) {
 	machines, err := st.ListMachines(ctx)
 	if err != nil || len(machines) != 1 || machines[0].ID != "mach-safe" {
 		t.Fatalf("expected mach-safe to remain intact after failed subscribe, got %+v", machines)
+	}
+}
+
+func TestMQTTStore_Refresh_Transactional_SubscribeTimeout_NoPartialUpdate(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.Timeout = 10 * time.Millisecond
+	cfg.SettleTimeout = 10 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	mach := `{"id":"mach-timeout","name":"mach-timeout","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-timeout/status", []byte(mach), true)
+
+	// Subscribe to events
+	subCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Broker has new retained data that should NOT leak into live store on failure
+	fakeClient.Publish("agentpulse/v1/machines/mach-broker-retained/status", 1, true, []byte(`{"id":"mach-broker-retained","online":true}`))
+
+	// Inject subscription timeout
+	fakeClient.SetSubscribeTimeout(true)
+
+	// Refresh must fail with timeout
+	if err := st.Refresh(ctx); err == nil {
+		t.Fatalf("expected Refresh error when subscribe times out, got nil")
+	}
+
+	// Live store state must remain untouched
+	machines, err := st.ListMachines(ctx)
+	if err != nil || len(machines) != 1 || machines[0].ID != "mach-timeout" {
+		t.Fatalf("expected original machines to remain intact, got %+v", machines)
+	}
+
+	// No events should be delivered to subscriber for aborted retained messages
+	select {
+	case ev := <-subCh:
+		t.Fatalf("expected no events on failed refresh, got: %+v", ev)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestMQTTStore_Refresh_ContextCanceled_NoPartialUpdate(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 150 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	mach := `{"id":"mach-cancel","name":"mach-cancel","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-cancel/status", []byte(mach), true)
+
+	job := `{"id":"job-cancel","machine_id":"mach-cancel","status":"running","title":"Job Cancel"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-cancel/jobs/job-cancel/status", []byte(job), true)
+
+	// Broker has different retained message that arrives during subscription
+	fakeClient.Publish("agentpulse/v1/machines/mach-ghost/status", 1, true, []byte(`{"id":"mach-ghost","online":true}`))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel context during settle wait
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	err = st.Refresh(ctx)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from Refresh, got: %v", err)
+	}
+
+	// Store must have original state, mach-ghost must not exist
+	checkCtx := context.Background()
+	machines, err := st.ListMachines(checkCtx)
+	if err != nil || len(machines) != 1 || machines[0].ID != "mach-cancel" {
+		t.Fatalf("expected only mach-cancel after canceled refresh, got %+v", machines)
+	}
+
+	jobs, err := st.ListJobs(checkCtx)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != "job-cancel" {
+		t.Fatalf("expected only job-cancel after canceled refresh, got %+v", jobs)
+	}
+}
+
+func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_Success(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 80 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Initial store state
+	t0 := time.Now().Add(-10 * time.Minute)
+	mach1Init := fmt.Sprintf(`{"id":"mach-1","name":"mach-1","online":true,"last_heartbeat":%q}`, t0.Format(time.RFC3339))
+	fakeClient.Deliver("agentpulse/v1/machines/mach-1/status", []byte(mach1Init), true)
+
+	job1Init := `{"id":"job-1","machine_id":"mach-1","status":"running","title":"Job 1","progress":10}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/status", []byte(job1Init), true)
+
+	subCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Retained on broker: mach-2 new node
+	fakeClient.Publish("agentpulse/v1/machines/mach-2/status", 1, true, []byte(`{"id":"mach-2","name":"mach-2","online":true}`))
+
+	// Run Refresh in background and inject real-time concurrent messages during settle
+	refreshErrCh := make(chan error, 1)
+	go func() {
+		refreshErrCh <- st.Refresh(ctx)
+	}()
+
+	// Wait 20ms into refresh, then publish concurrent real-time messages (retained: false)
+	time.Sleep(20 * time.Millisecond)
+
+	// Real-time job progress update (progress 95%)
+	job1Realtime := `{"id":"job-1","machine_id":"mach-1","status":"running","title":"Job 1","progress":95}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/status", []byte(job1Realtime), false)
+
+	// Real-time new job
+	jobNewRealtime := `{"id":"job-new","machine_id":"mach-1","status":"running","title":"Job New","progress":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-new/status", []byte(jobNewRealtime), false)
+
+	// Real-time log entry
+	logPayload := `{"job_id":"job-1","machine_id":"mach-1","level":"info","message":"realtime progress checkpoint"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/logs", []byte(logPayload), false)
+
+	// Wait for refresh to finish
+	if err := <-refreshErrCh; err != nil {
+		t.Fatalf("Refresh returned unexpected error: %v", err)
+	}
+
+	// 1. Verify live store contains both machines and both jobs
+	machines, err := st.ListMachines(ctx)
+	if err != nil || len(machines) != 2 {
+		t.Fatalf("expected 2 machines after refresh, got %+v", machines)
+	}
+
+	jobs, err := st.ListJobs(ctx)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs after refresh, got %+v", jobs)
+	}
+
+	var j1 *model.Job
+	for i := range jobs {
+		if jobs[i].ID == "job-1" {
+			j1 = &jobs[i]
+		}
+	}
+	if j1 == nil || j1.Progress != 95 {
+		t.Fatalf("expected job-1 to have progress 95 from real-time update, got: %+v", j1)
+	}
+
+	// 2. Verify logs for job-1 preserved the real-time log entry
+	logs, err := st.GetLogs(ctx, "job-1", 10)
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("expected logs for job-1 to contain real-time log, got: %+v (err: %v)", logs, err)
+	}
+	if !strings.Contains(logs[len(logs)-1].Message, "realtime progress checkpoint") {
+		t.Fatalf("expected log entry to contain message, got: %+v", logs[len(logs)-1])
+	}
+
+	// 3. Verify subscriber received real-time events
+	receivedEvents := make([]model.Event, 0)
+	drainDone := false
+	for !drainDone {
+		select {
+		case ev := <-subCh:
+			receivedEvents = append(receivedEvents, ev)
+		case <-time.After(50 * time.Millisecond):
+			drainDone = true
+		}
+	}
+
+	hasJ1Update := false
+	hasJNew := false
+	hasLog := false
+	for _, ev := range receivedEvents {
+		if ev.Type == model.EventJobUpdated && ev.Job != nil {
+			if ev.Job.ID == "job-1" && ev.Job.Progress == 95 {
+				hasJ1Update = true
+			}
+			if ev.Job.ID == "job-new" {
+				hasJNew = true
+			}
+		}
+		if ev.Type == model.EventLogAdded && ev.Log != nil && ev.Log.JobID == "job-1" {
+			hasLog = true
+		}
+	}
+	if !hasJ1Update {
+		t.Errorf("expected subscriber to receive EventJobUpdated for job-1 (progress 95)")
+	}
+	if !hasJNew {
+		t.Errorf("expected subscriber to receive EventJobUpdated for job-new")
+	}
+	if !hasLog {
+		t.Errorf("expected subscriber to receive EventLogAdded for job-1 log")
+	}
+}
+
+func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_FailedRefresh(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 100 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	// Initial store state
+	mach1Init := `{"id":"mach-base","name":"mach-base","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-base/status", []byte(mach1Init), true)
+
+	job1Init := `{"id":"job-base","machine_id":"mach-base","status":"running","title":"Base Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-base/jobs/job-base/status", []byte(job1Init), true)
+
+	subCh, err := st.Subscribe(context.Background())
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Broker has a stale retained node that should be discarded when refresh fails
+	fakeClient.Publish("agentpulse/v1/machines/mach-broker-stale/status", 1, true, []byte(`{"id":"mach-broker-stale","online":true}`))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	refreshErrCh := make(chan error, 1)
+	go func() {
+		refreshErrCh <- st.Refresh(ctx)
+	}()
+
+	// Wait 20ms into refresh
+	time.Sleep(20 * time.Millisecond)
+
+	// Deliver concurrent real-time message (retained: false)
+	realtimeJob := `{"id":"job-realtime-important","machine_id":"mach-base","status":"running","title":"Crucial Realtime Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-base/jobs/job-realtime-important/status", []byte(realtimeJob), false)
+
+	// Cancel refresh
+	cancel()
+
+	refreshErr := <-refreshErrCh
+	if refreshErr == nil {
+		t.Fatalf("expected Refresh to fail on cancel, got nil")
+	}
+
+	// Verify live store state:
+	// 1. mach-broker-stale MUST NOT be present (staging discarded!)
+	// 2. job-realtime-important MUST be present (real-time message was merged and NOT lost!)
+	checkCtx := context.Background()
+	machines, err := st.ListMachines(checkCtx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	for _, m := range machines {
+		if m.ID == "mach-broker-stale" {
+			t.Fatalf("mach-broker-stale should not be present after failed refresh")
+		}
+	}
+
+	jCrucial, err := st.GetJob(checkCtx, "job-realtime-important")
+	if err != nil || jCrucial == nil {
+		t.Fatalf("job-realtime-important must not be lost after failed refresh: %v", err)
+	}
+
+	// 3. Subscriber should have received the event for job-realtime-important
+	receivedRealtime := false
+	drainDone := false
+	for !drainDone {
+		select {
+		case ev := <-subCh:
+			if ev.Type == model.EventJobUpdated && ev.Job != nil && ev.Job.ID == "job-realtime-important" {
+				receivedRealtime = true
+			}
+		case <-time.After(50 * time.Millisecond):
+			drainDone = true
+		}
+	}
+	if !receivedRealtime {
+		t.Errorf("expected subscriber to receive EventJobUpdated for job-realtime-important after failed refresh replay")
 	}
 }

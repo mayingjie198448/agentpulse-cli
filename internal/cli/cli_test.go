@@ -3,11 +3,13 @@ package cli_test
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/spf13/cobra"
@@ -1292,6 +1294,11 @@ func TestJobsDeleteCommand_StructureAndHelp(t *testing.T) {
 }
 
 func TestAutostartCommand_CLI(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
 	cmd := cli.NewRootCmd()
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
@@ -1325,6 +1332,11 @@ func TestAutostartCommand_CLI(t *testing.T) {
 }
 
 func TestDoctorCommand_AutostartDisplay(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
 	tmpDir := t.TempDir()
 	confPath := filepath.Join(tmpDir, "config.yaml")
 
