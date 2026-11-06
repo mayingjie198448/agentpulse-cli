@@ -1,11 +1,14 @@
 package config_test
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 )
@@ -233,4 +236,160 @@ func TestResolveAgentBinary(t *testing.T) {
 	if !strings.Contains(res, "ls") {
 		t.Errorf("expected 'ls' to resolve to PATH, got %q", res)
 	}
+}
+
+func TestHasAgyModelEvidence(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected bool
+	}{
+		{
+			name:     "contains gemini model",
+			output:   "gemini-3.8-flash-high  Gemini 3.8 Flash (High)",
+			expected: true,
+		},
+		{
+			name:     "contains claude model",
+			output:   "claude-sonnet-4-6      Claude Sonnet 4.6 (Thinking)",
+			expected: true,
+		},
+		{
+			name: "spinner with models and storage notice",
+			output: "Using file-based token storage because SSH session detected\n" +
+				"⠋ Fetching available models...\n" +
+				"gemini-3.8-flash-high  Gemini 3.8 Flash (High)\n" +
+				"gpt-oss-120b-medium    GPT-OSS 120B (Medium)\n",
+			expected: true,
+		},
+		{
+			name:     "arbitrary two column model entry",
+			output:   "deepseek-v3   DeepSeek V3",
+			expected: true,
+		},
+		{
+			name:     "empty string",
+			output:   "",
+			expected: false,
+		},
+		{
+			name:     "only storage notice",
+			output:   "Using file-based token storage because SSH session detected",
+			expected: false,
+		},
+		{
+			name:     "only spinner line",
+			output:   "⠋ Fetching available models...",
+			expected: false,
+		},
+		{
+			name:     "error line",
+			output:   "Error: failed to connect",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := config.HasAgyModelEvidence(tt.output)
+			if got != tt.expected {
+				t.Errorf("HasAgyModelEvidence(%q) = %v, want %v", tt.output, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestProbeAgyAuth(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script mock test on windows")
+	}
+
+	createMockScript := func(t *testing.T, content string) string {
+		tmpDir := t.TempDir()
+		scriptPath := filepath.Join(tmpDir, "mock-agy")
+		script := fmt.Sprintf("#!/bin/sh\n%s\n", content)
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write mock script: %v", err)
+		}
+		return scriptPath
+	}
+
+	t.Run("explicit success with model list reports ready", func(t *testing.T) {
+		bin := createMockScript(t, `echo "gemini-3.8-flash-high Gemini 3.8 Flash (High)"; exit 0`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if !ok {
+			t.Errorf("expected ok=true, got ok=false, detail=%q", detail)
+		}
+		if detail != "已登录就绪" {
+			t.Errorf("expected detail '已登录就绪', got %q", detail)
+		}
+	})
+
+	t.Run("unauthenticated error output reports not logged in", func(t *testing.T) {
+		bin := createMockScript(t, `echo "Please sign in to view available models"; exit 1`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if ok {
+			t.Errorf("expected ok=false for unauthenticated, got ok=true")
+		}
+		if !strings.Contains(detail, "未登录") {
+			t.Errorf("expected detail mentioning 未登录, got %q", detail)
+		}
+	})
+
+	t.Run("token source error output reports not logged in", func(t *testing.T) {
+		bin := createMockScript(t, `echo "error getting token source: You are not logged into Antigravity."; exit 1`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if ok {
+			t.Errorf("expected ok=false for token source error, got ok=true")
+		}
+		if !strings.Contains(detail, "未登录") {
+			t.Errorf("expected detail mentioning 未登录, got %q", detail)
+		}
+	})
+
+	t.Run("timeout reports probe timeout rather than ready", func(t *testing.T) {
+		bin := createMockScript(t, `sleep 1; exit 0`)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		ok, detail := config.ProbeAgyAuthContext(ctx, bin)
+		if ok {
+			t.Errorf("expected ok=false for timeout, got ok=true (fake ready bug)")
+		}
+		if !strings.Contains(detail, "超时") {
+			t.Errorf("expected detail mentioning 超时, got %q", detail)
+		}
+	})
+
+	t.Run("non-zero exit failure reports probe failure rather than ready", func(t *testing.T) {
+		bin := createMockScript(t, `echo "connection reset by peer"; exit 2`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if ok {
+			t.Errorf("expected ok=false for command failure, got ok=true (fake ready bug)")
+		}
+		if !strings.Contains(detail, "探测失败") {
+			t.Errorf("expected detail mentioning 探测失败, got %q", detail)
+		}
+	})
+
+	t.Run("storage notice alone without models reports unknown output rather than ready", func(t *testing.T) {
+		bin := createMockScript(t, `echo "Using file-based token storage because SSH session detected"; exit 0`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if ok {
+			t.Errorf("expected ok=false for storage notice alone, got ok=true")
+		}
+		if !strings.Contains(detail, "未知输出") {
+			t.Errorf("expected detail mentioning 未知输出, got %q", detail)
+		}
+	})
+
+	t.Run("empty output reports unknown output rather than ready", func(t *testing.T) {
+		bin := createMockScript(t, `exit 0`)
+		ok, detail := config.ProbeAgyAuth(bin)
+		if ok {
+			t.Errorf("expected ok=false for empty output, got ok=true")
+		}
+		if !strings.Contains(detail, "未知输出") {
+			t.Errorf("expected detail mentioning 未知输出, got %q", detail)
+		}
+	})
 }

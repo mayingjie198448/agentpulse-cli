@@ -1096,9 +1096,10 @@ func TestIsUnauthenticatedOutput(t *testing.T) {
 		"Please sign in to view available models",
 		"Authentication required. Please visit the URL to log in",
 		"Waiting for authentication...",
+		"Waiting for authentication (timeout 60s)...",
 		"Paste the authorization code here and press Enter",
+		"Then paste the authorization code, or the full URL of the page you land on, and press Enter:",
 		"Print mode: not logged in and no controlling terminal; cannot complete interactive login",
-		"Using file-based token storage because SSH session detected",
 		"you are not logged into Antigravity",
 	}
 
@@ -1108,21 +1109,30 @@ func TestIsUnauthenticatedOutput(t *testing.T) {
 			t.Errorf("expected %q to be detected as unauthenticated", line)
 		}
 		if !strings.Contains(reason, "未登录") {
-			t.Errorf("expected Chinese reason, got %q", reason)
+			t.Errorf("expected Chinese reason containing '未登录', got %q", reason)
 		}
 	}
 
+	// Normal informational notices and common model text that must NOT trigger auth failure
 	normalLines := []string{
 		"Starting language server process with pid 12345",
 		"Language server version: 1.5.1",
 		"gemini-3.8-flash-high Gemini 3.8 Flash (High)",
 		"Executing tool: git status",
+		"Using file-based token storage because SSH session detected",
+		"Using file-based token storage because a keyring timeout was recorded within the last 10m",
+		"HTTP 401: Authentication required",
+		"// Note: authentication required for this route",
+		"Please sign in to our web portal to manage subscription",
+		"<button onClick={login}>Please sign in</button>",
+		"you are not logged into the external database",
+		"State: waiting for authentication response from server",
 	}
 
 	for _, line := range normalLines {
-		isUnauth, _ := wrapper.IsUnauthenticatedOutput(line)
+		isUnauth, reason := wrapper.IsUnauthenticatedOutput(line)
 		if isUnauth {
-			t.Errorf("expected %q to NOT be detected as unauthenticated", line)
+			t.Errorf("expected %q to NOT be detected as unauthenticated, got reason: %s", line, reason)
 		}
 	}
 }
@@ -1160,5 +1170,31 @@ func TestWrapper_AuthFailure_FastFails(t *testing.T) {
 	}
 	if w.Job().Status != model.StatusFailed {
 		t.Errorf("expected job status %s, got %s", model.StatusFailed, w.Job().Status)
+	}
+}
+
+func TestWrapper_StorageNotice_DoesNotFail(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	// Storage notice should NOT trigger fast failure or error out
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "test-mac",
+		StatusFile: statusFile,
+		Args: []string{
+			"sh", "-c",
+			`echo "Using file-based token storage because SSH session detected"; echo "Task completed"`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	runErr := w.Run(context.Background())
+	if runErr != nil {
+		t.Fatalf("expected storage notice to succeed, got error: %v", runErr)
+	}
+	if w.Job().Status != model.StatusDone {
+		t.Errorf("expected job status %s, got %s", model.StatusDone, w.Job().Status)
 	}
 }

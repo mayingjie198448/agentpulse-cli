@@ -15,9 +15,18 @@ import (
 
 // Config represents the AgentPulse v1 configuration stored in ~/.config/agentpulse/config.yaml.
 type Config struct {
-	Version           int           `yaml:"version"`
-	MachineID         string        `yaml:"machine_id"`
-	Rev               int           `yaml:"rev,omitempty"`
+	Version   int    `yaml:"version"`
+	MachineID string `yaml:"machine_id"`
+	Rev       int    `yaml:"rev,omitempty"`
+	// MaxConcurrentJobs specifies the maximum number of AI agent jobs that can execute
+	// concurrently on this machine (default: 1 for safe serial execution).
+	//
+	// Working Directory (cwd / worktree) & Resource Isolation Warning:
+	// When MaxConcurrentJobs > 1, multiple agent processes may run simultaneously.
+	// If multiple concurrent jobs are dispatched to the same working directory (cwd),
+	// they may collide on git index locks, conflicting file edits, or test artifacts.
+	// Users and callers should ensure each concurrent job runs in an isolated workspace
+	// (e.g. dedicated git worktree) and that the host has sufficient CPU, RAM, and model API quota.
 	MaxConcurrentJobs int           `yaml:"max_concurrent_jobs,omitempty"`
 	Broker            BrokerConfig  `yaml:"broker"`
 	Agents            []AgentConfig `yaml:"agents"`
@@ -234,12 +243,46 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 	return st
 }
 
+// HasAgyModelEvidence checks whether output contains concrete evidence of available models.
+func HasAgyModelEvidence(output string) bool {
+	lower := strings.ToLower(output)
+	if strings.Contains(lower, "gemini") ||
+		strings.Contains(lower, "claude") ||
+		strings.Contains(lower, "gpt") ||
+		strings.Contains(lower, "sonnet") ||
+		strings.Contains(lower, "opus") ||
+		strings.Contains(lower, "flash") {
+		return true
+	}
+
+	// Also check if any non-spinner, non-storage line looks like a model entry
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" ||
+			strings.Contains(line, "Fetching available models") ||
+			strings.Contains(strings.ToLower(line), "using file-based token storage") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "-") && !strings.HasPrefix(fields[0], "Error") {
+			return true
+		}
+	}
+	return false
+}
+
 // ProbeAgyAuth probes whether agy is authenticated for non-interactive execution.
 // It executes 'agy models' with SSH session variables stripped and a short timeout.
+// Unknown output, execution failure, or timeout must NOT report ready; only explicit
+// login success evidence reports ready.
 func ProbeAgyAuth(binPath string) (bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	return ProbeAgyAuthContext(ctx, binPath)
+}
 
+// ProbeAgyAuthContext probes whether agy is authenticated within the provided context.
+func ProbeAgyAuthContext(ctx context.Context, binPath string) (bool, string) {
 	cmd := exec.CommandContext(ctx, binPath, "models")
 	cmd.Env = FilterChildProcessEnv(os.Environ())
 
@@ -247,18 +290,39 @@ func ProbeAgyAuth(binPath string) (bool, string) {
 	outStr := strings.TrimSpace(string(output))
 	lower := strings.ToLower(outStr)
 
+	// Explicit auth failure detection
 	if strings.Contains(lower, "please sign in") ||
 		strings.Contains(lower, "not logged into antigravity") ||
 		strings.Contains(lower, "error getting token source") ||
-		strings.Contains(lower, "authentication required") {
+		strings.Contains(lower, "authentication required") ||
+		strings.Contains(lower, "not logged in and no controlling terminal") ||
+		strings.Contains(lower, "paste the authorization code") {
 		return false, "未登录 (需执行 'agy' 完成登录认证)"
 	}
 
+	if ctx.Err() == context.DeadlineExceeded {
+		return false, "探测超时 (执行 'agy models' 超时，无法确认登录态)"
+	}
+
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return true, "就绪 (在线测活超时)"
+		errDetail := outStr
+		if errDetail == "" {
+			errDetail = err.Error()
+		} else {
+			// Extract the first meaningful error line
+			for _, l := range strings.Split(errDetail, "\n") {
+				l = strings.TrimSpace(l)
+				if l != "" && !strings.Contains(strings.ToLower(l), "using file-based token storage") {
+					errDetail = l
+					break
+				}
+			}
 		}
-		return true, "就绪"
+		return false, fmt.Sprintf("探测失败 (%s)", errDetail)
+	}
+
+	if !HasAgyModelEvidence(outStr) {
+		return false, "未知输出 (未检测到可用模型列表，无法确认登录态)"
 	}
 
 	return true, "已登录就绪"

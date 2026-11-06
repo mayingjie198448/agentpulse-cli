@@ -479,19 +479,59 @@ func (w *Wrapper) runStub(ctx context.Context) error {
 
 // IsUnauthenticatedOutput detects output emitted when an agent CLI (e.g. agy) is unauthenticated
 // or blocked waiting for interactive OAuth approval in a non-interactive session.
+// Informational notices (such as using file-based token storage) and ordinary model/code outputs
+// are carefully distinguished to avoid false-positive kills.
 func IsUnauthenticatedOutput(line string) (bool, string) {
-	lower := strings.ToLower(line)
-	if strings.Contains(lower, "not logged into antigravity") ||
-		strings.Contains(lower, "error getting token source") ||
-		strings.Contains(lower, "please sign in") ||
-		strings.Contains(lower, "authentication required") ||
-		strings.Contains(lower, "waiting for authentication") ||
-		strings.Contains(lower, "paste the authorization code here") ||
-		strings.Contains(lower, "not logged in and no controlling terminal") ||
-		strings.Contains(lower, "using file-based token storage because ssh session detected") ||
-		strings.Contains(lower, "you are not logged into") {
-		return true, "Agent CLI 未登录认证 (检测到 'Authentication required / 未登录'，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+
+	// Explicitly ignore benign informational token storage notices
+	if strings.Contains(lower, "using file-based token storage") {
+		return false, ""
 	}
+
+	// 1. Antigravity specific unauthenticated errors
+	if strings.Contains(lower, "not logged into antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到 'Not logged into Antigravity'，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 2. Token source retrieval failure
+	if strings.Contains(lower, "error getting token source") || strings.Contains(lower, "failed to get token source") {
+		return true, "Agent CLI 未登录认证 (检测到 'error getting token source'，凭据源不可用，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 3. Headless non-interactive session cannot complete login
+	if strings.Contains(lower, "not logged in and no controlling terminal") {
+		return true, "Agent CLI 未登录认证 (检测到非交互终端无法完成登录，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 4. Interactive OAuth prompts blocking the process waiting for user input
+	if strings.Contains(lower, "paste the authorization code") ||
+		strings.Contains(lower, "copy the code displayed in the browser and paste it below") {
+		return true, "Agent CLI 未登录认证 (等待网页授权输入，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+	if strings.HasPrefix(lower, "waiting for authentication") ||
+		strings.Contains(lower, "waiting for authentication...") ||
+		strings.Contains(lower, "waiting for authentication (") {
+		return true, "Agent CLI 未登录认证 (等待网页授权，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 5. Explicit sign-in prompts for agy
+	if strings.Contains(lower, "please sign in to view available models") ||
+		strings.Contains(lower, "please sign in to antigravity") ||
+		strings.Contains(lower, "sign in to antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到需登录提示，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 6. Tightened "authentication required" prompt with URL / visit directive
+	if strings.Contains(lower, "authentication required") &&
+		(strings.Contains(lower, "visit the url") ||
+			strings.Contains(lower, "please visit") ||
+			strings.Contains(lower, "browser") ||
+			strings.Contains(lower, "antigravity")) {
+		return true, "Agent CLI 未登录认证 (检测到 'Authentication required'，请先在目标节点运行 'agy' 登录)"
+	}
+
 	return false, ""
 }
 
