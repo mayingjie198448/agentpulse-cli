@@ -39,13 +39,20 @@ type ListenerConfig struct {
 	OnJobComplete              func(job model.Job, err error)
 
 	// Bare agent process attach options
-	DisableBareAttach  bool
-	AttachScanInterval time.Duration
-	Agents             []config.AgentConfig
-	ProcessLister      ProcessLister
-	IsProcessAlive     func(pid int) bool
-	AgyLogDir          string
-	OpenCodeLogDir     string
+	DisableBareAttach      bool
+	AttachScanInterval     time.Duration
+	Agents                 []config.AgentConfig
+	ProcessLister          ProcessLister
+	IsProcessAlive         func(pid int) bool
+	ProcessExitChecker     func(pid int) (exitCode int, ok bool)
+	ReliableSuccessChecker func(pid int) bool
+	PIDAllowlist           []int
+	PIDFilter              func(pid int) bool
+	AgyLogDir              string
+	AgyBrainDir            string
+	OpenCodeLogDir         string
+	StartTimeResolver      func(pid int) time.Time
+	CwdResolver            func(pid int) string
 }
 
 var jobIDRegex = regexp.MustCompile(`"job_id"\s*:\s*"([^"]+)"`)
@@ -181,17 +188,24 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		}
 
 		attachCfg := AttachManagerConfig{
-			MachineID:      cfg.MachineID,
-			Agents:         agents,
-			ScanInterval:   cfg.AttachScanInterval,
-			ProcessLister:  cfg.ProcessLister,
-			IsProcessAlive: cfg.IsProcessAlive,
-			AgyLogDir:      cfg.AgyLogDir,
-			OpenCodeLogDir: cfg.OpenCodeLogDir,
-			StatusFile:     cfg.StatusFile,
-			Quiet:          cfg.Quiet,
-			Stdout:         cfg.Stdout,
-			Stderr:         cfg.Stderr,
+			MachineID:              cfg.MachineID,
+			Agents:                 agents,
+			ScanInterval:           cfg.AttachScanInterval,
+			ProcessLister:          cfg.ProcessLister,
+			IsProcessAlive:         cfg.IsProcessAlive,
+			ProcessExitChecker:     cfg.ProcessExitChecker,
+			ReliableSuccessChecker: cfg.ReliableSuccessChecker,
+			PIDAllowlist:           cfg.PIDAllowlist,
+			PIDFilter:              cfg.PIDFilter,
+			AgyLogDir:              cfg.AgyLogDir,
+			AgyBrainDir:            cfg.AgyBrainDir,
+			OpenCodeLogDir:         cfg.OpenCodeLogDir,
+			StatusFile:             cfg.StatusFile,
+			Quiet:                  cfg.Quiet,
+			Stdout:                 cfg.Stdout,
+			Stderr:                 cfg.Stderr,
+			StartTimeResolver:      cfg.StartTimeResolver,
+			CwdResolver:            cfg.CwdResolver,
 			IsDispatchPID: func(pid int) bool {
 				l.pidsMu.Lock()
 				defer l.pidsMu.Unlock()
