@@ -178,3 +178,97 @@ func TestJob_NeedsAttention(t *testing.T) {
 		})
 	}
 }
+
+func TestJob_ExtendedFieldsAndJSON(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	ended := now.Add(45 * time.Minute)
+
+	j := model.Job{
+		ID:          "job-test-001",
+		MachineID:   "mac-studio",
+		Engine:      model.EngineAgy,
+		Status:      model.StatusDone,
+		Progress:    100.0,
+		Cwd:         "/Users/mayingjie/Repos/agentpulse-cli",
+		Command:     "agy run --prompt 'refactor store'",
+		Title:       "Refactor store layer",
+		Repo:        "mayingjie198448/agentpulse-cli",
+		Project:     "agentpulse-cli",
+		Prompt:      "Refactor store layer for MQTT integration",
+		StartedAt:   now,
+		UpdatedAt:   ended,
+		EndedAt:     ended,
+		DurationStr: "45m 0s",
+		RequestedBy: "mayingjie@mac-studio",
+		Error:       "",
+	}
+
+	if j.RepoOrProject() != "mayingjie198448/agentpulse-cli" {
+		t.Errorf("expected repo 'mayingjie198448/agentpulse-cli', got %q", j.RepoOrProject())
+	}
+	if j.DisplayTitle() != "Refactor store layer" {
+		t.Errorf("expected title 'Refactor store layer', got %q", j.DisplayTitle())
+	}
+
+	jOnlyProj := model.Job{Project: "subproject"}
+	if jOnlyProj.RepoOrProject() != "subproject" {
+		t.Errorf("expected project fallback 'subproject', got %q", jOnlyProj.RepoOrProject())
+	}
+
+	jNoTitle := model.Job{ID: "job-fallback-id"}
+	if jNoTitle.DisplayTitle() != "job-fallback-id" {
+		t.Errorf("expected ID fallback 'job-fallback-id', got %q", jNoTitle.DisplayTitle())
+	}
+
+	data, err := json.Marshal(j)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var decoded model.Job
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if decoded.Repo != j.Repo || decoded.Project != j.Project || decoded.Prompt != j.Prompt {
+		t.Errorf("decoded fields mismatch: repo=%q project=%q prompt=%q", decoded.Repo, decoded.Project, decoded.Prompt)
+	}
+	if decoded.RequestedBy != j.RequestedBy || !decoded.EndedAt.Equal(j.EndedAt) {
+		t.Errorf("decoded meta mismatch: requested_by=%q ended_at=%v", decoded.RequestedBy, decoded.EndedAt)
+	}
+}
+
+func TestJob_BackwardCompatibility(t *testing.T) {
+	// Legacy JSON payload from v0.7.0 without repo, project, prompt, ended_at, requested_by
+	legacyJSON := `{
+		"id": "job-legacy-001",
+		"machine_id": "mac-node",
+		"engine": "agy",
+		"status": "running",
+		"progress": 55.0,
+		"cwd": "/tmp",
+		"command": "agy",
+		"title": "Legacy Job",
+		"started_at": "2026-11-06T10:00:00Z",
+		"updated_at": "2026-11-06T10:05:00Z"
+	}`
+
+	var j model.Job
+	if err := json.Unmarshal([]byte(legacyJSON), &j); err != nil {
+		t.Fatalf("failed to unmarshal legacy job JSON: %v", err)
+	}
+
+	if j.ID != "job-legacy-001" || j.Title != "Legacy Job" {
+		t.Errorf("unexpected legacy job fields: %+v", j)
+	}
+	if j.Repo != "" || j.Project != "" || j.Prompt != "" || j.RequestedBy != "" {
+		t.Errorf("expected omitted extended fields to be empty, got repo=%q proj=%q prompt=%q req=%q",
+			j.Repo, j.Project, j.Prompt, j.RequestedBy)
+	}
+	if !j.EndedAt.IsZero() {
+		t.Errorf("expected ended_at to be zero for running legacy job, got %v", j.EndedAt)
+	}
+	if j.RepoOrProject() != "" {
+		t.Errorf("expected empty RepoOrProject(), got %q", j.RepoOrProject())
+	}
+}

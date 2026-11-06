@@ -56,3 +56,14 @@ func (m *Model) DeleteErrorForTest() string {
 func (m *Model) RefreshErrorForTest() string {
 	return m.refreshError
 }
+
+// GroupingForTest returns the current grouping mode for test assertions.
+func (m *Model) GroupingForTest() JobGrouping {
+	return m.grouping
+}
+
+// SetGroupingForTest sets the grouping mode for test assertions.
+func (m *Model) SetGroupingForTest(g JobGrouping) {
+	m.grouping = g
+	m.applyGrouping()
+}
