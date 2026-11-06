@@ -178,8 +178,35 @@ func SaveConfig(path string, cfg *Config) error {
 	return nil
 }
 
+// IsAgyAgent determines whether the given agent config or resolved binary represents agy.
+func IsAgyAgent(ag AgentConfig, resolvedPath string) bool {
+	if strings.EqualFold(ag.ID, "agy") {
+		return true
+	}
+	for _, alias := range ag.Alias {
+		if strings.EqualFold(alias, "agy") {
+			return true
+		}
+	}
+	if resolvedPath != "" {
+		base := filepath.Base(resolvedPath)
+		baseNoExt := strings.TrimSuffix(strings.ToLower(base), ".exe")
+		if baseNoExt == "agy" {
+			return true
+		}
+	}
+	return false
+}
+
 // ProbeAgent probes whether the given agent CLI executable is available.
 func ProbeAgent(ag AgentConfig) AgentStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return ProbeAgentContext(ctx, ag)
+}
+
+// ProbeAgentContext probes whether the given agent CLI executable is available within the provided context.
+func ProbeAgentContext(ctx context.Context, ag AgentConfig) AgentStatus {
 	st := AgentStatus{
 		ID:    ag.ID,
 		Alias: ag.Alias,
@@ -192,33 +219,32 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 		return st
 	}
 
-	// If explicit path configured
+	// 1. Resolve executable binary path
 	if ag.Path != "" {
 		resolved, err := exec.LookPath(ag.Path)
-		if err == nil {
-			st.Ok = true
-			st.ResolvedPath = resolved
-			st.Detail = resolved
-		} else {
+		if err != nil {
 			st.Ok = false
 			st.Detail = fmt.Sprintf("指定路径不可用: %v", err)
+			return st
 		}
-		return st
-	}
-
-	// If path is empty: search PATH by id, then by primary alias
-	if p, err := exec.LookPath(ag.ID); err == nil {
 		st.Ok = true
-		st.ResolvedPath = p
-		st.Detail = p
+		st.ResolvedPath = resolved
+		st.Detail = resolved
 	} else {
-		for _, alias := range ag.Alias {
-			if alias != "" && alias != ag.ID {
-				if p, err := exec.LookPath(alias); err == nil {
-					st.Ok = true
-					st.ResolvedPath = p
-					st.Detail = p
-					break
+		// If path is empty: search PATH by id, then by primary alias
+		if p, err := exec.LookPath(ag.ID); err == nil {
+			st.Ok = true
+			st.ResolvedPath = p
+			st.Detail = p
+		} else {
+			for _, alias := range ag.Alias {
+				if alias != "" && alias != ag.ID {
+					if p, err := exec.LookPath(alias); err == nil {
+						st.Ok = true
+						st.ResolvedPath = p
+						st.Detail = p
+						break
+					}
 				}
 			}
 		}
@@ -229,9 +255,10 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 		return st
 	}
 
-	// For agy, probe whether it is logged in and ready for non-interactive execution
-	if filepath.Base(st.ResolvedPath) == "agy" || ag.ID == "agy" {
-		authOk, detail := ProbeAgyAuth(st.ResolvedPath)
+	// 2. For agy (or agents requiring authentication), probe whether it is logged in and ready for execution.
+	// Unified across PATH, alias, and explicit path configurations.
+	if IsAgyAgent(ag, st.ResolvedPath) {
+		authOk, detail := ProbeAgyAuthContext(ctx, st.ResolvedPath)
 		if !authOk {
 			st.Ok = false
 			st.Detail = detail
@@ -243,32 +270,178 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 	return st
 }
 
+// Recognized model families and identifiers for agy model evidence.
+var recognizedModelKeywords = []string{
+	"gemini",
+	"claude",
+	"gpt",
+	"sonnet",
+	"opus",
+	"flash",
+	"deepseek",
+	"llama",
+	"mistral",
+	"qwen",
+	"codex",
+	"command-r",
+	"grok",
+	"minimax",
+	"o1-",
+	"o3-",
+	"o1/",
+	"o3/",
+	"o1_",
+	"o3_",
+}
+
 // HasAgyModelEvidence checks whether output contains concrete evidence of available models.
+// It abolishes the naive "any two words is a model" heuristic and requires explicit model
+// family evidence or a recognized structured model entry format.
+// Plain two-word or multi-word sentences (e.g. "service temporarily unavailable", "hello world")
+// must NOT report ready.
 func HasAgyModelEvidence(output string) bool {
-	lower := strings.ToLower(output)
-	if strings.Contains(lower, "gemini") ||
-		strings.Contains(lower, "claude") ||
-		strings.Contains(lower, "gpt") ||
-		strings.Contains(lower, "sonnet") ||
-		strings.Contains(lower, "opus") ||
-		strings.Contains(lower, "flash") {
-		return true
+	if strings.TrimSpace(output) == "" {
+		return false
 	}
 
-	// Also check if any non-spinner, non-storage line looks like a model entry
-	for _, rawLine := range strings.Split(output, "\n") {
+	lines := strings.Split(output, "\n")
+	for _, rawLine := range lines {
 		line := strings.TrimSpace(rawLine)
-		if line == "" ||
-			strings.Contains(line, "Fetching available models") ||
-			strings.Contains(strings.ToLower(line), "using file-based token storage") {
+		if line == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "-") && !strings.HasPrefix(fields[0], "Error") {
+
+		lower := strings.ToLower(line)
+
+		// Filter out noise / storage notice / spinner / info lines
+		if strings.Contains(lower, "using file-based token storage") ||
+			strings.Contains(lower, "fetching available models") ||
+			strings.Contains(lower, "fetching models") ||
+			strings.Contains(lower, "loading models") {
+			continue
+		}
+
+		// Filter out error, warning, fatal, usage prefixes
+		if strings.HasPrefix(lower, "error") ||
+			strings.HasPrefix(lower, "err:") ||
+			strings.HasPrefix(lower, "fatal") ||
+			strings.HasPrefix(lower, "warning") ||
+			strings.HasPrefix(lower, "warn:") ||
+			strings.HasPrefix(lower, "info:") ||
+			strings.HasPrefix(lower, "usage:") ||
+			strings.HasPrefix(lower, "[error]") ||
+			strings.HasPrefix(lower, "[warn]") {
+			continue
+		}
+
+		// Filter out common HTTP / server / network error phrases
+		if strings.Contains(lower, "service temporarily unavailable") ||
+			strings.Contains(lower, "service unavailable") ||
+			strings.Contains(lower, "temporarily unavailable") ||
+			strings.Contains(lower, "bad gateway") ||
+			strings.Contains(lower, "gateway timeout") ||
+			strings.Contains(lower, "internal server error") ||
+			strings.Contains(lower, "connection refused") ||
+			strings.Contains(lower, "connection reset") ||
+			strings.Contains(lower, "network unreachable") ||
+			strings.Contains(lower, "unexpected eof") ||
+			strings.Contains(lower, "rate limit exceeded") ||
+			strings.Contains(lower, "request timeout") ||
+			strings.Contains(lower, "permission denied") ||
+			strings.Contains(lower, "unauthorized") ||
+			strings.Contains(lower, "not logged into") ||
+			strings.Contains(lower, "please sign in") ||
+			strings.Contains(lower, "authentication required") {
+			continue
+		}
+
+		// Check for recognized AI model families / keywords
+		if isRecognizedModelLine(lower, line) {
+			return true
+		}
+
+		// Check for structured technical model ID entry (e.g. "custom-model-v1 Custom Model")
+		if isStructuredModelEntry(line) {
 			return true
 		}
 	}
+
 	return false
+}
+
+func isRecognizedModelLine(lower, rawLine string) bool {
+	matchedKeyword := false
+	for _, kw := range recognizedModelKeywords {
+		if strings.Contains(lower, kw) {
+			matchedKeyword = true
+			break
+		}
+	}
+	if !matchedKeyword {
+		return false
+	}
+
+	clean := strings.TrimPrefix(rawLine, "- ")
+	clean = strings.TrimPrefix(clean, "* ")
+	fields := strings.Fields(clean)
+	if len(fields) == 0 {
+		return false
+	}
+
+	// Sentence words indicating failure / absence / status rather than a model listing
+	sentenceStopWords := []string{
+		"failed", "cannot", "could", "unable", "not", "no", "error", "please",
+		"connect", "connection", "available", "found", "timeout", "server", "service",
+	}
+	firstWordLower := strings.ToLower(fields[0])
+	for _, stop := range sentenceStopWords {
+		if firstWordLower == stop {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isStructuredModelEntry(rawLine string) bool {
+	clean := strings.TrimPrefix(rawLine, "- ")
+	clean = strings.TrimPrefix(clean, "* ")
+	fields := strings.Fields(clean)
+	// Must have at least 2 columns
+	if len(fields) < 2 {
+		return false
+	}
+
+	id := fields[0]
+
+	// Must contain technical model ID delimiters: hyphen, slash, or colon
+	if !strings.ContainsAny(id, "-/:") {
+		return false
+	}
+
+	// Must contain digits or explicit version marker (e.g. "-v1", "7b", "120b", "3.8")
+	hasVersion := strings.ContainsAny(id, "0123456789") ||
+		strings.Contains(strings.ToLower(id), "-v") ||
+		strings.Contains(strings.ToLower(id), "preview") ||
+		strings.Contains(strings.ToLower(id), "latest")
+
+	if !hasVersion {
+		return false
+	}
+
+	// The first column must NOT be a common English word or sentence fragment
+	commonProse := []string{
+		"service", "server", "system", "client", "request", "response",
+		"message", "status", "notice", "warning", "error", "failed",
+	}
+	idLower := strings.ToLower(id)
+	for _, word := range commonProse {
+		if strings.HasPrefix(idLower, word) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ProbeAgyAuth probes whether agy is authenticated for non-interactive execution.
@@ -293,14 +466,17 @@ func ProbeAgyAuthContext(ctx context.Context, binPath string) (bool, string) {
 	// Explicit auth failure detection
 	if strings.Contains(lower, "please sign in") ||
 		strings.Contains(lower, "not logged into antigravity") ||
+		strings.Contains(lower, "not logged into") ||
 		strings.Contains(lower, "error getting token source") ||
 		strings.Contains(lower, "authentication required") ||
 		strings.Contains(lower, "not logged in and no controlling terminal") ||
-		strings.Contains(lower, "paste the authorization code") {
+		strings.Contains(lower, "paste the authorization code") ||
+		strings.Contains(lower, "login required") ||
+		strings.Contains(lower, "unauthenticated") {
 		return false, "未登录 (需执行 'agy' 完成登录认证)"
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
 		return false, "探测超时 (执行 'agy models' 超时，无法确认登录态)"
 	}
 
@@ -330,9 +506,16 @@ func ProbeAgyAuthContext(ctx context.Context, binPath string) (bool, string) {
 
 // ProbeAgents probes a list of agent configs.
 func ProbeAgents(agents []AgentConfig) []AgentStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return ProbeAgentsContext(ctx, agents)
+}
+
+// ProbeAgentsContext probes a list of agent configs within the provided context.
+func ProbeAgentsContext(ctx context.Context, agents []AgentConfig) []AgentStatus {
 	statuses := make([]AgentStatus, len(agents))
 	for i, ag := range agents {
-		statuses[i] = ProbeAgent(ag)
+		statuses[i] = ProbeAgentContext(ctx, ag)
 	}
 	return statuses
 }

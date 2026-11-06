@@ -774,4 +774,3 @@ func TestTUIModel_DeleteJobFlow(t *testing.T) {
 		t.Fatalf("expected 'No active jobs' when all jobs deleted, got:\n%s", v)
 	}
 }
-

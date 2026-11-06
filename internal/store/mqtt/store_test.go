@@ -910,4 +910,3 @@ func TestMQTTStore_TombstoneClearsJob(t *testing.T) {
 		t.Fatalf("expected job-ext-01 to be removed after tombstone, but still exists")
 	}
 }
-

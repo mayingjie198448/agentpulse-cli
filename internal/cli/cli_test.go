@@ -2,8 +2,11 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +162,112 @@ func TestDoctorCommand_Output(t *testing.T) {
 		out := buf.String()
 		if !strings.Contains(out, "[-] test-disabled") {
 			t.Errorf("expected disabled agent marker '[-] test-disabled', got: %s", out)
+		}
+	})
+}
+
+func TestDoctorCommand_ExplicitPath_Regressions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script mock test on windows")
+	}
+
+	createMockScript := func(t *testing.T, content string) string {
+		tmpDir := t.TempDir()
+		scriptPath := filepath.Join(tmpDir, "mock-agy")
+		script := fmt.Sprintf("#!/bin/sh\n%s\n", content)
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write mock script: %v", err)
+		}
+		return scriptPath
+	}
+
+	runDoctorWithAgentPath := func(t *testing.T, binPath string) string {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "config.yaml")
+		cfg := &config.Config{
+			Version:   1,
+			MachineID: "test-doctor-node",
+			Broker: config.BrokerConfig{
+				URL: "tcp://127.0.0.1:18833",
+			},
+			Agents: []config.AgentConfig{
+				{
+					ID:    "agy",
+					Alias: []string{"agy"},
+					Path:  binPath,
+				},
+			},
+		}
+		_ = config.SaveConfig(cfgPath, cfg)
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--config", cfgPath})
+
+		_ = cmd.Execute()
+		return buf.String()
+	}
+
+	t.Run("explicit path unauthenticated shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "Please sign in to view available models"; exit 1`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for unauthenticated explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for unauthenticated explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path error exit shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "connection reset by peer"; exit 2`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for error explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for error explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path timeout shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `sleep 1; exit 0`)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		// Also verify via ProbeAgentContext that timeout status is generated
+		st := config.ProbeAgentContext(ctx, config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("ProbeAgentContext must return Ok=false on timeout, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "超时") {
+			t.Errorf("expected detail mentioning 超时, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path unknown two-word output shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "service temporarily unavailable"; exit 0`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for unknown two-word explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for unknown two-word explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path valid model list shows [✓] agy", func(t *testing.T) {
+		bin := createMockScript(t, `echo "gemini-3.8-flash-high Gemini 3.8 Flash (High)"; exit 0`)
+		out := runDoctorWithAgentPath(t, bin)
+		if !strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must show [✓] agy for valid model explicit path, got:\n%s", out)
+		}
+		if strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must NOT show [✗] agy for valid model explicit path, got:\n%s", out)
 		}
 	})
 }

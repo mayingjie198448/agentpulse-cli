@@ -64,10 +64,10 @@ func generateTestCert(t *testing.T, isCA bool) (certPEM []byte, keyPEM []byte) {
 
 func TestConfig_TLSInferenceAndEndpoint(t *testing.T) {
 	tests := []struct {
-		name          string
-		cfg           mqtt.Config
-		wantTLS       bool
-		wantEndpoint  string
+		name         string
+		cfg          mqtt.Config
+		wantTLS      bool
+		wantEndpoint string
 	}{
 		{
 			name: "plain tcp url without tls",
