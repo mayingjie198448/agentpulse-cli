@@ -40,7 +40,12 @@
 - **生命周期跟踪**：
   - 发现存活进程：向 `agentpulse/v1/machines/{machine_id}/jobs/{job_id}/status` 发布 `status: "running"`, `progress: 0.0`（QoS 1, Retained true）；
   - 进程存活期间：维护心跳并实时刷新 `updated_at`；更新节点心跳的 `job_count`；
-  - 进程退出：探测到进程终止后，自动更新 `duration_str`，将状态标记为 `done`（或若检测到异常错误则标记为 `failed`），`progress: 100.0`，向 Broker 发布最终状态与 `agentpulse/v1/notifications/alerts` 告警。
+  - 进程退出：探测到进程终止后，自动更新 `duration_str`。严格执行可靠终态判定机制，禁止将不确定当成 `done`：
+    - 若能可靠判定退出码且退出码为 0（且日志流无异常错误），标记为 `done`，`progress: 100.0`；
+    - 若退出码非 0（例如 exit=7），坚决标记为 `failed`，在 `error` 字段载明非零退出码原因，且不将进度虚标为 100%；
+    - 若无法取得退出码且无可靠成功证据（非子进程、无退出码提供器或观测受限），按保守原则标记为 `failed`，在 `error` 字段说明「无法判定退出码（依据不足，非正常可观测退出）」；
+    - 若进程监控被外部中断或停止（如守护进程退出），标记为 `failed` 并说明被中断。
+    向 Broker 发布最终状态与 `agentpulse/v1/notifications/alerts` 告警。
 
 ### 2.3 日志与进度流捕获
 针对不同 Agent CLI 的原生日志机制，自动挂接器进行无侵入式流式追踪：
@@ -60,18 +65,28 @@
 | 维度 | 远程派发 (Dispatch) | 裸进程自动挂接 (Bare Attach) | 说明 |
 | :--- | :--- | :--- | :--- |
 | **能采到什么 (Collected)** | PID、退出码、完整的真实标准输出与错误输出 (stdout/stderr)、耗时、节点 IP | 真实 PID、完整命令行 (argv)、启动时间、运行时长、操作系统工作目录 (cwd)、Agent 引擎类型、日志流与进度 | 裸进程依靠系统进程表与 Agent 本地日志落地文件进行采集，保证基础监控与流式看流体验对齐 |
-| **猜什么 (Inferred)** | 无需猜测（全部由调度者指令显式定义） | **稳定 Job ID**（由 PID+启动时间生成）、**任务说明**（从 -p/--prompt 参数推断）、**工作目录**（通过 lsof/procfs 探测推断）、**完成状态**（依据进程退出与日志是否报错判定） | 裸进程不由 AgentPulse 创生，其元数据由挂接器在扫描时结合操作系统环境与参数进行确定性推断 |
+| **猜什么 (Inferred)** | 无需猜测（全部由调度者指令显式定义） | **稳定 Job ID**（由 PID+启动时间生成）、**任务说明**（从 -p/--prompt 参数推断）、**工作目录**（通过 lsof/procfs 探测推断）、**完成状态**（依据可靠退出码判定；无法判定或退出码≠0 则保守标记为 failed） | 裸进程不由 AgentPulse 创生，其元数据由挂接器在扫描时结合操作系统环境与参数进行确定性推断 |
 | **缺什么 (Missing)** | 无缺失 | **请求者身份 (`requested_by`)**（仅能标记为本地终端触发）、**超时控制 (`timeout_seconds`)**（不强杀用户本地进程）、**环境变量注入与 Worktree 隔离**（完全运行在用户原有 shell 环境中） | 裸挂接不替代 dispatch 的远程调度、权限控制与自动隔离能力，仅承担被动观测职责 |
 
 ---
 
-## 4. 安全与隔离约束
+## 4. 安全、隔离与依赖注入约束
 
+### 4.1 生产运行安全防护
 1. **绝对不误收无关进程**：白名单机制严格拦截非 Agent 命令，坚决不误收诸如 `grep agy`、`vim agy.go`、`go test` 或 `agentpulse` 自身。
 2. **绝对不污染/不修改用户工作区**：挂接器为纯只读观测者，不创建、不修改、不删除用户的任何代码目录或 worktree。
 3. **严格遵守配置启用开关**：只有在 `config.yaml` 中配置且 `enabled: true` 的 Agent CLI 才会被挂接；配置未启用的命令绝不上报。
 4. **与 Dispatch 严格去重**：Dispatch 派发的子进程在启动时直接注册至内部排除表，挂接器扫描到时自动忽略，保证不会产生两条重复任务。
 5. **支持显式关闭**：运行 `agentpulse listen --no-attach` 可按需完全禁用裸进程挂接功能。
+
+### 4.2 内部测试与隔离依赖注入 (Testing & Isolation Injection)
+为了避免自动化验收或集成测试在全局运行 `ps -A` 时扫描到开发机上其他并行编码进程的命令行与提示词（如宿主机正在运行的其他 `agy` 或 `opencode` 会话），系统提供全套内部依赖注入 Hook，同时保证默认生产扫描行为不变：
+1. **`ProcessLister`**：支持注入自定义进程列表枚举器，测试完全无需执行系统级 `ps -A`；
+2. **`PIDAllowlist` / 环境变量 `AGENTPULSE_ATTACH_PID_ALLOWLIST`**：限制挂接器仅关注指定的 PID 列表（如合成测试子进程 PID）。未在白名单中的进程在扫描最外层被立即过滤，绝不提取其命令行、提示词或环境变量；
+3. **`AgyLogDir` / `AgyBrainDir` / 环境变量 `AGENTPULSE_TEST_AGY_LOG_DIR`**：支持指定临时隔离的日志目录，彻底杜绝测试读取宿主机真实用户 `~/.gemini` 下的历史日志；
+4. **`OpenCodeLogDir` / 环境变量 `AGENTPULSE_TEST_OPENCODE_LOG_DIR`**：支持指定隔离的 OpenCode 测试日志目录；
+5. **`ProcessExitChecker`**：支持注入子进程退出码探测器，供受限合成测试精确校验 exit≠0（如 exit=7）或退出码无法判定时的终态转换；
+6. **`StartTimeResolver` / `CwdResolver`**：支持注入模拟启动时间与工作目录解析器，避免测试时触发宿主机 `lsof`。
 
 ---
 

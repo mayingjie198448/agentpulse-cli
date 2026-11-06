@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -293,15 +294,16 @@ func TestAttachManager_Lifecycle_Mock(t *testing.T) {
 	}
 
 	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
-		MachineID:        "test-mac-box",
-		MQTTClient:       mockClient,
-		Agents:           agents,
-		ScanInterval:     50 * time.Millisecond,
-		ProcessLister:    mockLister,
-		IsProcessAlive:   isAlive,
-		AgyLogDir:        logDir,
-		Quiet:            true,
-		OnJobCountChange: onCountChange,
+		MachineID:          "test-mac-box",
+		MQTTClient:         mockClient,
+		Agents:             agents,
+		ScanInterval:       50 * time.Millisecond,
+		ProcessLister:      mockLister,
+		IsProcessAlive:     isAlive,
+		ProcessExitChecker: func(pid int) (int, bool) { return 0, true },
+		AgyLogDir:          logDir,
+		Quiet:              true,
+		OnJobCountChange:   onCountChange,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -510,6 +512,7 @@ func TestListener_WithBareAttach(t *testing.T) {
 		AttachScanInterval: 40 * time.Millisecond,
 		ProcessLister:      mockLister,
 		IsProcessAlive:     isAlive,
+		ProcessExitChecker: func(pid int) (int, bool) { return 0, true },
 	})
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
@@ -578,4 +581,418 @@ func TestListener_WithBareAttach(t *testing.T) {
 	l.Stop()
 	cancel()
 	<-errCh
+}
+
+// TestAttachManager_ExitNonZero_MarkedFailed verifies that when a bare agent process exits
+// with a non-zero exit code (e.g. exit=7), AttachManager marks the job as FAILED (status != DONE)
+// and records the non-zero exit code in the Error field, preventing false positive completion.
+func TestAttachManager_ExitNonZero_MarkedFailed(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	logDir := filepath.Join(tmpDir, "log")
+	_ = os.MkdirAll(logDir, 0755)
+
+	testPID := 88801
+	var procAliveMu sync.Mutex
+	procAlive := true
+	isAlive := func(pid int) bool {
+		procAliveMu.Lock()
+		defer procAliveMu.Unlock()
+		return procAlive
+	}
+
+	startTime := time.Now().Add(-5 * time.Second).UTC()
+	mockProcs := []wrapper.ProcessInfo{
+		{
+			PID:       testPID,
+			PPID:      1,
+			StartTime: startTime,
+			Args:      []string{"agy", "-p", "Failing task simulation"},
+			Cwd:       "/tmp/project",
+		},
+	}
+
+	mockLister := func(ctx context.Context) ([]wrapper.ProcessInfo, error) {
+		procAliveMu.Lock()
+		alive := procAlive
+		procAliveMu.Unlock()
+		if alive {
+			return mockProcs, nil
+		}
+		return nil, nil
+	}
+
+	agents := []config.AgentConfig{
+		{
+			ID:      "agy",
+			Alias:   []string{"agy"},
+			Enabled: boolPtr(true),
+		},
+	}
+
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:      "test-box-fail",
+		MQTTClient:     mockClient,
+		Agents:         agents,
+		ScanInterval:   40 * time.Millisecond,
+		ProcessLister:  mockLister,
+		IsProcessAlive: isAlive,
+		ProcessExitChecker: func(pid int) (int, bool) {
+			// Simulate exit code 7 (exact reproduction case)
+			return 7, true
+		},
+		AgyLogDir: logDir,
+		Quiet:     true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr.Start(ctx)
+
+	expectedJobID := wrapper.GenerateAttachJobID("agy", testPID, startTime)
+	statusTopic := mqtt.JobStatusTopic("test-box-fail", expectedJobID)
+
+	// 1. Wait for initial running status
+	var runningJob model.Job
+	for i := 0; i < 20; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			if err := json.Unmarshal(pub.Payload, &runningJob); err == nil && runningJob.Status == model.StatusRunning {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if runningJob.Status != model.StatusRunning {
+		t.Fatalf("expected running job, got %q", runningJob.Status)
+	}
+
+	// 2. Terminate the process (exit=7)
+	procAliveMu.Lock()
+	procAlive = false
+	procAliveMu.Unlock()
+
+	// 3. Wait for finalized job status
+	var finalJob model.Job
+	for i := 0; i < 30; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			_ = json.Unmarshal(pub.Payload, &finalJob)
+			if finalJob.Status == model.StatusFailed {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	if finalJob.Status == model.StatusDone {
+		t.Fatalf("regression failed: job with exit=7 must NOT be marked DONE!")
+	}
+	if finalJob.Status != model.StatusFailed {
+		t.Fatalf("expected job status failed, got %q", finalJob.Status)
+	}
+	if !strings.Contains(finalJob.Error, "退出码 7") {
+		t.Errorf("expected error to mention exit code 7, got %q", finalJob.Error)
+	}
+	if finalJob.Progress == 100.0 {
+		t.Errorf("failed job progress must not be blindly set to 100.0, got %f", finalJob.Progress)
+	}
+
+	mgr.Stop()
+}
+
+// TestAttachManager_ExitUnknown_MarkedFailed verifies that when a process disappears
+// and its exit code cannot be determined (and no reliable success evidence exists),
+// AttachManager conservatively marks it FAILED (status != DONE) and sets a clear
+// Chinese explanation rather than treating uncertainty as DONE.
+func TestAttachManager_ExitUnknown_MarkedFailed(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	logDir := filepath.Join(tmpDir, "log")
+	_ = os.MkdirAll(logDir, 0755)
+
+	testPID := 88802
+	var procAliveMu sync.Mutex
+	procAlive := true
+	isAlive := func(pid int) bool {
+		procAliveMu.Lock()
+		defer procAliveMu.Unlock()
+		return procAlive
+	}
+
+	startTime := time.Now().Add(-5 * time.Second).UTC()
+	mockProcs := []wrapper.ProcessInfo{
+		{
+			PID:       testPID,
+			PPID:      1,
+			StartTime: startTime,
+			Args:      []string{"agy", "-p", "Unobservable termination task"},
+			Cwd:       "/tmp/project",
+		},
+	}
+
+	mockLister := func(ctx context.Context) ([]wrapper.ProcessInfo, error) {
+		procAliveMu.Lock()
+		alive := procAlive
+		procAliveMu.Unlock()
+		if alive {
+			return mockProcs, nil
+		}
+		return nil, nil
+	}
+
+	agents := []config.AgentConfig{
+		{
+			ID:      "agy",
+			Alias:   []string{"agy"},
+			Enabled: boolPtr(true),
+		},
+	}
+
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:      "test-box-unknown",
+		MQTTClient:     mockClient,
+		Agents:         agents,
+		ScanInterval:   40 * time.Millisecond,
+		ProcessLister:  mockLister,
+		IsProcessAlive: isAlive,
+		// No ProcessExitChecker configured -> exit code cannot be determined
+		ProcessExitChecker: nil,
+		AgyLogDir:          logDir,
+		Quiet:              true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr.Start(ctx)
+
+	expectedJobID := wrapper.GenerateAttachJobID("agy", testPID, startTime)
+	statusTopic := mqtt.JobStatusTopic("test-box-unknown", expectedJobID)
+
+	// 1. Wait for running
+	var runningJob model.Job
+	for i := 0; i < 20; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			if err := json.Unmarshal(pub.Payload, &runningJob); err == nil && runningJob.Status == model.StatusRunning {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if runningJob.Status != model.StatusRunning {
+		t.Fatalf("expected running job, got %q", runningJob.Status)
+	}
+
+	// 2. Process disappears
+	procAliveMu.Lock()
+	procAlive = false
+	procAliveMu.Unlock()
+
+	// 3. Wait for finalized job status
+	var finalJob model.Job
+	for i := 0; i < 30; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			_ = json.Unmarshal(pub.Payload, &finalJob)
+			if finalJob.Status == model.StatusFailed {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	if finalJob.Status == model.StatusDone {
+		t.Fatalf("regression failed: job with undetermined exit code must NOT be marked DONE!")
+	}
+	if finalJob.Status != model.StatusFailed {
+		t.Fatalf("expected job status failed, got %q", finalJob.Status)
+	}
+	if !strings.Contains(finalJob.Error, "无法判定退出码") {
+		t.Errorf("expected error to state 无法判定退出码, got %q", finalJob.Error)
+	}
+
+	mgr.Stop()
+}
+
+// TestAttachManager_PIDAllowlist_Isolation verifies that injecting PIDAllowlist
+// completely isolates tests from scanning or attaching to other running processes
+// on the developer host machine (such as parallel coding processes PID 3445/3456).
+func TestAttachManager_PIDAllowlist_Isolation(t *testing.T) {
+	mockClient := newMockMQTTClient()
+
+	mockProcs := []wrapper.ProcessInfo{
+		{
+			PID:  12345,
+			PPID: 1,
+			Args: []string{"agy", "-p", "Allowed test task"},
+		},
+		{
+			PID:  3445,
+			PPID: 1,
+			Args: []string{"agy", "-p", "Real developer secret prompt sk-SECRET-1"},
+		},
+		{
+			PID:  3456,
+			PPID: 1,
+			Args: []string{"agy", "-p", "Another developer session sk-SECRET-2"},
+		},
+	}
+
+	mockLister := func(ctx context.Context) ([]wrapper.ProcessInfo, error) {
+		return mockProcs, nil
+	}
+
+	agents := []config.AgentConfig{
+		{
+			ID:      "agy",
+			Alias:   []string{"agy"},
+			Enabled: boolPtr(true),
+		},
+	}
+
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:     "isolated-node",
+		MQTTClient:    mockClient,
+		Agents:        agents,
+		ScanInterval:  40 * time.Millisecond,
+		ProcessLister: mockLister,
+		IsProcessAlive: func(pid int) bool {
+			return true
+		},
+		PIDAllowlist: []int{12345}, // Only allow PID 12345!
+		Quiet:        true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr.Start(ctx)
+
+	// Wait for scan to execute
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify only PID 12345 was attached
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected exactly 1 active job, got %d", mgr.ActiveCount())
+	}
+
+	// Verify that PID 3445 and 3456 were NEVER published
+	allPubs := mockClient.GetPublished()
+	for _, pub := range allPubs {
+		payloadStr := string(pub.Payload)
+		if strings.Contains(payloadStr, "3445") || strings.Contains(payloadStr, "3456") {
+			t.Fatalf("forbidden: leaked unallowed PID 3445/3456 into published MQTT payload: %s", payloadStr)
+		}
+		if strings.Contains(payloadStr, "SECRET") {
+			t.Fatalf("forbidden: leaked prompt into published MQTT payload: %s", payloadStr)
+		}
+	}
+
+	mgr.Stop()
+}
+
+// TestAttachManager_ContextCancelled_Interrupted verifies that when monitoring
+// is stopped/cancelled externally, the job is marked FAILED with an interruption error.
+func TestAttachManager_ContextCancelled_Interrupted(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	testPID := 88803
+	startTime := time.Now().Add(-2 * time.Second).UTC()
+
+	mockProcs := []wrapper.ProcessInfo{
+		{
+			PID:       testPID,
+			PPID:      1,
+			StartTime: startTime,
+			Args:      []string{"agy", "-p", "Interrupted task"},
+		},
+	}
+
+	agents := []config.AgentConfig{
+		{
+			ID:      "agy",
+			Alias:   []string{"agy"},
+			Enabled: boolPtr(true),
+		},
+	}
+
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:      "test-box-cancel",
+		MQTTClient:     mockClient,
+		Agents:         agents,
+		ScanInterval:   40 * time.Millisecond,
+		ProcessLister:  func(ctx context.Context) ([]wrapper.ProcessInfo, error) { return mockProcs, nil },
+		IsProcessAlive: func(pid int) bool { return true }, // Still alive
+		Quiet:          true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mgr.Start(ctx)
+
+	expectedJobID := wrapper.GenerateAttachJobID("agy", testPID, startTime)
+	statusTopic := mqtt.JobStatusTopic("test-box-cancel", expectedJobID)
+
+	// Wait for running status
+	for i := 0; i < 20; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			var j model.Job
+			if err := json.Unmarshal(pub.Payload, &j); err == nil && j.Status == model.StatusRunning {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// Cancel context to simulate daemon shutdown
+	cancel()
+
+	// Wait for finalized status
+	var finalJob model.Job
+	for i := 0; i < 30; i++ {
+		pub := getLastPublished(mockClient, statusTopic)
+		if pub != nil {
+			_ = json.Unmarshal(pub.Payload, &finalJob)
+			if finalJob.Status == model.StatusFailed {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	if finalJob.Status != model.StatusFailed {
+		t.Fatalf("expected job status failed after cancellation, got %q", finalJob.Status)
+	}
+	if !strings.Contains(finalJob.Error, "中断") && !strings.Contains(finalJob.Error, "停止") {
+		t.Errorf("expected error to indicate interruption, got %q", finalJob.Error)
+	}
+
+	mgr.Stop()
+}
+
+func TestParsePIDAllowlist(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []int
+	}{
+		{"100, 200,300", []int{100, 200, 300}},
+		{"400 500;600\n700", []int{400, 500, 600, 700}},
+		{"", nil},
+		{"abc, -1, 0, 800", []int{800}},
+	}
+
+	for _, tt := range tests {
+		got := wrapper.ParsePIDAllowlist(tt.input)
+		if len(got) != len(tt.expected) {
+			t.Fatalf("ParsePIDAllowlist(%q) returned %d items, want %d", tt.input, len(got), len(tt.expected))
+		}
+		for i := range got {
+			if got[i] != tt.expected[i] {
+				t.Errorf("ParsePIDAllowlist(%q)[%d] = %d, want %d", tt.input, i, got[i], tt.expected[i])
+			}
+		}
+	}
 }
