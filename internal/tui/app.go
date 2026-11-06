@@ -172,8 +172,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = false
 				m.deleteTargetID = ""
 				return m, nil
-				m.deleteTargetID = ""
-				return m, nil
 			}
 		}
 

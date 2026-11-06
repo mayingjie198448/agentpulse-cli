@@ -3,11 +3,13 @@ package cli_test
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 )
@@ -306,6 +308,11 @@ func TestRunConfigWizard_AutostartSection(t *testing.T) {
 		t.Fatalf("failed to save initial config: %v", err)
 	}
 
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
 	// 1. Edit section autostart -> enable with "y"
 	var out bytes.Buffer
 	if err := cli.RunConfigWizardWithSection(strings.NewReader("y\n"), &out, confPath, "autostart"); err != nil {
@@ -335,6 +342,11 @@ func TestRunConfigWizard_AutostartSection(t *testing.T) {
 }
 
 func TestRunConfigWizard_MachineIDChange_AutoRestart(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
 	tmpDir := t.TempDir()
 	confPath := filepath.Join(tmpDir, "config.yaml")
 
@@ -370,5 +382,139 @@ func TestRunConfigWizard_MachineIDChange_AutoRestart(t *testing.T) {
 		if !strings.Contains(outStr, "检测到 machine_id 变更") || !strings.Contains(outStr, "old-box-id") {
 			t.Errorf("expected notification about machine_id change from old-box-id, got:\n%s", outStr)
 		}
+	}
+}
+
+func TestRunConfigWizard_BrokerAccountChange_AutoRestart(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "box-test",
+		Broker: config.BrokerConfig{
+			URL:      "tcp://127.0.0.1:1883",
+			Username: "old-user",
+			Password: "old-password",
+		},
+		Agents:    config.DefaultAgents(),
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+
+	var out bytes.Buffer
+	// Broker section prompts: URL, Username, Password, TLS
+	// Enter URL default (\n), new username (new-user\n), new password (new-pass\n), TLS default (\n)
+	input := "\nnew-user\nnew-pass\n\n"
+	if err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "broker"); err != nil {
+		t.Fatalf("wizard broker failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if loaded.Broker.Username != "new-user" || loaded.Broker.Password != "new-pass" {
+		t.Errorf("expected updated credentials, got user=%q pass=%q", loaded.Broker.Username, loaded.Broker.Password)
+	}
+
+	outStr := out.String()
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(outStr, "检测到 Broker 配置变更") {
+			t.Errorf("expected notification about broker change restart, got:\n%s", outStr)
+		}
+		if !strings.Contains(outStr, "已重启常驻守护进程并应用新 Broker 配置") {
+			t.Errorf("expected notification about successful restart, got:\n%s", outStr)
+		}
+	}
+}
+
+func TestRunConfigWizard_BrokerTLSChange_AutoRestart(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "box-test",
+		Broker: config.BrokerConfig{
+			URL: "tcp://127.0.0.1:1883",
+			TLS: false,
+		},
+		Agents:    config.DefaultAgents(),
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+
+	var out bytes.Buffer
+	// Broker section prompts: URL (\n), Username (\n), Password (\n), TLS (y\n)
+	input := "\n\n\ny\n"
+	if err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "broker"); err != nil {
+		t.Fatalf("wizard broker failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if !loaded.Broker.TLS {
+		t.Errorf("expected TLS=true after wizard update")
+	}
+
+	outStr := out.String()
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(outStr, "检测到 Broker 配置变更") {
+			t.Errorf("expected notification about broker change restart for TLS, got:\n%s", outStr)
+		}
+	}
+}
+
+func TestRunConfigWizard_BrokerUnchanged_NoRestart(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "box-test",
+		Broker: config.BrokerConfig{
+			URL:      "tcp://127.0.0.1:1883",
+			Username: "user1",
+			Password: "pass1",
+			TLS:      false,
+		},
+		Agents:    config.DefaultAgents(),
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+
+	var out bytes.Buffer
+	// Edit machine_id with same ID
+	if err := cli.RunConfigWizardWithSection(strings.NewReader("box-test\n"), &out, confPath, "machine_id"); err != nil {
+		t.Fatalf("wizard machine_id failed: %v", err)
+	}
+
+	outStr := out.String()
+	if strings.Contains(outStr, "检测到 Broker 配置变更") {
+		t.Errorf("expected NO broker change notification when broker is unchanged, got:\n%s", outStr)
 	}
 }

@@ -9,8 +9,9 @@ import (
 
 // fakeToken implements paho.Token for unit tests.
 type fakeToken struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	timeout bool
 }
 
 func newSuccessToken() *fakeToken {
@@ -25,8 +26,12 @@ func newErrorToken(err error) *fakeToken {
 	return &fakeToken{done: c, err: err}
 }
 
-func (t *fakeToken) Wait() bool                       { return true }
-func (t *fakeToken) WaitTimeout(d time.Duration) bool { return true }
+func newTimeoutToken() *fakeToken {
+	return &fakeToken{done: make(chan struct{}), timeout: true}
+}
+
+func (t *fakeToken) Wait() bool                       { return !t.timeout }
+func (t *fakeToken) WaitTimeout(d time.Duration) bool { return !t.timeout }
 func (t *fakeToken) Done() <-chan struct{}            { return t.done }
 func (t *fakeToken) Error() error                     { return t.err }
 
@@ -56,14 +61,15 @@ type PublishedMessage struct {
 
 // FakeMQTTClient implements paho.Client in memory for tests.
 type FakeMQTTClient struct {
-	mu             sync.Mutex
-	connected      bool
-	subscriptions  map[string]paho.MessageHandler
-	retained       map[string]fakeMessage
-	published      []PublishedMessage
-	unsubscribed   []string
-	disconnectWait uint
-	subscribeErr   error
+	mu               sync.Mutex
+	connected        bool
+	subscriptions    map[string]paho.MessageHandler
+	retained         map[string]fakeMessage
+	published        []PublishedMessage
+	unsubscribed     []string
+	disconnectWait   uint
+	subscribeErr     error
+	subscribeTimeout bool
 }
 
 func NewFakeMQTTClient() *FakeMQTTClient {
@@ -165,8 +171,19 @@ func (c *FakeMQTTClient) SetSubscribeError(err error) {
 	c.subscribeErr = err
 }
 
+// SetSubscribeTimeout injects a timeout for future Subscribe/SubscribeMultiple calls.
+func (c *FakeMQTTClient) SetSubscribeTimeout(timeout bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscribeTimeout = timeout
+}
+
 func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) paho.Token {
 	c.mu.Lock()
+	if c.subscribeTimeout {
+		c.mu.Unlock()
+		return newTimeoutToken()
+	}
 	if c.subscribeErr != nil {
 		err := c.subscribeErr
 		c.mu.Unlock()

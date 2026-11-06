@@ -4,10 +4,16 @@ package autostart
 
 import (
 	"fmt"
+	"os/exec"
 	"runtime"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 )
+
+// SetTestOverrides is a no-op placeholder on non-darwin platforms.
+func SetTestOverrides(launchAgentsDir, logsDir string, cmdFn func(name string, args ...string) *exec.Cmd) func() {
+	return func() {}
+}
 
 // IsSupported reports whether login autostart is supported on the current operating system.
 // On Linux/Windows, this is currently a placeholder returning an unsupported platform error.
