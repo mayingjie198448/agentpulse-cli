@@ -19,10 +19,16 @@ func newSuccessToken() *fakeToken {
 	return &fakeToken{done: c, err: nil}
 }
 
-func (t *fakeToken) Wait() bool                        { return true }
-func (t *fakeToken) WaitTimeout(d time.Duration) bool  { return true }
-func (t *fakeToken) Done() <-chan struct{}             { return t.done }
-func (t *fakeToken) Error() error                      { return t.err }
+func newErrorToken(err error) *fakeToken {
+	c := make(chan struct{})
+	close(c)
+	return &fakeToken{done: c, err: err}
+}
+
+func (t *fakeToken) Wait() bool                       { return true }
+func (t *fakeToken) WaitTimeout(d time.Duration) bool { return true }
+func (t *fakeToken) Done() <-chan struct{}            { return t.done }
+func (t *fakeToken) Error() error                     { return t.err }
 
 // fakeMessage implements paho.Message.
 type fakeMessage struct {
@@ -57,6 +63,7 @@ type FakeMQTTClient struct {
 	published      []PublishedMessage
 	unsubscribed   []string
 	disconnectWait uint
+	subscribeErr   error
 }
 
 func NewFakeMQTTClient() *FakeMQTTClient {
@@ -151,8 +158,20 @@ func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.Message
 	return newSuccessToken()
 }
 
+// SetSubscribeError injects an error for future Subscribe/SubscribeMultiple calls.
+func (c *FakeMQTTClient) SetSubscribeError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscribeErr = err
+}
+
 func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) paho.Token {
 	c.mu.Lock()
+	if c.subscribeErr != nil {
+		err := c.subscribeErr
+		c.mu.Unlock()
+		return newErrorToken(err)
+	}
 	for filter := range filters {
 		c.subscriptions[filter] = callback
 	}

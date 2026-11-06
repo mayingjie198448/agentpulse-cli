@@ -20,6 +20,7 @@ type fakeStore struct {
 	jobs         []model.Job
 	logs         map[string][]model.LogEntry
 	disconnected bool
+	refreshErr   error
 }
 
 var _ store.Store = (*fakeStore)(nil)
@@ -94,7 +95,7 @@ func (f *fakeStore) IsConnected() bool {
 }
 
 func (f *fakeStore) Refresh(context.Context) error {
-	return nil
+	return f.refreshErr
 }
 
 func (f *fakeStore) Close() error { return nil }
@@ -871,5 +872,67 @@ func TestTUIModel_ExplicitRefresh(t *testing.T) {
 
 	if len(mRefreshed.JobsForTest()) != 1 || mRefreshed.JobsForTest()[0].ID != "job-1" {
 		t.Fatalf("expected job-stale to be dropped after refresh, got %+v", mRefreshed.JobsForTest())
+	}
+}
+
+func TestTUIModel_RefreshFailure(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-orig", Name: "node-orig", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-orig", MachineID: "node-orig", Status: model.StatusRunning, Title: "Job Orig"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-orig": {{JobID: "job-orig", Message: "log orig"}},
+		},
+		refreshErr: fmt.Errorf("MQTT subscription timeout"),
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Trigger manual refresh via 'r' key
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatalf("expected 'r' key to produce a tea.Cmd for refresh")
+	}
+
+	// Execute cmd (fails with refreshErr)
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("expected refresh cmd to return a message")
+	}
+
+	// Deliver refreshDoneMsg
+	tm, _ = tm.Update(msg)
+
+	mAfter := tm.(*tui.Model)
+
+	// 1. Existing view data must be kept
+	if len(mAfter.MachinesForTest()) != 1 || mAfter.MachinesForTest()[0].ID != "node-orig" {
+		t.Fatalf("expected original machines to be preserved, got %+v", mAfter.MachinesForTest())
+	}
+	if len(mAfter.JobsForTest()) != 1 || mAfter.JobsForTest()[0].ID != "job-orig" {
+		t.Fatalf("expected original jobs to be preserved, got %+v", mAfter.JobsForTest())
+	}
+
+	// 2. Visible Chinese error hint in status/help area
+	if !strings.Contains(mAfter.RefreshErrorForTest(), "刷新失败") {
+		t.Fatalf("expected RefreshErrorForTest to contain '刷新失败', got %q", mAfter.RefreshErrorForTest())
+	}
+	view := mAfter.View()
+	if !strings.Contains(view, "刷新失败") {
+		t.Fatalf("expected view to contain '刷新失败', got:\n%s", view)
+	}
+
+	// 3. Next key clears the error hint
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	mCleared := tm.(*tui.Model)
+	if mCleared.RefreshErrorForTest() != "" {
+		t.Fatalf("expected error hint to be cleared on next key, got %q", mCleared.RefreshErrorForTest())
 	}
 }

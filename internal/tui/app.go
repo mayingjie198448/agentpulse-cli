@@ -58,6 +58,7 @@ type Model struct {
 	confirmDelete    bool
 	deleteTargetID   string
 	deleteError      string
+	refreshError     string
 }
 
 // BrokerConnected returns true if the MQTT broker is currently connected.
@@ -178,6 +179,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.deleteError != "" && msg.String() != "d" {
 			m.deleteError = ""
+		}
+		if m.refreshError != "" && msg.String() != "r" && msg.String() != "R" {
+			m.refreshError = ""
 		}
 
 		switch msg.String() {
@@ -379,31 +383,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, clockTick())
 
 	case refreshDoneMsg:
-		if msg.err == nil {
-			m.machines = msg.machines
-			m.jobs = msg.jobs
-
-			// Clean up logs for jobs that no longer exist
-			activeJobIDs := make(map[string]bool, len(m.jobs))
-			for _, j := range m.jobs {
-				activeJobIDs[j.ID] = true
-			}
-			for jid := range m.logs {
-				if !activeJobIDs[jid] {
-					delete(m.logs, jid)
-				}
-			}
-
-			if len(m.jobs) == 0 {
-				m.selectedJobIdx = 0
-				m.jobsScrollOffset = 0
-			} else if m.selectedJobIdx >= len(m.jobs) {
-				m.selectedJobIdx = len(m.jobs) - 1
-			}
-
-			m.ensureLogsLoadedForSelectedJob()
-			m.updateViewportContent()
+		if msg.err != nil {
+			m.refreshError = fmt.Sprintf("刷新失败: %v", msg.err)
+			return m, nil
 		}
+		m.refreshError = ""
+		m.machines = msg.machines
+		m.jobs = msg.jobs
+
+		// Clean up logs for jobs that no longer exist
+		activeJobIDs := make(map[string]bool, len(m.jobs))
+		for _, j := range m.jobs {
+			activeJobIDs[j.ID] = true
+		}
+		for jid := range m.logs {
+			if !activeJobIDs[jid] {
+				delete(m.logs, jid)
+			}
+		}
+
+		if len(m.jobs) == 0 {
+			m.selectedJobIdx = 0
+			m.jobsScrollOffset = 0
+		} else if m.selectedJobIdx >= len(m.jobs) {
+			m.selectedJobIdx = len(m.jobs) - 1
+		}
+
+		m.ensureLogsLoadedForSelectedJob()
+		m.updateViewportContent()
 	}
 
 	if m.activePane == PaneLogs {
@@ -420,15 +427,23 @@ func (m *Model) triggerRefresh() tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg {
 		if st == nil {
-			return refreshDoneMsg{}
+			return refreshDoneMsg{err: fmt.Errorf("未连接存储引擎")}
 		}
 		refreshErr := st.Refresh(ctx)
-		machs, _ := st.ListMachines(ctx)
-		jobs, _ := st.ListJobs(ctx)
+		if refreshErr != nil {
+			return refreshDoneMsg{err: refreshErr}
+		}
+		machs, err := st.ListMachines(ctx)
+		if err != nil {
+			return refreshDoneMsg{err: err}
+		}
+		jobs, err := st.ListJobs(ctx)
+		if err != nil {
+			return refreshDoneMsg{err: err}
+		}
 		return refreshDoneMsg{
 			machines: machs,
 			jobs:     jobs,
-			err:      refreshErr,
 		}
 	}
 }
@@ -1123,7 +1138,10 @@ func (m *Model) renderFooter() string {
 		sep = " • "
 	}
 	bar := strings.Join(keys, sep)
-	if m.deleteError != "" {
+	if m.refreshError != "" {
+		errStr := lipgloss.NewStyle().Bold(true).Foreground(ColorRed).Render("✖ " + m.refreshError)
+		bar = errStr + "  |  " + bar
+	} else if m.deleteError != "" {
 		errStr := lipgloss.NewStyle().Bold(true).Foreground(ColorRed).Render("✖ " + m.deleteError)
 		bar = errStr + "  |  " + bar
 	}

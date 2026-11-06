@@ -1022,3 +1022,102 @@ func TestMQTTStore_Refresh(t *testing.T) {
 		t.Fatalf("expected node-1 and node-new, node-stale dropped, got: %+v", machIDs)
 	}
 }
+
+func TestMQTTStore_Refresh_Transactional_ClientNil(t *testing.T) {
+	cfg := mqttstore.DefaultConfig()
+	st, err := mqttstore.NewWithClient(cfg, nil)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Direct message injection before refresh
+	mach := `{"id":"mach-persist","name":"mach-persist","online":true,"job_count":0}`
+	st.HandleMessage("agentpulse/v1/machines/mach-persist/status", []byte(mach))
+
+	// Refresh must return error when client is nil
+	if err := st.Refresh(ctx); err == nil {
+		t.Fatalf("expected Refresh error when client is nil, got nil")
+	}
+
+	// Existing store state must remain unchanged
+	m, err := st.GetMachine(ctx, "mach-persist")
+	if err != nil || m == nil || m.ID != "mach-persist" {
+		t.Fatalf("expected mach-persist to remain intact after failed refresh, got m=%v, err=%v", m, err)
+	}
+}
+
+func TestMQTTStore_Refresh_Transactional_Disconnected(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 10 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Initial message
+	mach := `{"id":"mach-persist","name":"mach-persist","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-persist/status", []byte(mach), true)
+
+	job := `{"id":"job-persist","machine_id":"mach-persist","status":"running","title":"Job 1"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-persist/jobs/job-persist/status", []byte(job), true)
+
+	// Simulate client disconnected
+	fakeClient.Disconnect(0)
+
+	// Refresh must fail and NOT clear store
+	if err := st.Refresh(ctx); err == nil {
+		t.Fatalf("expected Refresh error when disconnected, got nil")
+	}
+
+	machines, err := st.ListMachines(ctx)
+	if err != nil || len(machines) != 1 || machines[0].ID != "mach-persist" {
+		t.Fatalf("expected machines to remain unchanged after failed refresh, got %+v", machines)
+	}
+
+	jobs, err := st.ListJobs(ctx)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != "job-persist" {
+		t.Fatalf("expected jobs to remain unchanged after failed refresh, got %+v", jobs)
+	}
+}
+
+func TestMQTTStore_Refresh_Transactional_SubscribeFails(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 10 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	mach := `{"id":"mach-safe","name":"mach-safe","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-safe/status", []byte(mach), true)
+
+	// Inject subscription error
+	fakeClient.SetSubscribeError(fmt.Errorf("broker subscription rejected"))
+
+	// Refresh must fail
+	if err := st.Refresh(ctx); err == nil {
+		t.Fatalf("expected Refresh error when subscribe fails, got nil")
+	}
+
+	// State must be left untouched
+	machines, err := st.ListMachines(ctx)
+	if err != nil || len(machines) != 1 || machines[0].ID != "mach-safe" {
+		t.Fatalf("expected mach-safe to remain intact after failed subscribe, got %+v", machines)
+	}
+}

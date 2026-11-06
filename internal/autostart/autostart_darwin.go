@@ -139,7 +139,10 @@ func Enable(cfg *config.Config, exePath string) error {
 		cmdUser := execCommand("launchctl", "bootstrap", fmt.Sprintf("user/%d", uid), plistPath)
 		if errUser := cmdUser.Run(); errUser != nil {
 			// Legacy fallback
-			_ = execCommand("launchctl", "load", "-w", plistPath).Run()
+			cmdLoad := execCommand("launchctl", "load", "-w", plistPath)
+			if errLoad := cmdLoad.Run(); errLoad != nil {
+				return fmt.Errorf("failed to enable LaunchAgent: all launchctl attempts failed (bootstrap gui: %v; bootstrap user: %v; load: %w)", err, errUser, errLoad)
+			}
 		}
 	}
 

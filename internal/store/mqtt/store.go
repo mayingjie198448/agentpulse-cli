@@ -30,6 +30,14 @@ type Store struct {
 	subscribers map[chan model.Event]struct{}
 	closeCh     chan struct{}
 	closed      bool
+	refreshMu   sync.Mutex
+	staging     *refreshStaging
+}
+
+type refreshStaging struct {
+	machines  map[string]*model.Machine
+	jobs      map[string]*model.Job
+	announces map[string]*model.MachineAnnounce
 }
 
 // New initializes a new MQTT Store, connects to the configured broker,
@@ -187,6 +195,9 @@ func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
 			s.mu.Unlock()
 			return
 		}
+		if s.staging != nil {
+			delete(s.staging.machines, pt.machineID)
+		}
 		deletedMachine, exists := s.machines[pt.machineID]
 		delete(s.machines, pt.machineID)
 		s.mu.Unlock()
@@ -223,6 +234,9 @@ func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
 		return
 	}
 	stored := m
+	if s.staging != nil {
+		s.staging.machines[m.ID] = &stored
+	}
 	s.machines[m.ID] = &stored
 	s.mu.Unlock()
 
@@ -241,6 +255,9 @@ func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
 		if s.closed {
 			s.mu.Unlock()
 			return
+		}
+		if s.staging != nil {
+			delete(s.staging.jobs, pt.jobID)
 		}
 		deletedJob, exists := s.jobs[pt.jobID]
 		delete(s.jobs, pt.jobID)
@@ -280,6 +297,9 @@ func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
 		return
 	}
 	stored := j
+	if s.staging != nil {
+		s.staging.jobs[j.ID] = &stored
+	}
 	s.jobs[j.ID] = &stored
 	s.mu.Unlock()
 
@@ -353,6 +373,9 @@ func (s *Store) handleAnnounce(pt parsedTopic, payload []byte) {
 			s.mu.Unlock()
 			return
 		}
+		if s.staging != nil {
+			delete(s.staging.announces, pt.machineID)
+		}
 		delete(s.announces, pt.machineID)
 		s.mu.Unlock()
 		return
@@ -373,6 +396,20 @@ func (s *Store) handleAnnounce(pt parsedTopic, payload []byte) {
 	if s.closed {
 		s.mu.Unlock()
 		return
+	}
+
+	if s.staging != nil {
+		stagingExisting, stagingExists := s.staging.announces[ann.MachineID]
+		canApplyStaging := true
+		if stagingExists && stagingExisting != nil {
+			if ann.Rev < stagingExisting.Rev || (ann.Rev == stagingExisting.Rev && !ann.TS.After(stagingExisting.TS)) {
+				canApplyStaging = false
+			}
+		}
+		if canApplyStaging {
+			stagingStored := ann
+			s.staging.announces[ann.MachineID] = &stagingStored
+		}
 	}
 
 	// Conflict resolution per 0.5.0 spec:
@@ -510,6 +547,9 @@ func (s *Store) DeleteJob(ctx context.Context, id string) error {
 	deletedJob := *job
 
 	// Remove from in-memory cache
+	if s.staging != nil {
+		delete(s.staging.jobs, id)
+	}
 	delete(s.jobs, id)
 	delete(s.logs, id)
 	client := s.client
@@ -762,24 +802,44 @@ func (s *Store) CheckStaleMachines() {
 	s.checkStaleMachines()
 }
 
-// Refresh re-subscribes to MQTT topics, clears stale in-memory state, and settles
-// retained messages from the broker per docs/mqtt-protocol.md §5.1.
+// Refresh re-subscribes to MQTT topics, re-pulls and settles retained messages from the broker,
+// and transactionally replaces cached state per docs/mqtt-protocol.md §5.1.
+// If disconnected or subscription fails, existing state is left unchanged and an error is returned.
 func (s *Store) Refresh(ctx context.Context) error {
-	s.mu.Lock()
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	s.mu.RLock()
 	if s.closed {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return fmt.Errorf("store closed")
 	}
-	// Clear cached state so records removed or cleared on broker are dropped
-	s.machines = make(map[string]*model.Machine)
-	s.jobs = make(map[string]*model.Job)
-	s.announces = make(map[string]*model.MachineAnnounce)
+	client := s.client
+	s.mu.RUnlock()
+
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("MQTT client not connected")
+	}
+
+	// Prepare transactional staging state to collect incoming retained messages
+	staging := &refreshStaging{
+		machines:  make(map[string]*model.Machine),
+		jobs:      make(map[string]*model.Job),
+		announces: make(map[string]*model.MachineAnnounce),
+	}
+
+	s.mu.Lock()
+	s.staging = staging
 	s.mu.Unlock()
 
-	if s.client == nil || !s.client.IsConnected() {
-		s.checkStaleMachines()
-		return nil
-	}
+	committed := false
+	defer func() {
+		s.mu.Lock()
+		if !committed && s.staging == staging {
+			s.staging = nil
+		}
+		s.mu.Unlock()
+	}()
 
 	filters := map[string]byte{
 		TopicMachinesStatus:           1,
@@ -796,16 +856,18 @@ func (s *Store) Refresh(ctx context.Context) error {
 		TopicMachinesAnnounceWildcard,
 	}
 
-	if token := s.client.Unsubscribe(unsubTopics...); token != nil {
+	if token := client.Unsubscribe(unsubTopics...); token != nil {
 		token.WaitTimeout(s.cfg.Timeout)
 	}
 
-	subToken := s.client.SubscribeMultiple(filters, s.onMQTTMessage)
+	subToken := client.SubscribeMultiple(filters, s.onMQTTMessage)
 	if subToken != nil {
 		if !subToken.WaitTimeout(s.cfg.Timeout) {
+			_ = client.SubscribeMultiple(filters, s.onMQTTMessage)
 			return fmt.Errorf("MQTT subscription timed out during refresh")
 		}
 		if err := subToken.Error(); err != nil {
+			_ = client.SubscribeMultiple(filters, s.onMQTTMessage)
 			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
 		}
 	}
@@ -822,6 +884,20 @@ func (s *Store) Refresh(ctx context.Context) error {
 	case <-s.closeCh:
 		return fmt.Errorf("store closed")
 	}
+
+	// Atomically replace caches after successful settle/re-pull of retained messages
+	s.mu.Lock()
+	s.machines = staging.machines
+	s.jobs = staging.jobs
+	s.announces = staging.announces
+	for jid := range s.logs {
+		if _, ok := s.jobs[jid]; !ok {
+			delete(s.logs, jid)
+		}
+	}
+	s.staging = nil
+	committed = true
+	s.mu.Unlock()
 
 	s.checkStaleMachines()
 	return nil
