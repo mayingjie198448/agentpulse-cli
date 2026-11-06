@@ -10,7 +10,7 @@ import (
 )
 
 // IsSupported reports whether login autostart is supported on the current operating system.
-// On Linux/Windows, this is currently a documented placeholder / no-op.
+// On Linux/Windows, this is currently a placeholder returning an unsupported platform error.
 func IsSupported() bool {
 	return false
 }

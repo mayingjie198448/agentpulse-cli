@@ -51,3 +51,8 @@ func (m *Model) ConfirmDeleteForTest() bool {
 func (m *Model) DeleteErrorForTest() string {
 	return m.deleteError
 }
+
+// RefreshErrorForTest returns the current refresh error message for test assertions.
+func (m *Model) RefreshErrorForTest() string {
+	return m.refreshError
+}

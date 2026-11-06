@@ -99,6 +99,42 @@ func TestEnableAndDisable(t *testing.T) {
 	}
 }
 
+func TestEnable_FailureWhenLaunchctlFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("skipping macOS LaunchAgent enable test on non-darwin")
+	}
+
+	tmpLaunchDir := t.TempDir()
+	tmpLogsDir := t.TempDir()
+
+	testLaunchAgentsDir = tmpLaunchDir
+	testLogsDir = tmpLogsDir
+	defer func() {
+		testLaunchAgentsDir = ""
+		testLogsDir = ""
+	}()
+
+	// Mock execCommand to always fail for bootstrap and load
+	oldExec := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command("false")
+	}
+	defer func() { execCommand = oldExec }()
+
+	cfg := &config.Config{
+		MachineID: "test-node",
+		Autostart: true,
+	}
+
+	err := Enable(cfg, "/usr/local/bin/agentpulse")
+	if err == nil {
+		t.Fatalf("expected Enable to fail when all launchctl bootstrap/load commands fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "all launchctl attempts failed") {
+		t.Errorf("expected descriptive error mentioning launchctl attempts, got: %v", err)
+	}
+}
+
 func TestPublishOffline_EmptyInputs(t *testing.T) {
 	// Should cleanly no-op without error if URL or machineID is empty
 	if err := PublishOffline(config.BrokerConfig{URL: ""}, "node-1"); err != nil {
