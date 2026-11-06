@@ -14,6 +14,7 @@ import (
 
 func TestRunConfigWizard_FreshInstall(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Guided sequence for new configuration:
@@ -22,13 +23,27 @@ func TestRunConfigWizard_FreshInstall(t *testing.T) {
 	// 3. Username: testuser
 	// 4. Password: testpass
 	// 5. TLS: n
-	// 6. Agents customize: n (keeps probed defaults)
+	// 6. Agents auto-scan: y
+	// 7. Agents rescan: n
+	// 8. Select builtin engines: 1,2 (agy, opencode)
+	// 9. Confirm agy: enabled y, path (empty), alias (empty -> default agy)
+	// 10. Confirm opencode: enabled y, path (empty), alias (empty -> default op, opencode)
+	// 11. Add custom CLI: n
 	inputLines := []string{
 		"test-machine-01",
 		"tcp://127.0.0.1:1883",
 		"testuser",
 		"testpass",
 		"n",
+		"y",
+		"n",
+		"1,2",
+		"y",
+		"",
+		"",
+		"y",
+		"",
+		"",
 		"n",
 	}
 	input := strings.Join(inputLines, "\n") + "\n"
@@ -44,6 +59,12 @@ func TestRunConfigWizard_FreshInstall(t *testing.T) {
 		!strings.Contains(outStr, "[步骤 2/3]") ||
 		!strings.Contains(outStr, "[步骤 3/3]") {
 		t.Errorf("expected 3 guided steps in output, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "[步骤 1/4]") ||
+		!strings.Contains(outStr, "[步骤 2/4]") ||
+		!strings.Contains(outStr, "[步骤 3/4]") ||
+		!strings.Contains(outStr, "[步骤 4/4]") {
+		t.Errorf("expected 4 agent wizard sub-steps in output, got:\n%s", outStr)
 	}
 	if !strings.Contains(outStr, "Doctor") {
 		t.Errorf("expected doctor verification in output, got:\n%s", outStr)
@@ -74,13 +95,17 @@ func TestRunConfigWizard_FreshInstall(t *testing.T) {
 	if cfg.Broker.Username != "testuser" {
 		t.Errorf("expected username 'testuser', got %q", cfg.Broker.Username)
 	}
-	if len(cfg.Agents) == 0 {
-		t.Errorf("expected default agents to be saved")
+	if len(cfg.Agents) != 2 {
+		t.Fatalf("expected 2 agents saved, got %d", len(cfg.Agents))
+	}
+	if cfg.Agents[0].ID != "agy" || cfg.Agents[1].ID != "opencode" {
+		t.Errorf("expected [agy, opencode], got %+v", cfg.Agents)
 	}
 }
 
 func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Guided sequence:
@@ -89,25 +114,38 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 	// 3. Username: (empty)
 	// 4. Password: (empty)
 	// 5. TLS: n
-	// 6. Agents customize: y
-	// 7. agy: enabled y, path /custom/bin/agy, aliases agy,ai
-	// 8. opencode: enabled n (disabled)
-	// 9. codex: enabled y, path (empty), aliases codex
-	// 10. add more agents: n
+	// 6. Agents auto-scan: n (skip scan)
+	// 7. Select builtin engines: 1,4 (agy and codex; opencode skipped)
+	// 8. Confirm agy: enabled y, path /custom/bin/agy, aliases agy,ai
+	// 9. Confirm codex: enabled y, path (empty), aliases codex
+	// 10. Add custom CLI: y
+	// 11. Custom ID: agy (rejected as built-in!)
+	// 12. Custom ID: myagent
+	// 13. Custom path: /usr/local/bin/myagent
+	// 14. Custom aliases: myagent,bot
+	// 15. Custom enabled: y
+	// 16. Continue adding custom: n
 	inputLines := []string{
 		"custom-box",
 		"tcp://127.0.0.1:1883",
 		"",
 		"",
 		"n",
-		"y",
+		"n",
+		"1,4",
 		"y",
 		"/custom/bin/agy",
 		"agy,ai",
-		"n",
 		"y",
 		"",
 		"codex",
+		"y",
+		"agy",
+		"y",
+		"myagent",
+		"/usr/local/bin/myagent",
+		"myagent,bot",
+		"y",
 		"n",
 	}
 	input := strings.Join(inputLines, "\n") + "\n"
@@ -116,6 +154,11 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 	err := cli.RunConfigWizard(strings.NewReader(input), &out, confPath)
 	if err != nil {
 		t.Fatalf("RunConfigWizard failed: %v", err)
+	}
+
+	outStr := out.String()
+	if !strings.Contains(outStr, "为系统内置适配引擎，不可作为自定义 CLI 追加") {
+		t.Errorf("expected rejection of builtin agent name as custom, output:\n%s", outStr)
 	}
 
 	cfg, err := config.LoadConfig(confPath)
@@ -127,8 +170,8 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 		t.Errorf("expected machine_id 'custom-box', got %q", cfg.MachineID)
 	}
 
-	// Verify agy
-	var agyFound, opencodeFound bool
+	// Verify agy, codex, myagent
+	var agyFound, codexFound, myagentFound, opencodeFound bool
 	for _, ag := range cfg.Agents {
 		if ag.ID == "agy" {
 			agyFound = true
@@ -141,21 +184,56 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 			if len(ag.Alias) != 2 || ag.Alias[1] != "ai" {
 				t.Errorf("expected agy aliases [agy, ai], got %v", ag.Alias)
 			}
+			if ag.IsCustom() {
+				t.Errorf("expected agy to NOT be custom")
+			}
+		}
+		if ag.ID == "codex" {
+			codexFound = true
+			if !ag.IsEnabled() {
+				t.Errorf("expected codex to be enabled")
+			}
+			if ag.IsCustom() {
+				t.Errorf("expected codex to NOT be custom")
+			}
+		}
+		if ag.ID == "myagent" {
+			myagentFound = true
+			if !ag.IsEnabled() {
+				t.Errorf("expected myagent to be enabled")
+			}
+			if ag.Path != "/usr/local/bin/myagent" {
+				t.Errorf("expected myagent path '/usr/local/bin/myagent', got %q", ag.Path)
+			}
+			if !ag.IsCustom() {
+				t.Errorf("expected myagent to be marked as custom")
+			}
 		}
 		if ag.ID == "opencode" {
 			opencodeFound = true
-			if ag.IsEnabled() {
-				t.Errorf("expected opencode to be disabled")
-			}
 		}
 	}
-	if !agyFound || !opencodeFound {
-		t.Errorf("expected to find both agy and opencode in saved config")
+	if !agyFound || !codexFound || !myagentFound {
+		t.Errorf("expected to find agy, codex, and myagent in saved config, got: %+v", cfg.Agents)
+	}
+	if opencodeFound {
+		t.Errorf("expected opencode to not be present since it wasn't selected")
+	}
+
+	// Verify builtin vs custom segregation
+	builtins := cfg.BuiltinAgents()
+	customs := cfg.CustomAgents()
+	if len(builtins) != 2 {
+		t.Errorf("expected 2 builtin agents, got %d", len(builtins))
+	}
+	if len(customs) != 1 || customs[0].ID != "myagent" {
+		t.Errorf("expected 1 custom agent 'myagent', got %v", customs)
 	}
 }
 
 func TestRunConfigWizard_ExistingConfig_SectionedEditBroker(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Seed existing config
@@ -223,6 +301,7 @@ func TestRunConfigWizard_ExistingConfig_SectionedEditBroker(t *testing.T) {
 
 func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Seed existing config
@@ -249,7 +328,7 @@ func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 	// username: Enter (keeps keepuser)
 	// password: Enter (keeps keeppassword)
 	// TLS: Enter (keeps true)
-	// agents customize: Enter (keeps false)
+	// agents: Enter (keeps existing agents)
 	inputLines := []string{
 		"1",
 		"",
@@ -286,5 +365,72 @@ func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 	}
 	if !loaded.Broker.TLS {
 		t.Errorf("expected TLS true")
+	}
+	if len(loaded.Agents) != len(config.DefaultAgents()) {
+		t.Errorf("expected %d agents, got %d", len(config.DefaultAgents()), len(loaded.Agents))
+	}
+}
+
+func TestRunConfigWizard_RescanAndSectionAgents(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
+
+	// Seed existing config with 1 agent
+	seedCfg := &config.Config{
+		Version:   1,
+		MachineID: "rescan-node",
+		Broker: config.BrokerConfig{
+			URL: "tcp://127.0.0.1:1883",
+		},
+		Agents: []config.AgentConfig{
+			{ID: "agy", Alias: []string{"agy"}},
+		},
+	}
+	if err := config.SaveConfig(confPath, seedCfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	// Directly invoke Section "agents"
+	// Sequence:
+	// 1. auto-scan: y
+	// 2. rescan: y
+	// 3. rescan: n (proceed)
+	// 4. select builtin: 3 (claude)
+	// 5. confirm claude: enabled y, path /opt/bin/claude, alias claude,c
+	// 6. add custom: n
+	inputLines := []string{
+		"y",
+		"y",
+		"n",
+		"3",
+		"y",
+		"/opt/bin/claude",
+		"claude,c",
+		"n",
+	}
+	input := strings.Join(inputLines, "\n") + "\n"
+
+	var out bytes.Buffer
+	err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "agents")
+	if err != nil {
+		t.Fatalf("RunConfigWizardWithSection failed: %v", err)
+	}
+
+	outStr := out.String()
+	if !strings.Contains(outStr, "正在扫描本机 PATH 及常见安装路径...") {
+		t.Errorf("expected scan execution in output, got:\n%s", outStr)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if len(loaded.Agents) != 1 || loaded.Agents[0].ID != "claude" {
+		t.Fatalf("expected 1 agent 'claude', got: %+v", loaded.Agents)
+	}
+	if loaded.Agents[0].Path != "/opt/bin/claude" {
+		t.Errorf("expected path '/opt/bin/claude', got %q", loaded.Agents[0].Path)
 	}
 }
