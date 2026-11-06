@@ -1268,3 +1268,104 @@ func TestWrapper_ExtendedFieldsInStatusAndAlert(t *testing.T) {
 		t.Errorf("expected finished_at in alert payload")
 	}
 }
+
+func TestSecretsRedactedAcrossAllBoundaries(t *testing.T) {
+	fakeOpenAI := "sk-TESTFAKE1234567890abcdef1234567890"
+	fakeGitHub := "ghp_TESTFAKE1234567890abcdef1234567890abcdef"
+	fakeKVPass := "password=SuperFakeSecret987654321"
+
+	mockClient := newMockMQTTClient()
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:   "sec-node-1",
+		MachineName: "sec-node-1",
+		JobID:       "job-sec-001",
+		Engine:      model.EngineAgy,
+		Title:       fmt.Sprintf("Run task with token %s", fakeGitHub),
+		Repo:        "org/sec-repo",
+		Project:     "sec-repo",
+		Prompt:      fmt.Sprintf("Use %s and %s for query", fakeOpenAI, fakeKVPass),
+		Args:        []string{"agy", "run", "--prompt", fmt.Sprintf("Use %s", fakeOpenAI), "--key", fakeOpenAI},
+		Command:     fmt.Sprintf("agy run --prompt 'Use %s' --api-key=%s", fakeOpenAI, fakeOpenAI),
+		RequestedBy: "dev@workstation",
+		MQTTClient:  mockClient,
+		Stub:        true,
+		Quiet:       true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	// 1. Verify Job model metadata is sanitized
+	j := w.Job()
+	if strings.Contains(j.Command, "sk-TESTFAKE") || strings.Contains(j.Command, fakeOpenAI) {
+		t.Errorf("Job.Command contains raw fake key: %q", j.Command)
+	}
+	if strings.Contains(j.Title, "ghp_TESTFAKE") || strings.Contains(j.Title, fakeGitHub) {
+		t.Errorf("Job.Title contains raw fake token: %q", j.Title)
+	}
+	if strings.Contains(j.Prompt, "sk-TESTFAKE") || strings.Contains(j.Prompt, fakeOpenAI) || strings.Contains(j.Prompt, "SuperFakeSecret") {
+		t.Errorf("Job.Prompt contains raw fake key: %q", j.Prompt)
+	}
+
+	// 2. Verify child process execution args are PRESERVED (actual argv not corrupted)
+	if len(w.Config().Args) < 6 || w.Config().Args[5] != fakeOpenAI {
+		t.Errorf("child process argv was modified; actual execution args must remain intact, got: %v", w.Config().Args)
+	}
+
+	// 3. Run job and inspect running and completed status publications
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("w.Run failed: %v", err)
+	}
+
+	// 4. Assert all published MQTT payloads (job status and alerts) are completely clean of synthetic fake keys
+	published := mockClient.GetPublished()
+	if len(published) == 0 {
+		t.Fatalf("expected MQTT publications")
+	}
+
+	for _, p := range published {
+		payloadStr := string(p.Payload)
+		if strings.Contains(payloadStr, "sk-TESTFAKE") {
+			t.Errorf("MQTT published payload on topic %s contains fake OpenAI key:\n%s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "ghp_TESTFAKE") {
+			t.Errorf("MQTT published payload on topic %s contains fake GitHub token:\n%s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "SuperFakeSecret") {
+			t.Errorf("MQTT published payload on topic %s contains fake password:\n%s", p.Topic, payloadStr)
+		}
+	}
+
+	// 5. Verify failed status redaction
+	mockClientFail := newMockMQTTClient()
+	wFail, err := wrapper.New(wrapper.Config{
+		MachineID:  "sec-node-fail",
+		JobID:      "job-sec-fail-001",
+		Engine:     model.EngineAgy,
+		Title:      fmt.Sprintf("Failed task %s", fakeGitHub),
+		Prompt:     fmt.Sprintf("Prompt %s", fakeOpenAI),
+		Command:    fmt.Sprintf("agy fail --secret=%s", fakeOpenAI),
+		MQTTClient: mockClientFail,
+		Stub:       false,
+		Args:       []string{"/nonexistent/binary/for/failure", "--key", fakeOpenAI},
+		Quiet:      true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	_ = wFail.Run(ctx) // Expected to fail
+
+	for _, p := range mockClientFail.GetPublished() {
+		payloadStr := string(p.Payload)
+		if strings.Contains(payloadStr, "sk-TESTFAKE") {
+			t.Errorf("failed job MQTT payload on %s contains fake key: %s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "ghp_TESTFAKE") {
+			t.Errorf("failed job MQTT payload on %s contains fake token: %s", p.Topic, payloadStr)
+		}
+	}
+}

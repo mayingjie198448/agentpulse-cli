@@ -186,7 +186,6 @@ flowchart TD
   "project": "agentpulse-cli",
   "prompt": "refactor store layer to support MQTT retained message cleanup and job status sync",
   "started_at": "2026-11-02T13:25:00Z",
-  "ended_at": "",
   "updated_at": "2026-11-02T13:30:15Z",
   "duration_str": "5m 15s",
   "requested_by": "mayingjie@mac-studio-m2",

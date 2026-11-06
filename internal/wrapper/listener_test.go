@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -904,3 +905,98 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 	}
 }
 
+func TestListener_PublishJobFailed_RetainsMetadataAndRedactsSecrets(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "fail-meta-node",
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.NewListener failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	fakeOpenAI := "sk-TESTFAKEabcdef1234567890abcdef"
+	fakeGitHub := "ghp_TESTFAKEabcdef1234567890abcdef"
+
+	dispatchTopic := mqtt.MachineDispatchTopic("fail-meta-node")
+	cmd := model.DispatchCommand{
+		CommandID:   "cmd-fail-meta-1",
+		JobID:       "job-fail-meta-1",
+		Engine:      model.EngineAgy,
+		Command:     "", // triggers empty command failure
+		Args:        []string{},
+		Title:       fmt.Sprintf("Title with %s", fakeGitHub),
+		Repo:        "org/fail-repo",
+		Project:     "fail-project",
+		Prompt:      fmt.Sprintf("Prompt with %s", fakeOpenAI),
+		RequestedBy: "qa-lead@testnode",
+	}
+
+	payload, _ := json.Marshal(cmd)
+	mockClient.Publish(dispatchTopic, 1, false, payload)
+
+	time.Sleep(50 * time.Millisecond)
+
+	var failedMessage []byte
+	var failedJob *model.Job
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == mqtt.JobStatusTopic("fail-meta-node", "job-fail-meta-1") {
+			var j model.Job
+			if err := json.Unmarshal(m.Payload, &j); err == nil && j.Status == model.StatusFailed {
+				cp := j
+				failedJob = &cp
+				failedMessage = m.Payload
+			}
+		}
+	}
+
+	if failedJob == nil {
+		t.Fatalf("expected failed job status publication")
+	}
+
+	// 1. Verify metadata was retained and not dropped
+	if failedJob.Repo != "org/fail-repo" {
+		t.Errorf("expected Repo 'org/fail-repo', got %q", failedJob.Repo)
+	}
+	if failedJob.Project != "fail-project" {
+		t.Errorf("expected Project 'fail-project', got %q", failedJob.Project)
+	}
+	if failedJob.RequestedBy != "qa-lead@testnode" {
+		t.Errorf("expected RequestedBy 'qa-lead@testnode', got %q", failedJob.RequestedBy)
+	}
+
+	// 2. Verify EndedAt is set and present in JSON
+	if failedJob.EndedAt.IsZero() {
+		t.Errorf("expected EndedAt to be non-zero for failed job")
+	}
+	if !strings.Contains(string(failedMessage), "ended_at") {
+		t.Errorf("expected ended_at field in failed job JSON: %s", string(failedMessage))
+	}
+
+	// 3. Verify secrets redacted from raw MQTT payload
+	rawPayload := string(failedMessage)
+	if strings.Contains(rawPayload, "sk-TESTFAKE") || strings.Contains(rawPayload, fakeOpenAI) {
+		t.Errorf("raw MQTT failed payload contains fake OpenAI key: %s", rawPayload)
+	}
+	if strings.Contains(rawPayload, "ghp_TESTFAKE") || strings.Contains(rawPayload, fakeGitHub) {
+		t.Errorf("raw MQTT failed payload contains fake GitHub token: %s", rawPayload)
+	}
+
+	if !strings.Contains(failedJob.Prompt, "sk-[REDACTED]") {
+		t.Errorf("expected redacted prompt, got %q", failedJob.Prompt)
+	}
+	if !strings.Contains(failedJob.Title, "[REDACTED_TOKEN]") {
+		t.Errorf("expected redacted title, got %q", failedJob.Title)
+	}
+}

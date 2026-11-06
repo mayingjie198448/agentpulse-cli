@@ -2,6 +2,7 @@ package model_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -270,5 +271,96 @@ func TestJob_BackwardCompatibility(t *testing.T) {
 	}
 	if j.RepoOrProject() != "" {
 		t.Errorf("expected empty RepoOrProject(), got %q", j.RepoOrProject())
+	}
+}
+
+func TestJob_EndedAtSerialization(t *testing.T) {
+	// 1. Running job: EndedAt is zero -> must NOT appear in marshaled JSON
+	runningJob := model.Job{
+		ID:        "job-running-001",
+		MachineID: "node-1",
+		Engine:    model.EngineAgy,
+		Status:    model.StatusRunning,
+		StartedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(runningJob)
+	if err != nil {
+		t.Fatalf("failed to marshal running job: %v", err)
+	}
+	if strings.Contains(string(data), "ended_at") {
+		t.Errorf("expected running job JSON to omit ended_at, got: %s", string(data))
+	}
+
+	// 2. Completed job: EndedAt is non-zero -> must appear in marshaled JSON
+	now := time.Now().UTC().Truncate(time.Second)
+	doneJob := model.Job{
+		ID:        "job-done-001",
+		MachineID: "node-1",
+		Engine:    model.EngineAgy,
+		Status:    model.StatusDone,
+		StartedAt: now.Add(-10 * time.Minute),
+		UpdatedAt: now,
+		EndedAt:   now,
+	}
+	dataDone, err := json.Marshal(doneJob)
+	if err != nil {
+		t.Fatalf("failed to marshal done job: %v", err)
+	}
+	if !strings.Contains(string(dataDone), "ended_at") {
+		t.Errorf("expected completed job JSON to include ended_at, got: %s", string(dataDone))
+	}
+
+	// 3. Unmarshal variations: null, empty string, zero RFC3339, valid RFC3339
+	cases := []struct {
+		name       string
+		json       string
+		wantZero   bool
+		wantParsed time.Time
+	}{
+		{
+			name:     "missing ended_at",
+			json:     `{"id": "j1", "status": "running"}`,
+			wantZero: true,
+		},
+		{
+			name:     "null ended_at",
+			json:     `{"id": "j2", "status": "running", "ended_at": null}`,
+			wantZero: true,
+		},
+		{
+			name:     "empty string ended_at",
+			json:     `{"id": "j3", "status": "running", "ended_at": ""}`,
+			wantZero: true,
+		},
+		{
+			name:     "zero RFC3339 ended_at",
+			json:     `{"id": "j4", "status": "running", "ended_at": "0001-01-01T00:00:00Z"}`,
+			wantZero: true,
+		},
+		{
+			name:       "valid RFC3339 ended_at",
+			json:       `{"id": "j5", "status": "done", "ended_at": "2026-11-06T14:00:00Z"}`,
+			wantZero:   false,
+			wantParsed: time.Date(2026, 11, 6, 14, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var decoded model.Job
+			if err := json.Unmarshal([]byte(tc.json), &decoded); err != nil {
+				t.Fatalf("failed to unmarshal JSON: %v", err)
+			}
+			if tc.wantZero {
+				if !decoded.EndedAt.IsZero() {
+					t.Errorf("expected EndedAt to be zero, got %v", decoded.EndedAt)
+				}
+			} else {
+				if !decoded.EndedAt.Equal(tc.wantParsed) {
+					t.Errorf("expected EndedAt = %v, got %v", tc.wantParsed, decoded.EndedAt)
+				}
+			}
+		})
 	}
 }

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -88,6 +89,53 @@ func (j Job) DisplayTitle() string {
 		return t
 	}
 	return j.ID
+}
+
+// MarshalJSON customizes Job JSON encoding to omit ended_at when zero (for running/queued jobs).
+func (j Job) MarshalJSON() ([]byte, error) {
+	type Alias Job
+	if j.EndedAt.IsZero() {
+		return json.Marshal(&struct {
+			EndedAt *time.Time `json:"ended_at,omitempty"`
+			Alias
+		}{
+			EndedAt: nil,
+			Alias:   (Alias)(j),
+		})
+	}
+	return json.Marshal((Alias)(j))
+}
+
+// UnmarshalJSON customizes Job JSON decoding to safely handle missing, null, empty string, or zero RFC3339 ended_at.
+func (j *Job) UnmarshalJSON(data []byte) error {
+	type Alias Job
+	aux := struct {
+		EndedAtRaw *json.RawMessage `json:"ended_at,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(j),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.EndedAtRaw != nil {
+		var s string
+		if err := json.Unmarshal(*aux.EndedAtRaw, &s); err == nil {
+			s = strings.TrimSpace(s)
+			if s == "" || s == "0001-01-01T00:00:00Z" {
+				j.EndedAt = time.Time{}
+			} else {
+				t, err := time.Parse(time.RFC3339Nano, s)
+				if err != nil {
+					t, err = time.Parse(time.RFC3339, s)
+				}
+				if err == nil {
+					j.EndedAt = t
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // LocalStatus represents the on-disk JSON snapshot of local wrapper state.

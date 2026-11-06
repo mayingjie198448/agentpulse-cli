@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 )
 
 const (
@@ -16,30 +18,91 @@ const (
 )
 
 var (
-	// Regex for OpenAI / Anthropic / AI vendor keys (e.g. sk-..., ant-...)
-	apiKeyRegex = regexp.MustCompile(`\b(sk|ant|key)-[a-zA-Z0-9_\-]{16,}\b`)
+	// Regex for Private Key blocks (PEM format: RSA, EC, DSA, OPENSSH, etc.)
+	privateKeyRegex = regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`)
 
-	// Regex for GitHub tokens
-	githubTokenRegex = regexp.MustCompile(`\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)
+	// Regex for URL embedded credentials: http://user:pass@host
+	urlCredRegex = regexp.MustCompile(`(https?://[^:\s]+):([^@\s]+)@`)
+
+	// Regex for Bearer / Authorization tokens in headers or strings
+	bearerRegex = regexp.MustCompile(`(?i)\b(bearer|authorization)\s+[a-zA-Z0-9_\-\.]{10,}\b`)
+
+	// Regex for CLI flag credentials (e.g. --api-key secret, --token secret)
+	cliFlagCredRegex = regexp.MustCompile(`(?i)(--?[a-z0-9_-]*(?:api[_-]?key|access[_-]?token|secret[_-]?key|secret|password|passwd|auth[_-]?token|token))\s+([^\s,;]+)`)
+
+	// Regex for key-value credentials: password=xyz, token=xyz, secret=xyz, etc.
+	credentialKVRegex = regexp.MustCompile(`(?i)\b([a-z0-9_-]*(?:api[_-]?key|access[_-]?token|secret[_-]?key|secret|password|passwd|auth[_-]?token|token))\s*([:=])\s*([^\s,;]+)`)
+
+	// Regex for OpenAI / Anthropic / AI vendor keys (e.g. sk-..., ant-..., key-..., ai-...)
+	apiKeyRegex = regexp.MustCompile(`\b(sk|ant|key|ai)-[a-zA-Z0-9_\-]{16,}\b`)
+
+	// Regex for GitHub / GitLab / HuggingFace tokens
+	githubTokenRegex = regexp.MustCompile(`\b(gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_\-]{20,}|hf_[A-Za-z0-9]{20,})\b`)
 
 	// Regex for Slack / Discord / OAuth tokens
 	oauthTokenRegex = regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9_\-]{16,}\b`)
 
 	// Regex for AWS Access Key IDs
 	awsKeyRegex = regexp.MustCompile(`\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b`)
-
-	// Regex for Bearer tokens
-	bearerRegex = regexp.MustCompile(`(?i)\b(bearer|authorization)\s+[a-zA-Z0-9_\-\.]{10,}\b`)
-
-	// Regex for key-value credentials: password=xyz, token=xyz, secret=xyz, etc.
-	credentialKVRegex = regexp.MustCompile(`(?i)\b(api[_-]?key|access[_-]?token|secret[_-]?key|secret|password|passwd|auth[_-]?token|token)\s*([:=])\s*([^\s,;]+)`)
-
-	// Regex for URL embedded credentials: http://user:pass@host
-	urlCredRegex = regexp.MustCompile(`(https?://[^:\s]+):([^@\s]+)@`)
-
-	// Regex for Private Key blocks
-	privateKeyRegex = regexp.MustCompile(`-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----`)
 )
+
+// RedactSecrets scans a text string and replaces detected credentials, API keys, and tokens
+// with redaction placeholders.
+//
+// Known patterns covered:
+//   - PEM Private Key blocks
+//   - Embedded URL credentials (e.g. https://user:token@github.com)
+//   - Authorization / Bearer tokens
+//   - CLI flags with credential values (e.g. --api-key secret, --token secret)
+//   - Key-value credentials (e.g. password=secret, token:secret)
+//   - Vendor-specific tokens: OpenAI/Anthropic (sk-..., ant-..., ai-...), GitHub (ghp_..., github_pat_...),
+//     GitLab (glpat-...), HuggingFace (hf_...), Slack (xoxb-...), AWS Access Keys (AKIA...).
+//
+// Boundary Note: Non-exhaustive regex patterns provide defense-in-depth sanitization, but do
+// not constitute an absolute cryptographic security guarantee. Users should avoid embedding credentials
+// directly in task command lines where environment variables or credential managers can be used.
+func RedactSecrets(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	// 1. Redact Private Key blocks
+	text = privateKeyRegex.ReplaceAllString(text, "[PRIVATE_KEY_REDACTED]")
+
+	// 2. Redact URL credentials
+	text = urlCredRegex.ReplaceAllString(text, "${1}:[REDACTED]@")
+
+	// 3. Redact Bearer / Authorization headers
+	text = bearerRegex.ReplaceAllString(text, "${1} [REDACTED]")
+
+	// 4. Redact CLI flag credentials (e.g. --api-key secret)
+	text = cliFlagCredRegex.ReplaceAllString(text, "${1} [REDACTED]")
+
+	// 5. Redact Key-Value credentials (e.g. password=secret)
+	text = credentialKVRegex.ReplaceAllString(text, "${1}${2}[REDACTED]")
+
+	// 6. Redact vendor-specific API keys and tokens
+	text = apiKeyRegex.ReplaceAllString(text, "${1}-[REDACTED]")
+	text = githubTokenRegex.ReplaceAllString(text, "[REDACTED_TOKEN]")
+	text = oauthTokenRegex.ReplaceAllString(text, "[REDACTED_TOKEN]")
+	text = awsKeyRegex.ReplaceAllString(text, "[REDACTED_AWS_KEY]")
+
+	return text
+}
+
+// SanitizeCommand cleans and redacts secret keys/tokens from command strings so sensitive data
+// is never leaked into MQTT retained messages or external job metadata.
+func SanitizeCommand(cmd string) string {
+	return RedactSecrets(cmd)
+}
+
+// SanitizeTitle cleans and bounds a title string, ensuring secrets are redacted.
+func SanitizeTitle(title string, maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = 60
+	}
+	return SanitizePrompt(title, maxLen)
+}
 
 // SanitizePrompt redacts secret keys/tokens and enforces length limits so sensitive data
 // NEVER leaks into MQTT retained messages.
@@ -53,38 +116,37 @@ func SanitizePrompt(prompt string, maxLen int) string {
 		return ""
 	}
 
-	// 1. Redact Private Key blocks
-	cleaned = privateKeyRegex.ReplaceAllString(cleaned, "[PRIVATE_KEY_REDACTED]")
+	cleaned = RedactSecrets(cleaned)
 
-	// 2. Redact URL credentials
-	cleaned = urlCredRegex.ReplaceAllString(cleaned, "${1}:[REDACTED]@")
-
-	// 3. Redact Bearer / Authorization headers
-	cleaned = bearerRegex.ReplaceAllString(cleaned, "${1} [REDACTED]")
-
-	// 4. Redact Key-Value credentials (e.g. password=secret)
-	cleaned = credentialKVRegex.ReplaceAllString(cleaned, "${1}${2}[REDACTED]")
-
-	// 5. Redact vendor-specific API keys and tokens
-	cleaned = apiKeyRegex.ReplaceAllString(cleaned, "${1}-[REDACTED]")
-	cleaned = githubTokenRegex.ReplaceAllString(cleaned, "[REDACTED_TOKEN]")
-	cleaned = oauthTokenRegex.ReplaceAllString(cleaned, "[REDACTED_TOKEN]")
-	cleaned = awsKeyRegex.ReplaceAllString(cleaned, "[REDACTED_AWS_KEY]")
-
-	// 6. Normalize newlines and consecutive whitespace to a single space
+	// Normalize newlines and consecutive whitespace to a single space
 	cleaned = strings.Join(strings.Fields(cleaned), " ")
 
-	// 7. Enforce max length
+	// Enforce max rune length
 	runes := []rune(cleaned)
 	if len(runes) > maxLen {
 		if maxLen > 3 {
 			cleaned = string(runes[:maxLen-3]) + "..."
-		} else {
+		} else if maxLen > 0 {
 			cleaned = string(runes[:maxLen])
+		} else {
+			cleaned = ""
 		}
 	}
 
 	return cleaned
+}
+
+// SanitizeJob returns a copy of model.Job with Command, Title, Prompt, and Error
+// fields consistently redacted for external visibility boundaries (MQTT retained, status files, alerts).
+func SanitizeJob(j model.Job) model.Job {
+	sanitized := j
+	sanitized.Command = SanitizeCommand(j.Command)
+	sanitized.Title = SanitizeTitle(j.Title, 100)
+	sanitized.Prompt = SanitizePrompt(j.Prompt, DefaultMaxPromptLength)
+	if sanitized.Error != "" {
+		sanitized.Error = RedactSecrets(sanitized.Error)
+	}
+	return sanitized
 }
 
 // ExtractPrompt scans command-line arguments for prompt/task flags (e.g. -p, --prompt, --task).
