@@ -161,6 +161,10 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 	// 角色 1: 本机 Listener + 心跳守护进程
 	pMQTT := &listenerMQTT
 	isPlain := termutil.ShouldUsePlain(plainOutput)
+	maxConcurrent := 1
+	if fileCfg != nil && fileCfg.MaxConcurrentJobs > 0 {
+		maxConcurrent = fileCfg.MaxConcurrentJobs
+	}
 	listenerCfg := wrapper.ListenerConfig{
 		MachineID:                  machineID,
 		MachineName:                host,
@@ -171,6 +175,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		Quiet:                      !isPlain,
 		Stdout:                     io.Discard,
 		Stderr:                     io.Discard,
+		MaxConcurrentJobs:          maxConcurrent,
 		OnMQTTConnected: func() {
 			opts := paho.NewClientOptions()
 			_ = mqtt.ApplyClientOptions(opts, announceMQTT)

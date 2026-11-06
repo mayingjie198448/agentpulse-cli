@@ -118,9 +118,11 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		cfg.Version = existingCfg.Version
 		cfg.Rev = existingCfg.Rev + 1
 		cfg.MachineID = existingCfg.MachineID
+		cfg.MaxConcurrentJobs = existingCfg.MaxConcurrentJobs
 		cfg.Broker = existingCfg.Broker
 		cfg.Agents = existingCfg.Agents
 	} else {
+		cfg.MaxConcurrentJobs = 1
 		cfg.Broker = config.BrokerConfig{
 			URL: "tls://broker.example:8883",
 			TLS: true,

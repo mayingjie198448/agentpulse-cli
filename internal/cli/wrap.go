@@ -31,6 +31,7 @@ func newWrapCmd() *cobra.Command {
 		dangerouslySkipPermissions bool
 		quiet                      bool
 		listen                     bool
+		maxConcurrentJobs          int
 	)
 
 	wrapCmd := &cobra.Command{
@@ -70,7 +71,7 @@ Examples:
 			}
 
 			if listen {
-				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet)
+				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, maxConcurrentJobs)
 			}
 
 			// 状态文件只来自 --status-file，否则使用默认路径。
@@ -214,6 +215,7 @@ Examples:
 	wrapCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when wrapping agy")
 	wrapCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse wrapper header/footer banners")
 	wrapCmd.Flags().BoolVar(&listen, "listen", false, "Run thin wrapper in listen mode to receive and execute remote dispatch commands")
+	wrapCmd.Flags().IntVarP(&maxConcurrentJobs, "max-concurrent-jobs", "c", 0, "最大本地并发作业数 (用于 --listen 模式，默认 1)")
 
 	return wrapCmd
 }

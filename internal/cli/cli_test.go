@@ -14,6 +14,7 @@ import (
 )
 
 func TestRootCommands(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tests := []struct {
 		name      string
 		args      []string
@@ -1089,6 +1090,7 @@ func TestRootCommand_050ProductBoundaries(t *testing.T) {
 }
 
 func TestJobsCommand_RequiresBroker(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	for _, args := range [][]string{{"jobs"}, {"jobs", "--json"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			cmd := cli.NewRootCmd()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -789,5 +790,118 @@ func TestListener_QueuedStatusAndJobCount(t *testing.T) {
 	}
 	if queuedJob.Status != model.StatusQueued {
 		t.Errorf("expected queued status, got %s", queuedJob.Status)
+	}
+}
+
+func TestListener_ConcurrentExecution(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "concurrent-status.json")
+
+	listeningCh := make(chan struct{})
+	startedCh := make(chan string, 10)
+	gateCh := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:         "concurrent-node-3",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		MaxConcurrentJobs: 3,
+		OnListening: func(_ string) {
+			close(listeningCh)
+		},
+		OnJobStart: func(j model.Job) {
+			startedCh <- j.ID
+			<-gateCh
+		},
+		OnJobComplete: func(j model.Job, err error) {
+			wg.Done()
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = l.Run(ctx)
+	}()
+
+	select {
+	case <-listeningCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for OnListening")
+	}
+
+	dispatchTopic := mqtt.MachineDispatchTopic("concurrent-node-3")
+
+	// Dispatch 4 jobs to node with MaxConcurrentJobs = 3
+	for i := 1; i <= 4; i++ {
+		cmd := model.DispatchCommand{
+			CommandID: fmt.Sprintf("cmd-conc-%d", i),
+			JobID:     fmt.Sprintf("job-conc-%d", i),
+			Engine:    model.EngineAgy,
+			Command:   "agy",
+			Args:      []string{"--", "-p", fmt.Sprintf("task %d", i)},
+			Title:     fmt.Sprintf("Concurrent task %d", i),
+			Timestamp: time.Now().UTC(),
+		}
+		p, _ := json.Marshal(cmd)
+		mockClient.Publish(dispatchTopic, 1, false, p)
+	}
+
+	// First 3 jobs should start concurrently
+	startedJobs := make(map[string]bool)
+	for i := 0; i < 3; i++ {
+		select {
+		case id := <-startedCh:
+			startedJobs[id] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for 3 concurrent jobs to start (got %d)", len(startedJobs))
+		}
+	}
+
+	if len(startedJobs) != 3 {
+		t.Fatalf("expected 3 jobs running concurrently, got %d", len(startedJobs))
+	}
+
+	// 4th job must NOT have started yet because limit is 3
+	select {
+	case extraID := <-startedCh:
+		t.Fatalf("unexpected 4th job started beyond concurrency limit 3: %s", extraID)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: 4th job is waiting in dispatch queue
+	}
+
+	// Total machine job count should be 4 (3 running + 1 queued)
+	if l.Machine().JobCount != 4 {
+		t.Errorf("expected machine job count to be 4 (3 running + 1 queued), got %d", l.Machine().JobCount)
+	}
+
+	// Release gate to let jobs complete
+	close(gateCh)
+
+	// Wait for all 4 jobs to complete
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for all 4 jobs to finish")
+	}
+
+	// All jobs done -> job count returns to 0
+	if l.Machine().JobCount != 0 {
+		t.Errorf("expected machine job count to be 0 after all jobs complete, got %d", l.Machine().JobCount)
 	}
 }

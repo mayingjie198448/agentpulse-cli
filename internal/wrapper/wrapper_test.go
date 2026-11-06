@@ -1035,3 +1035,130 @@ func TestListener_MachineIdentityDefaults(t *testing.T) {
 		t.Errorf("expected sanitized ID 'worker-node-beta', got %q", l2.Machine().ID)
 	}
 }
+
+func TestBuildCommandArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		args     []string
+		expected []string
+	}{
+		{
+			name:     "bare -- following binary is stripped",
+			command:  "agy",
+			args:     []string{"--", "-p", "hello world"},
+			expected: []string{"agy", "-p", "hello world"},
+		},
+		{
+			name:     "bare -- in command string is stripped",
+			command:  "agy -- -p",
+			args:     []string{"hello"},
+			expected: []string{"agy", "-p", "hello"},
+		},
+		{
+			name:     "no bare -- untouched",
+			command:  "agy",
+			args:     []string{"-p", "hello"},
+			expected: []string{"agy", "-p", "hello"},
+		},
+		{
+			name:     "git checkout with -- untouched",
+			command:  "git",
+			args:     []string{"checkout", "--", "main"},
+			expected: []string{"git", "checkout", "--", "main"},
+		},
+		{
+			name:     "empty command with args",
+			command:  "",
+			args:     []string{"agy", "--", "-p", "test"},
+			expected: []string{"agy", "-p", "test"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wrapper.BuildCommandArgs(tt.command, tt.args)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("length mismatch: got %v, expected %v", got, tt.expected)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("item %d mismatch: got %q, expected %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIsUnauthenticatedOutput(t *testing.T) {
+	unauthLines := []string{
+		"Singleflight refresh failed: error getting token source: You are not logged into Antigravity.",
+		"Please sign in to view available models",
+		"Authentication required. Please visit the URL to log in",
+		"Waiting for authentication...",
+		"Paste the authorization code here and press Enter",
+		"Print mode: not logged in and no controlling terminal; cannot complete interactive login",
+		"Using file-based token storage because SSH session detected",
+		"you are not logged into Antigravity",
+	}
+
+	for _, line := range unauthLines {
+		isUnauth, reason := wrapper.IsUnauthenticatedOutput(line)
+		if !isUnauth {
+			t.Errorf("expected %q to be detected as unauthenticated", line)
+		}
+		if !strings.Contains(reason, "未登录") {
+			t.Errorf("expected Chinese reason, got %q", reason)
+		}
+	}
+
+	normalLines := []string{
+		"Starting language server process with pid 12345",
+		"Language server version: 1.5.1",
+		"gemini-3.8-flash-high Gemini 3.8 Flash (High)",
+		"Executing tool: git status",
+	}
+
+	for _, line := range normalLines {
+		isUnauth, _ := wrapper.IsUnauthenticatedOutput(line)
+		if isUnauth {
+			t.Errorf("expected %q to NOT be detected as unauthenticated", line)
+		}
+	}
+}
+
+func TestWrapper_AuthFailure_FastFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	// Simulate a process that prints an unauthenticated error and then would sleep 5s
+	// The wrapper should immediately kill the process and fail fast.
+	start := time.Now()
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "test-mac",
+		StatusFile: statusFile,
+		Args: []string{
+			"sh", "-c",
+			`echo "error getting token source: You are not logged into Antigravity."; exec sleep 5`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	runErr := w.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if runErr == nil {
+		t.Fatalf("expected error due to auth failure, got nil")
+	}
+	if !strings.Contains(runErr.Error(), "未登录认证") {
+		t.Errorf("expected error containing '未登录认证', got: %v", runErr)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("expected fail-fast (well under 3s), took %v", elapsed)
+	}
+	if w.Job().Status != model.StatusFailed {
+		t.Errorf("expected job status %s, got %s", model.StatusFailed, w.Job().Status)
+	}
+}

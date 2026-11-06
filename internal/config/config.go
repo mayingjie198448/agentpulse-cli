@@ -1,23 +1,26 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config represents the AgentPulse v1 configuration stored in ~/.config/agentpulse/config.yaml.
 type Config struct {
-	Version   int           `yaml:"version"`
-	MachineID string        `yaml:"machine_id"`
-	Rev       int           `yaml:"rev,omitempty"`
-	Broker    BrokerConfig  `yaml:"broker"`
-	Agents    []AgentConfig `yaml:"agents"`
+	Version           int           `yaml:"version"`
+	MachineID         string        `yaml:"machine_id"`
+	Rev               int           `yaml:"rev,omitempty"`
+	MaxConcurrentJobs int           `yaml:"max_concurrent_jobs,omitempty"`
+	Broker            BrokerConfig  `yaml:"broker"`
+	Agents            []AgentConfig `yaml:"agents"`
 }
 
 // BrokerConfig holds MQTT connection and authentication details.
@@ -123,6 +126,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Rev == 0 {
 		cfg.Rev = 1
 	}
+	if cfg.MaxConcurrentJobs <= 0 {
+		cfg.MaxConcurrentJobs = 1
+	}
 
 	return &cfg, nil
 }
@@ -196,23 +202,66 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 		st.Ok = true
 		st.ResolvedPath = p
 		st.Detail = p
-		return st
-	}
-
-	for _, alias := range ag.Alias {
-		if alias != "" && alias != ag.ID {
-			if p, err := exec.LookPath(alias); err == nil {
-				st.Ok = true
-				st.ResolvedPath = p
-				st.Detail = p
-				return st
+	} else {
+		for _, alias := range ag.Alias {
+			if alias != "" && alias != ag.ID {
+				if p, err := exec.LookPath(alias); err == nil {
+					st.Ok = true
+					st.ResolvedPath = p
+					st.Detail = p
+					break
+				}
 			}
 		}
 	}
 
-	st.Ok = false
-	st.Detail = "未在 PATH 中找到可执行文件"
+	if !st.Ok {
+		st.Detail = "未在 PATH 中找到可执行文件"
+		return st
+	}
+
+	// For agy, probe whether it is logged in and ready for non-interactive execution
+	if filepath.Base(st.ResolvedPath) == "agy" || ag.ID == "agy" {
+		authOk, detail := ProbeAgyAuth(st.ResolvedPath)
+		if !authOk {
+			st.Ok = false
+			st.Detail = detail
+		} else if detail != "" {
+			st.Detail = fmt.Sprintf("%s (%s)", st.ResolvedPath, detail)
+		}
+	}
+
 	return st
+}
+
+// ProbeAgyAuth probes whether agy is authenticated for non-interactive execution.
+// It executes 'agy models' with SSH session variables stripped and a short timeout.
+func ProbeAgyAuth(binPath string) (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binPath, "models")
+	cmd.Env = FilterChildProcessEnv(os.Environ())
+
+	output, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(output))
+	lower := strings.ToLower(outStr)
+
+	if strings.Contains(lower, "please sign in") ||
+		strings.Contains(lower, "not logged into antigravity") ||
+		strings.Contains(lower, "error getting token source") ||
+		strings.Contains(lower, "authentication required") {
+		return false, "未登录 (需执行 'agy' 完成登录认证)"
+	}
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return true, "就绪 (在线测活超时)"
+		}
+		return true, "就绪"
+	}
+
+	return true, "已登录就绪"
 }
 
 // ProbeAgents probes a list of agent configs.
@@ -224,9 +273,14 @@ func ProbeAgents(agents []AgentConfig) []AgentStatus {
 	return statuses
 }
 
-// FilterChildProcessEnv strips credential-bearing variables before a child process starts.
-// Product configuration is not read from the environment. Leftover AGENTPULSE_MQTT_* and
-// AGENTPULSE_BROKER_* values are still removed so a wrapped agent cannot inherit broker material.
+// FilterChildProcessEnv strips credential-bearing variables and incoming SSH session indicators
+// before a child process starts.
+// Removing SSH_CLIENT, SSH_CONNECTION, and SSH_TTY ensures that local AI agent CLIs (e.g. agy)
+// launched by listener or wrapper do not misidentify the execution environment as a remote/headless
+// SSH session, allowing them to access the host's normal credential/keyring store just like
+// interactive sessions.
+// Leftover AGENTPULSE_MQTT_* and AGENTPULSE_BROKER_* values are also removed so a wrapped agent
+// cannot inherit broker credentials.
 func FilterChildProcessEnv(env []string) []string {
 	var filtered []string
 	for _, kv := range env {
@@ -237,7 +291,10 @@ func FilterChildProcessEnv(env []string) []string {
 		key := strings.ToUpper(parts[0])
 		if strings.Contains(key, "PASSWORD") ||
 			strings.HasPrefix(key, "AGENTPULSE_MQTT_") ||
-			strings.HasPrefix(key, "AGENTPULSE_BROKER_") {
+			strings.HasPrefix(key, "AGENTPULSE_BROKER_") ||
+			key == "SSH_CLIENT" ||
+			key == "SSH_CONNECTION" ||
+			key == "SSH_TTY" {
 			continue
 		}
 		filtered = append(filtered, kv)
