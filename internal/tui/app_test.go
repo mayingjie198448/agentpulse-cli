@@ -93,6 +93,10 @@ func (f *fakeStore) IsConnected() bool {
 	return !f.disconnected
 }
 
+func (f *fakeStore) Refresh(context.Context) error {
+	return nil
+}
+
 func (f *fakeStore) Close() error { return nil }
 
 func TestTUIModel_Navigation(t *testing.T) {
@@ -775,3 +779,97 @@ func TestTUIModel_DeleteJobFlow(t *testing.T) {
 	}
 }
 
+func TestTUIModel_MachinesPrimaryLabelMachineID(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{
+				ID:     "mac-mini",
+				Name:   "hostname-mini",
+				Online: true,
+			},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	v := tm.View()
+	// Must contain config machine_id=mac-mini, not only hostname pretending to be primary
+	if !strings.Contains(v, "mac-mini") {
+		t.Fatalf("expected View to contain machine_id 'mac-mini', got:\n%s", v)
+	}
+	if !strings.Contains(v, "mac-mini") || !strings.Contains(v, "hostname-mini") {
+		t.Fatalf("expected View to contain 'mac-mini' primary and 'hostname-mini' secondary, got:\n%s", v)
+	}
+}
+
+func TestTUIModel_ExplicitRefresh(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+			{ID: "node-stale", Name: "node-stale", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-1", MachineID: "node-1", Status: model.StatusRunning, Title: "Job 1"},
+			{ID: "job-stale", MachineID: "node-stale", Status: model.StatusDone, Title: "Job Stale"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-1":     {{JobID: "job-1", Message: "log 1"}},
+			"job-stale": {{JobID: "job-stale", Message: "log stale"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Check footer includes 'r' and '刷新'
+	view := tm.View()
+	if !strings.Contains(view, "r") || !strings.Contains(view, "刷新") {
+		t.Fatalf("expected footer to show 'r 刷新', got:\n%s", view)
+	}
+
+	// Simulate external state change (node-stale dropped, new node announced)
+	st.machines = []model.Machine{
+		{ID: "node-1", Name: "node-1", Online: true},
+		{ID: "node-new", Name: "node-new", Online: true},
+	}
+	st.jobs = []model.Job{
+		{ID: "job-1", MachineID: "node-1", Status: model.StatusRunning, Title: "Job 1"},
+	}
+
+	// Trigger manual refresh via 'r' key
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatalf("expected 'r' key to produce a tea.Cmd for refresh")
+	}
+
+	// Execute cmd
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("expected refresh cmd to return a message")
+	}
+
+	// Deliver refreshDoneMsg
+	tm, _ = tm.Update(msg)
+
+	mRefreshed := tm.(*tui.Model)
+	if len(mRefreshed.MachinesForTest()) != 2 {
+		t.Fatalf("expected 2 machines after refresh, got %d", len(mRefreshed.MachinesForTest()))
+	}
+	machIDs := make(map[string]bool)
+	for _, mach := range mRefreshed.MachinesForTest() {
+		machIDs[mach.ID] = true
+	}
+	if !machIDs["node-1"] || !machIDs["node-new"] || machIDs["node-stale"] {
+		t.Fatalf("expected node-stale to be cleared and node-new present, got %+v", machIDs)
+	}
+
+	if len(mRefreshed.JobsForTest()) != 1 || mRefreshed.JobsForTest()[0].ID != "job-1" {
+		t.Fatalf("expected job-stale to be dropped after refresh, got %+v", mRefreshed.JobsForTest())
+	}
+}

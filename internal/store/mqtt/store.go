@@ -180,6 +180,29 @@ func (s *Store) HandleMessage(topic string, payload []byte) {
 }
 
 func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		// Empty payload is an MQTT clear-retained tombstone
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		deletedMachine, exists := s.machines[pt.machineID]
+		delete(s.machines, pt.machineID)
+		s.mu.Unlock()
+
+		if exists && deletedMachine != nil {
+			delCopy := *deletedMachine
+			delCopy.Online = false
+			s.broadcast(model.Event{
+				Type:      model.EventMachineUpdated,
+				Machine:   &delCopy,
+				Timestamp: time.Now(),
+			})
+		}
+		return
+	}
+
 	var m model.Machine
 	if err := json.Unmarshal(payload, &m); err != nil {
 		return
@@ -323,6 +346,18 @@ func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
 }
 
 func (s *Store) handleAnnounce(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		// Empty payload is an MQTT clear-retained tombstone
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.announces, pt.machineID)
+		s.mu.Unlock()
+		return
+	}
+
 	var ann model.MachineAnnounce
 	if err := json.Unmarshal(payload, &ann); err != nil {
 		return
@@ -725,6 +760,71 @@ func (s *Store) checkStaleMachines() {
 // CheckStaleMachines explicitly runs stale machine inspection (exported for testing).
 func (s *Store) CheckStaleMachines() {
 	s.checkStaleMachines()
+}
+
+// Refresh re-subscribes to MQTT topics, clears stale in-memory state, and settles
+// retained messages from the broker per docs/mqtt-protocol.md §5.1.
+func (s *Store) Refresh(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("store closed")
+	}
+	// Clear cached state so records removed or cleared on broker are dropped
+	s.machines = make(map[string]*model.Machine)
+	s.jobs = make(map[string]*model.Job)
+	s.announces = make(map[string]*model.MachineAnnounce)
+	s.mu.Unlock()
+
+	if s.client == nil || !s.client.IsConnected() {
+		s.checkStaleMachines()
+		return nil
+	}
+
+	filters := map[string]byte{
+		TopicMachinesStatus:           1,
+		TopicJobsStatus:               1,
+		TopicJobsLogs:                 0,
+		TopicAnnounceWildcard:         1,
+		TopicMachinesAnnounceWildcard: 1,
+	}
+	unsubTopics := []string{
+		TopicMachinesStatus,
+		TopicJobsStatus,
+		TopicJobsLogs,
+		TopicAnnounceWildcard,
+		TopicMachinesAnnounceWildcard,
+	}
+
+	if token := s.client.Unsubscribe(unsubTopics...); token != nil {
+		token.WaitTimeout(s.cfg.Timeout)
+	}
+
+	subToken := s.client.SubscribeMultiple(filters, s.onMQTTMessage)
+	if subToken != nil {
+		if !subToken.WaitTimeout(s.cfg.Timeout) {
+			return fmt.Errorf("MQTT subscription timed out during refresh")
+		}
+		if err := subToken.Error(); err != nil {
+			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
+		}
+	}
+
+	settle := s.cfg.SettleTimeout
+	if settle <= 0 {
+		settle = 200 * time.Millisecond
+	}
+
+	select {
+	case <-time.After(settle):
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCh:
+		return fmt.Errorf("store closed")
+	}
+
+	s.checkStaleMachines()
+	return nil
 }
 
 // Settle pauses the caller for the configured duration (or default) to allow retained messages to settle.

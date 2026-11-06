@@ -63,6 +63,10 @@ func NewRootCmd() *cobra.Command {
 	wrapCmd.Hidden = true
 	rootCmd.AddCommand(wrapCmd)
 
+	autostartCmd := newAutostartCmd()
+	autostartCmd.Hidden = true
+	rootCmd.AddCommand(autostartCmd)
+
 	listCmd := newListCmd()
 	listCmd.Hidden = true
 	rootCmd.AddCommand(listCmd)

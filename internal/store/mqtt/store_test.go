@@ -911,3 +911,114 @@ func TestMQTTStore_TombstoneClearsJob(t *testing.T) {
 	}
 }
 
+func TestMQTTStore_TombstoneClearsMachine(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	machPayload := `{"id":"mach-del","name":"mach-del","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-del/status", []byte(machPayload), true)
+
+	m, err := st.GetMachine(ctx, "mach-del")
+	if err != nil || m.ID != "mach-del" {
+		t.Fatalf("expected mach-del to exist, got %v", err)
+	}
+
+	// Empty payload tombstone
+	fakeClient.Deliver("agentpulse/v1/machines/mach-del/status", []byte{}, true)
+
+	if _, err := st.GetMachine(ctx, "mach-del"); err == nil {
+		t.Fatalf("expected mach-del to be removed after tombstone")
+	}
+}
+
+func TestMQTTStore_TombstoneClearsAnnounce(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	annPayload := `{"v":1,"machine_id":"ann-mach","ts":"2026-11-06T10:00:00Z","rev":1,"hostname":"ann-host","os":"darwin/arm64","agents":[]}`
+	fakeClient.Deliver("agentpulse/v1/machines/ann-mach/announce", []byte(annPayload), true)
+
+	ann, err := st.GetAnnounce(ctx, "ann-mach")
+	if err != nil || ann.MachineID != "ann-mach" {
+		t.Fatalf("expected ann-mach announce to exist, got %v", err)
+	}
+
+	// Empty payload tombstone
+	fakeClient.Deliver("agentpulse/v1/machines/ann-mach/announce", []byte{}, true)
+
+	if _, err := st.GetAnnounce(ctx, "ann-mach"); err == nil {
+		t.Fatalf("expected ann-mach announce to be removed after tombstone")
+	}
+}
+
+func TestMQTTStore_Refresh(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 10 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Initial deliver: node-1 and node-stale
+	mach1 := `{"id":"node-1","name":"node-1","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/node-1/status", []byte(mach1), true)
+
+	machStale := `{"id":"node-stale","name":"node-stale","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/node-stale/status", []byte(machStale), true)
+
+	if _, err := st.GetMachine(ctx, "node-stale"); err != nil {
+		t.Fatalf("expected node-stale to exist")
+	}
+
+	// Stale node retained message cleared on broker (tombstone)
+	fakeClient.Deliver("agentpulse/v1/machines/node-stale/status", []byte{}, true)
+
+	// New node announced on broker
+	machNew := `{"id":"node-new","name":"node-new","online":true,"job_count":0}`
+	fakeClient.Deliver("agentpulse/v1/machines/node-new/status", []byte(machNew), true)
+
+	// Refresh re-subscribes and settles retained messages
+	if err := st.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh error: %v", err)
+	}
+
+	machines, err := st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	if len(machines) != 2 {
+		t.Fatalf("expected 2 machines after refresh, got %d: %+v", len(machines), machines)
+	}
+
+	machIDs := make(map[string]bool)
+	for _, m := range machines {
+		machIDs[m.ID] = true
+	}
+	if !machIDs["node-1"] || !machIDs["node-new"] || machIDs["node-stale"] {
+		t.Fatalf("expected node-1 and node-new, node-stale dropped, got: %+v", machIDs)
+	}
+}
