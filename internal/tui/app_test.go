@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
@@ -939,5 +940,201 @@ func TestTUIModel_GroupingAndSelectionPreservation(t *testing.T) {
 	}
 	if !strings.Contains(viewDetail, "alice@company.internal") {
 		t.Errorf("expected detail box to display requested_by, got:\n%s", viewDetail)
+	}
+}
+
+func TestTUIModel_LiveUpdateAndContinuousGrouping(t *testing.T) {
+	st := &fakeStore{}
+	defer st.Close()
+	m := tui.NewModel(st)
+
+	t0 := time.Now().UTC()
+	jobs := []model.Job{
+		{
+			ID:        "job-1",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/beta",
+			StartedAt: t0,
+		},
+		{
+			ID:        "job-2",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/gamma",
+			StartedAt: t0,
+		},
+		{
+			ID:        "job-3",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/zeta",
+			StartedAt: t0,
+		},
+	}
+	m.SetJobsForTest(jobs)
+
+	// Set terminal size
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	// Switch to GroupRepo: press 'g'
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRepo {
+		t.Fatalf("expected GroupRepo, got %v", m.GroupingForTest())
+	}
+
+	// Navigate cursor to job-2
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-2" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Fatalf("failed to select job-2")
+	}
+
+	// 1. Receive EventJobUpdated for existing job-3: changes repo from org/zeta to org/alpha
+	// In GroupRepo, org/alpha must sort BEFORE org/beta and org/gamma!
+	updatedJob3 := jobs[2]
+	updatedJob3.Repo = "org/alpha"
+	tm, _ = tm.Update(model.Event{
+		Type: model.EventJobUpdated,
+		Job:  &updatedJob3,
+	})
+
+	// Assert job list was re-sorted according to new group order
+	firstJob := m.JobsForTest()[0]
+	if firstJob.ID != "job-3" || firstJob.Repo != "org/alpha" {
+		t.Errorf("expected job-3 (org/alpha) to be reordered to front, got %+v", firstJob)
+	}
+
+	// Assert selection preserved on job-2!
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Errorf("expected selected job to remain job-2, got %s (idx %d)",
+			m.JobsForTest()[m.SelectedJobIdxForTest()].ID, m.SelectedJobIdxForTest())
+	}
+
+	// 2. Receive EventJobUpdated for a NEW job: job-new with repo "org/00-first"
+	newJob := model.Job{
+		ID:        "job-new",
+		MachineID: "node-1",
+		Engine:    model.EngineAgy,
+		Status:    model.StatusRunning,
+		Repo:      "org/00-first",
+		StartedAt: t0,
+	}
+	tm, _ = tm.Update(model.Event{
+		Type: model.EventJobUpdated,
+		Job:  &newJob,
+	})
+
+	// Assert newly added job was sorted into correct place (first)
+	if m.JobsForTest()[0].ID != "job-new" {
+		t.Errorf("expected job-new at index 0 after grouping, got %s", m.JobsForTest()[0].ID)
+	}
+
+	// Assert selection still preserved on job-2!
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Errorf("expected selected job to remain job-2 after adding new job, got %s (idx %d)",
+			m.JobsForTest()[m.SelectedJobIdxForTest()].ID, m.SelectedJobIdxForTest())
+	}
+
+	// 3. Continuous sequential updates (simulating live broker stream)
+	for i := 0; i < 5; i++ {
+		liveJob := model.Job{
+			ID:        fmt.Sprintf("job-live-%d", i),
+			MachineID: "node-2",
+			Engine:    model.EngineOpenCode,
+			Status:    model.StatusRunning,
+			Repo:      fmt.Sprintf("org/stream-%d", i),
+			StartedAt: t0.Add(time.Duration(i) * time.Minute),
+		}
+		tm, _ = tm.Update(model.Event{
+			Type: model.EventJobUpdated,
+			Job:  &liveJob,
+		})
+
+		// Selection must remain on job-2 throughout all live events
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+			t.Fatalf("iteration %d: selection lost, got %s instead of job-2",
+				i, m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+		}
+	}
+}
+
+func TestTUIModel_CJKAndEmojiTruncationAndNarrowWindow(t *testing.T) {
+	st := &fakeStore{}
+	defer st.Close()
+	m := tui.NewModel(st)
+
+	t0 := time.Now().UTC()
+	jobs := []model.Job{
+		{
+			ID:          "job-cjk-1",
+			MachineID:   "node-cjk",
+			Engine:      model.EngineAgy,
+			Status:      model.StatusRunning,
+			Title:       "优化数据库连接池与查询性能处理长标题测试",
+			Repo:        "mayingjie/微服务核心组件仓",
+			Project:     "微服务核心组件",
+			Prompt:      "优化数据库连接池与查询性能，确保高并发下不发生死锁或连接泄漏 🚀🔥",
+			Cwd:         "/Users/张三/开发工程/🚀/agentpulse-cli",
+			Command:     "agy run --prompt '优化数据库连接池' --concurrency=10",
+			RequestedBy: "张三@公司内网",
+			StartedAt:   t0,
+			DurationStr: "12m 30s",
+		},
+		{
+			ID:          "job-emoji-2",
+			MachineID:   "node-gpu",
+			Engine:      model.EngineOpenCode,
+			Status:      model.StatusDone,
+			Title:       "🚀🔥模型微调与量化评估✨🎉",
+			Repo:        "org/🚀-ai-models",
+			Prompt:      "Fine-tune LLaMA-3 with LoRA and QLoRA 🚀🔥🎉",
+			Cwd:         "/home/ubuntu/models/🚀",
+			Command:     "opencode train --config lora.yaml",
+			RequestedBy: "ai-engineer@remote",
+			StartedAt:   t0.Add(-time.Hour),
+			EndedAt:     t0,
+			DurationStr: "1h 0s",
+		},
+	}
+	m.SetJobsForTest(jobs)
+
+	// Test a matrix of narrow and normal terminal window sizes
+	sizes := []struct {
+		w, h int
+	}{
+		{w: 120, h: 30},
+		{w: 60, h: 20},
+		{w: 40, h: 15},
+		{w: 25, h: 10},
+		{w: 15, h: 8},
+		{w: 10, h: 5},
+	}
+
+	var tm tea.Model = m
+	for _, sz := range sizes {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			tm, _ = tm.Update(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+
+			// View rendering must never panic, even in extremely narrow terminals
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("render panicked at size %dx%d: %v", sz.w, sz.h, r)
+				}
+			}()
+
+			view := tm.View()
+			if !utf8.ValidString(view) {
+				t.Fatalf("View output is not valid UTF-8 at size %dx%d", sz.w, sz.h)
+			}
+		})
 	}
 }

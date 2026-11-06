@@ -130,6 +130,8 @@ func New(cfg Config) (*Wrapper, error) {
 		} else {
 			cfg.Title = inferTitle(cfg.Args, cfg.Command)
 		}
+	} else {
+		cfg.Title = SanitizeTitle(cfg.Title, 100)
 	}
 
 	if cfg.Repo == "" && cfg.Project == "" {
@@ -173,8 +175,8 @@ func New(cfg Config) (*Wrapper, error) {
 		Status:      model.StatusRunning,
 		Progress:    0.0,
 		Cwd:         cfg.Cwd,
-		Command:     cfg.Command,
-		Title:       cfg.Title,
+		Command:     SanitizeCommand(cfg.Command),
+		Title:       SanitizeTitle(cfg.Title, 100),
 		Repo:        cfg.Repo,
 		Project:     cfg.Project,
 		Prompt:      cfg.Prompt,
@@ -208,6 +210,11 @@ func (w *Wrapper) Job() model.Job {
 	return w.job
 }
 
+// Config returns a copy of the wrapper's configuration.
+func (w *Wrapper) Config() Config {
+	return w.cfg
+}
+
 // Run executes the wrapped process or stub, writes local status, and publishes MQTT telemetry.
 func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 	// Write initial local status snapshot (status: running, online: true, job_count: 1)
@@ -225,7 +232,7 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
 		if runErr != nil {
 			w.job.Status = model.StatusFailed
-			w.job.Error = runErr.Error()
+			w.job.Error = RedactSecrets(runErr.Error())
 		} else {
 			w.job.Status = model.StatusDone
 			w.job.Progress = 100.0
@@ -540,6 +547,8 @@ func (w *Wrapper) publishJobStatus() {
 	j := w.job
 	w.mu.Unlock()
 
+	j = SanitizeJob(j)
+
 	topic := fmt.Sprintf("agentpulse/v1/machines/%s/jobs/%s/status", j.MachineID, j.ID)
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -594,7 +603,7 @@ func (w *Wrapper) publishAlert() {
 		return
 	}
 	w.mu.Lock()
-	j := w.job
+	j := SanitizeJob(w.job)
 	m := w.machine
 	w.mu.Unlock()
 
@@ -603,6 +612,7 @@ func (w *Wrapper) publishAlert() {
 		"machine_id":   m.ID,
 		"engine":       string(j.Engine),
 		"status":       string(j.Status),
+		"command":      j.Command,
 		"title":        j.Title,
 		"repo":         j.Repo,
 		"project":      j.Project,
@@ -635,7 +645,7 @@ func (w *Wrapper) writeStatusFile() error {
 	w.mu.Lock()
 	st := LocalStatus{
 		Machine:   w.machine,
-		Job:       w.job,
+		Job:       SanitizeJob(w.job),
 		PID:       w.pid,
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -853,20 +863,17 @@ func GenerateCommandID() string {
 func InferTitle(args []string, command string) string {
 	for i, arg := range args {
 		if (arg == "-p" || arg == "--prompt" || arg == "--task") && i+1 < len(args) {
-			return args[i+1]
+			return SanitizeTitle(args[i+1], 60)
 		}
 		if strings.HasPrefix(arg, "--prompt=") {
-			return strings.TrimPrefix(arg, "--prompt=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--prompt="), 60)
 		}
 		if strings.HasPrefix(arg, "--task=") {
-			return strings.TrimPrefix(arg, "--task=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--task="), 60)
 		}
 	}
 	if command != "" {
-		if len(command) > 60 {
-			return command[:57] + "..."
-		}
-		return command
+		return SanitizeTitle(command, 60)
 	}
 	return "Agent pulse job"
 }

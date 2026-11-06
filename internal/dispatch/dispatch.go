@@ -94,6 +94,8 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		} else {
 			cfg.Title = wrapper.InferTitle(commandArgs, commandBin)
 		}
+	} else {
+		cfg.Title = wrapper.SanitizeTitle(cfg.Title, 100)
 	}
 	if cfg.Repo == "" && cfg.Project == "" {
 		cfg.Repo, cfg.Project = wrapper.InferRepoAndProject(cfg.Cwd)

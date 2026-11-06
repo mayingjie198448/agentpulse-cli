@@ -182,6 +182,20 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 			cmdStr = cmdStr + " " + strings.Join(cmd.Args, " ")
 		}
 	}
+	title := cmd.Title
+	if title == "" && cmdStr != "" {
+		title = InferTitle(cmd.Args, cmdStr)
+	}
+	repo := cmd.Repo
+	project := cmd.Project
+	if repo == "" && project == "" && cmd.Cwd != "" {
+		repo, project = InferRepoAndProject(cmd.Cwd)
+	} else if repo == "" {
+		repo = project
+	} else if project == "" {
+		project = repo
+	}
+
 	job := model.Job{
 		ID:          cmd.JobID,
 		MachineID:   l.cfg.MachineID,
@@ -190,14 +204,15 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 		Progress:    0.0,
 		Cwd:         cmd.Cwd,
 		Command:     cmdStr,
-		Title:       cmd.Title,
-		Repo:        cmd.Repo,
-		Project:     cmd.Project,
+		Title:       title,
+		Repo:        repo,
+		Project:     project,
 		Prompt:      cmd.Prompt,
 		RequestedBy: cmd.RequestedBy,
 		StartedAt:   now,
 		UpdatedAt:   now,
 	}
+	job = SanitizeJob(job)
 	topic := mqtt.JobStatusTopic(l.cfg.MachineID, cmd.JobID)
 	data, err := json.Marshal(job)
 	if err != nil {
@@ -207,26 +222,54 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 	token.WaitTimeout(2 * time.Second)
 }
 
-func (l *Listener) publishJobFailed(jobID string, engine model.EngineType, cwd, command, title, errMsg string) {
-	if l.mqttClient == nil || !l.mqttClient.IsConnected() || jobID == "" {
+func (l *Listener) publishJobFailed(cmd model.DispatchCommand, errMsg string) {
+	if l.mqttClient == nil || !l.mqttClient.IsConnected() || cmd.JobID == "" {
 		return
 	}
 	now := time.Now().UTC()
+	cmdStr := strings.TrimSpace(cmd.Command)
+	if len(cmd.Args) > 0 {
+		if cmdStr == "" {
+			cmdStr = strings.Join(cmd.Args, " ")
+		} else {
+			cmdStr = cmdStr + " " + strings.Join(cmd.Args, " ")
+		}
+	}
+	title := cmd.Title
+	if title == "" && cmdStr != "" {
+		title = InferTitle(cmd.Args, cmdStr)
+	}
+	repo := cmd.Repo
+	project := cmd.Project
+	if repo == "" && project == "" && cmd.Cwd != "" {
+		repo, project = InferRepoAndProject(cmd.Cwd)
+	} else if repo == "" {
+		repo = project
+	} else if project == "" {
+		project = repo
+	}
+
 	job := model.Job{
-		ID:          jobID,
+		ID:          cmd.JobID,
 		MachineID:   l.cfg.MachineID,
-		Engine:      engine,
+		Engine:      cmd.Engine,
 		Status:      model.StatusFailed,
 		Progress:    0.0,
-		Cwd:         cwd,
-		Command:     command,
+		Cwd:         cmd.Cwd,
+		Command:     cmdStr,
 		Title:       title,
+		Repo:        repo,
+		Project:     project,
+		Prompt:      cmd.Prompt,
+		RequestedBy: cmd.RequestedBy,
 		StartedAt:   now,
 		UpdatedAt:   now,
+		EndedAt:     now,
 		DurationStr: "0s",
 		Error:       errMsg,
 	}
-	topic := mqtt.JobStatusTopic(l.cfg.MachineID, jobID)
+	job = SanitizeJob(job)
+	topic := mqtt.JobStatusTopic(l.cfg.MachineID, cmd.JobID)
 	data, err := json.Marshal(job)
 	if err != nil {
 		return
@@ -432,7 +475,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		l.logError(fmt.Sprintf("[agentpulse listener] rejected malformed dispatch payload: %v", err))
 		jobID := extractJobIDFromPayload(msg.Payload())
 		if jobID != "" {
-			l.publishJobFailed(jobID, "", "", "", "", fmt.Sprintf("rejected malformed dispatch payload: %v", err))
+			l.publishJobFailed(model.DispatchCommand{JobID: jobID}, fmt.Sprintf("rejected malformed dispatch payload: %v", err))
 		}
 		return
 	}
@@ -442,7 +485,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		errMsg := "rejected invalid dispatch: command is empty"
 		l.logError("[agentpulse listener] " + errMsg)
 		if cmd.JobID != "" {
-			l.publishJobFailed(cmd.JobID, cmd.Engine, cmd.Cwd, "", cmd.Title, errMsg)
+			l.publishJobFailed(cmd, errMsg)
 		}
 		return
 	}
@@ -478,7 +521,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		errMsg := fmt.Sprintf("rejected dispatch: serial execution queue is full (64) for command %s", cmd.CommandID)
 		l.logError(fmt.Sprintf("[agentpulse listener] %s", errMsg))
 		if cmd.JobID != "" {
-			l.publishJobFailed(cmd.JobID, cmd.Engine, cmd.Cwd, cmd.Command, cmd.Title, errMsg)
+			l.publishJobFailed(cmd, errMsg)
 		}
 	}
 }
@@ -569,6 +612,7 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	})
 	if err != nil {
 		l.logError(fmt.Sprintf("[agentpulse listener] failed to initialize wrapper for job %s: %v", cmd.JobID, err))
+		l.publishJobFailed(cmd, fmt.Sprintf("failed to initialize wrapper: %v", err))
 		l.executingJob.Store(false)
 		l.mu.Lock()
 		l.machine.JobCount = l.currentJobCount()

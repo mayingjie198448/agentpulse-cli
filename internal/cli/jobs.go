@@ -72,20 +72,23 @@ func newJobsCmd() *cobra.Command {
 }
 
 func renderJobsTable(out io.Writer, jobs []model.Job) {
-	fmt.Fprintf(out, "%-22s %-16s %-10s %-16s %-16s %-12s %-8s\n",
-		"短名/标题", "项目/仓库", "状态", "开始时间", "任务 ID", "节点", "运行时长")
+	fmt.Fprintf(out, "%s %s %s %s %s %s %s\n",
+		termutil.PadRight("短名/标题", 22),
+		termutil.PadRight("项目/仓库", 16),
+		termutil.PadRight("状态", 10),
+		termutil.PadRight("开始时间", 16),
+		termutil.PadRight("任务 ID", 16),
+		termutil.PadRight("节点", 12),
+		termutil.PadRight("运行时长", 8))
 	fmt.Fprintln(out, strings.Repeat("-", 106))
 
 	for _, j := range jobs {
-		title := j.DisplayTitle()
-		if len(title) > 20 {
-			title = title[:17] + "..."
-		}
+		title := termutil.TruncateString(j.DisplayTitle(), 20, "...")
 		repo := j.RepoOrProject()
 		if repo == "" {
 			repo = "-"
-		} else if len(repo) > 15 {
-			repo = repo[:12] + "..."
+		} else {
+			repo = termutil.TruncateString(repo, 15, "...")
 		}
 		started := "-"
 		if !j.StartedAt.IsZero() {
@@ -95,8 +98,18 @@ func renderJobsTable(out io.Writer, jobs []model.Job) {
 		if dur == "" {
 			dur = "-"
 		}
-		fmt.Fprintf(out, "%-22s %-16s %-10s %-16s %-16s %-12s %-8s\n",
-			title, repo, strings.ToUpper(string(j.Status)), started, j.ID, j.MachineID, dur)
+		status := strings.ToUpper(string(j.Status))
+		idStr := termutil.TruncateString(j.ID, 16, "...")
+		machStr := termutil.TruncateString(j.MachineID, 12, "...")
+
+		fmt.Fprintf(out, "%s %s %s %s %s %s %s\n",
+			termutil.PadRight(title, 22),
+			termutil.PadRight(repo, 16),
+			termutil.PadRight(status, 10),
+			termutil.PadRight(started, 16),
+			termutil.PadRight(idStr, 16),
+			termutil.PadRight(machStr, 12),
+			termutil.PadRight(dur, 8))
 	}
 }
 

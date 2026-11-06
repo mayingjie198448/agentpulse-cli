@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store"
+	"github.com/mayingjie198448/agentpulse-cli/internal/termutil"
 	"github.com/mayingjie198448/agentpulse-cli/internal/version"
 )
 
@@ -382,6 +383,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case model.EventJobUpdated:
 				if msg.Job != nil && msg.Job.ID != "" {
+					var selectedID string
+					if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
+						selectedID = m.jobs[m.selectedJobIdx].ID
+					}
+
 					found := false
 					for i, existing := range m.jobs {
 						if existing.ID == msg.Job.ID {
@@ -393,6 +399,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if !found {
 						m.jobs = append(m.jobs, *msg.Job)
 					}
+
+					if m.grouping != GroupDefault {
+						m.applyGrouping()
+					}
+
+					if selectedID != "" {
+						for i, j := range m.jobs {
+							if j.ID == selectedID {
+								m.selectedJobIdx = i
+								break
+							}
+						}
+					} else if len(m.jobs) > 0 {
+						if m.selectedJobIdx >= len(m.jobs) {
+							m.selectedJobIdx = len(m.jobs) - 1
+						}
+						if m.selectedJobIdx < 0 {
+							m.selectedJobIdx = 0
+						}
+					}
+
 					if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) && m.jobs[m.selectedJobIdx].ID == msg.Job.ID {
 						m.updateViewportContent()
 					}
@@ -1186,14 +1213,11 @@ func (m *Model) renderJobDetailBox(width int) string {
 
 	// Prompt summary row
 	if curJob.Prompt != "" {
-		promptSummary := curJob.Prompt
 		maxPromptLen := width - 18
 		if maxPromptLen < 20 {
 			maxPromptLen = 20
 		}
-		if len(promptSummary) > maxPromptLen {
-			promptSummary = promptSummary[:maxPromptLen-3] + "..."
-		}
+		promptSummary := termutil.TruncateString(curJob.Prompt, maxPromptLen, "...")
 		promptLine := lipgloss.NewStyle().Foreground(ColorDimText).Render("Prompt: ") +
 			lipgloss.NewStyle().Foreground(ColorHighlight).Italic(true).Render(fmt.Sprintf("%q", promptSummary))
 		b.WriteString(promptLine + "\n")
@@ -1206,12 +1230,8 @@ func (m *Model) renderJobDetailBox(width int) string {
 	if maxTextLen < 15 {
 		maxTextLen = 15
 	}
-	if len(cwd) > maxTextLen {
-		cwd = "..." + cwd[len(cwd)-maxTextLen+3:]
-	}
-	if len(cmd) > maxTextLen {
-		cmd = cmd[:maxTextLen-3] + "..."
-	}
+	cwd = termutil.TruncateLeft(cwd, maxTextLen, "...")
+	cmd = termutil.TruncateString(cmd, maxTextLen, "...")
 
 	cwdText := lipgloss.NewStyle().Foreground(ColorDimText).Render("Working Dir: ") +
 		lipgloss.NewStyle().Foreground(ColorLightText).Render(cwd)
