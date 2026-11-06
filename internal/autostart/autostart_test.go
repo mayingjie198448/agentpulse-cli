@@ -1,6 +1,7 @@
 package autostart
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,5 +143,168 @@ func TestPublishOffline_EmptyInputs(t *testing.T) {
 	}
 	if err := PublishOffline(config.BrokerConfig{URL: "tcp://127.0.0.1:1883"}, ""); err != nil {
 		t.Errorf("expected no-op nil error for empty machineID, got %v", err)
+	}
+}
+
+func TestServiceLabelDefaultsAndOverrides(t *testing.T) {
+	// 1. Defaults
+	if GetServiceLabel() != ServiceLabel {
+		t.Errorf("expected default label %q, got %q", ServiceLabel, GetServiceLabel())
+	}
+	if GetPlistFileName() != PlistFileName {
+		t.Errorf("expected default plist %q, got %q", PlistFileName, GetPlistFileName())
+	}
+
+	// 2. Programmatic override via SetTestServiceLabel
+	reset := SetTestServiceLabel("com.agentpulse.test.custom", "")
+	if GetServiceLabel() != "com.agentpulse.test.custom" {
+		t.Errorf("expected custom label, got %q", GetServiceLabel())
+	}
+	if GetPlistFileName() != "com.agentpulse.test.custom.plist" {
+		t.Errorf("expected auto-derived plist filename, got %q", GetPlistFileName())
+	}
+	reset()
+
+	// Restored to default
+	if GetServiceLabel() != ServiceLabel {
+		t.Errorf("expected restored default label %q, got %q", ServiceLabel, GetServiceLabel())
+	}
+
+	// 3. Environment variable override
+	t.Setenv("AGENTPULSE_TEST_SERVICE_LABEL", "com.agentpulse.test.fromenv")
+	if GetServiceLabel() != "com.agentpulse.test.fromenv" {
+		t.Errorf("expected env label, got %q", GetServiceLabel())
+	}
+	if GetPlistFileName() != "com.agentpulse.test.fromenv.plist" {
+		t.Errorf("expected derived plist filename from env label, got %q", GetPlistFileName())
+	}
+
+	t.Setenv("AGENTPULSE_TEST_PLIST_FILENAME", "custom-explicit.plist")
+	if GetPlistFileName() != "custom-explicit.plist" {
+		t.Errorf("expected explicit plist filename from env, got %q", GetPlistFileName())
+	}
+}
+
+func TestDifferentLabelsDoNotBootoutEachOther(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("skipping macOS LaunchAgent test on non-darwin")
+	}
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	tmpLaunchDir := t.TempDir()
+	tmpLogsDir := t.TempDir()
+
+	testLaunchAgentsDir = tmpLaunchDir
+	testLogsDir = tmpLogsDir
+	defer func() {
+		testLaunchAgentsDir = ""
+		testLogsDir = ""
+	}()
+
+	var executedCmds []string
+	oldExec := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		executedCmds = append(executedCmds, fmt.Sprintf("%s %s", name, strings.Join(args, " ")))
+		return exec.Command("true")
+	}
+	defer func() { execCommand = oldExec }()
+
+	cfg := &config.Config{MachineID: "test-node", Autostart: true}
+
+	// Step 1: Install production / Label A (com.agentpulse.daemon)
+	labelA := ServiceLabel
+	resetLabelA := SetTestServiceLabel(labelA, "")
+	defer resetLabelA()
+
+	if err := Enable(cfg, "/usr/local/bin/agentpulse"); err != nil {
+		t.Fatalf("Enable Label A failed: %v", err)
+	}
+
+	plistPathA := filepath.Join(tmpLaunchDir, PlistFileName)
+	if _, err := os.Stat(plistPathA); err != nil {
+		t.Fatalf("expected plist A to exist at %q", plistPathA)
+	}
+
+	// Clear recorded commands before operating on Label B
+	executedCmds = nil
+
+	// Step 2: Switch to isolated test Label B (com.agentpulse.daemon.test-isolate)
+	labelB := "com.agentpulse.daemon.test-isolate"
+	resetLabelB := SetTestServiceLabel(labelB, "")
+	defer resetLabelB()
+
+	if GetServiceLabel() != labelB {
+		t.Fatalf("expected GetServiceLabel to be %q, got %q", labelB, GetServiceLabel())
+	}
+	expectedPlistBName := labelB + ".plist"
+	if GetPlistFileName() != expectedPlistBName {
+		t.Fatalf("expected GetPlistFileName to be %q, got %q", expectedPlistBName, GetPlistFileName())
+	}
+
+	// Enable Label B
+	if err := Enable(cfg, "/usr/local/bin/agentpulse"); err != nil {
+		t.Fatalf("Enable Label B failed: %v", err)
+	}
+
+	plistPathB := filepath.Join(tmpLaunchDir, expectedPlistBName)
+	if _, err := os.Stat(plistPathB); err != nil {
+		t.Fatalf("expected plist B to exist at %q", plistPathB)
+	}
+
+	// Verify that Label B operations NEVER called bootout on Label A!
+	cmdsForBEnable := make([]string, len(executedCmds))
+	copy(cmdsForBEnable, executedCmds)
+	executedCmds = nil
+
+	for _, cmd := range cmdsForBEnable {
+		if strings.Contains(cmd, "bootout") {
+			// Check exact target label at the end of the domain target path (e.g. gui/501/com.agentpulse.daemon)
+			if strings.HasSuffix(cmd, "/"+labelA) {
+				t.Fatalf("VIOLATION: bootout command during Label B enable targeted Label A: %s", cmd)
+			}
+			if !strings.HasSuffix(cmd, "/"+labelB) {
+				t.Errorf("expected bootout command to target Label B, got: %s", cmd)
+			}
+		}
+	}
+
+	// Verify Label A plist is still completely intact on disk
+	if _, err := os.Stat(plistPathA); err != nil {
+		t.Fatalf("expected plist A to remain intact after Label B enable, but stat failed: %v", err)
+	}
+
+	// Step 3: Disable Label B
+	if err := Disable(); err != nil {
+		t.Fatalf("Disable Label B failed: %v", err)
+	}
+
+	cmdsForBDisable := make([]string, len(executedCmds))
+	copy(cmdsForBDisable, executedCmds)
+	executedCmds = nil
+
+	for _, cmd := range cmdsForBDisable {
+		if strings.Contains(cmd, "bootout") {
+			if strings.HasSuffix(cmd, "/"+labelA) {
+				t.Fatalf("VIOLATION: bootout during Label B disable targeted Label A: %s", cmd)
+			}
+			if !strings.HasSuffix(cmd, "/"+labelB) {
+				t.Errorf("expected bootout during Label B disable to target Label B, got: %s", cmd)
+			}
+		}
+		if strings.Contains(cmd, "unload") {
+			if strings.Contains(cmd, plistPathA) {
+				t.Fatalf("VIOLATION: unload during Label B disable targeted plist A: %s", cmd)
+			}
+		}
+	}
+
+	// Verify Label B plist was removed, but Label A plist is STILL present and untouched!
+	if _, err := os.Stat(plistPathB); !os.IsNotExist(err) {
+		t.Errorf("expected plist B to be removed, but still exists")
+	}
+	if _, err := os.Stat(plistPathA); err != nil {
+		t.Errorf("expected plist A to still exist unharmed after Label B disable, got: %v", err)
 	}
 }

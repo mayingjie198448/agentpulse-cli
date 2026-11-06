@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -11,11 +12,71 @@ import (
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
 
-// ServiceLabel is the launchd service label for AgentPulse daemon.
+// ServiceLabel is the default launchd service label for AgentPulse daemon.
 const ServiceLabel = "com.agentpulse.daemon"
 
-// PlistFileName is the filename of the LaunchAgent property list.
+// PlistFileName is the default filename of the LaunchAgent property list.
 const PlistFileName = "com.agentpulse.daemon.plist"
+
+var (
+	testLabelMu       sync.RWMutex
+	testServiceLabel  string
+	testPlistFileName string
+)
+
+// SetTestServiceLabel allows internal tests or isolated test harnesses to inject a custom
+// service label and plist filename to prevent operations from colliding with or booting out
+// the production daemon (com.agentpulse.daemon). If plistName is empty, "<label>.plist" is used.
+// It returns a restore function that reverts to the previous values.
+func SetTestServiceLabel(label, plistName string) func() {
+	testLabelMu.Lock()
+	oldLabel := testServiceLabel
+	oldPlist := testPlistFileName
+	testServiceLabel = label
+	testPlistFileName = plistName
+	testLabelMu.Unlock()
+
+	return func() {
+		testLabelMu.Lock()
+		testServiceLabel = oldLabel
+		testPlistFileName = oldPlist
+		testLabelMu.Unlock()
+	}
+}
+
+// GetServiceLabel returns the active LaunchAgent service label.
+// Priority: internal test hook override > AGENTPULSE_TEST_SERVICE_LABEL env var > production ServiceLabel.
+func GetServiceLabel() string {
+	testLabelMu.RLock()
+	label := testServiceLabel
+	testLabelMu.RUnlock()
+	if label != "" {
+		return label
+	}
+	if env := os.Getenv("AGENTPULSE_TEST_SERVICE_LABEL"); env != "" {
+		return env
+	}
+	return ServiceLabel
+}
+
+// GetPlistFileName returns the active LaunchAgent plist filename.
+// Priority: internal test hook override > AGENTPULSE_TEST_PLIST_FILENAME env var > "<label>.plist" (if test label set) > production PlistFileName.
+func GetPlistFileName() string {
+	testLabelMu.RLock()
+	plist := testPlistFileName
+	testLabelMu.RUnlock()
+	if plist != "" {
+		return plist
+	}
+	if env := os.Getenv("AGENTPULSE_TEST_PLIST_FILENAME"); env != "" {
+		return env
+	}
+	label := GetServiceLabel()
+	if label != ServiceLabel {
+		return label + ".plist"
+	}
+	return PlistFileName
+}
 
 // StatusInfo represents the runtime and configuration status of login autostart.
 type StatusInfo struct {

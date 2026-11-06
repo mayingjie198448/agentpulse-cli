@@ -108,7 +108,7 @@ func GeneratePlistContent(exePath, home, logsDir string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, ServiceLabel, exePath, home, home, pathEnv, stdoutPath, stderrPath)
+`, GetServiceLabel(), exePath, home, home, pathEnv, stdoutPath, stderrPath)
 }
 
 // Enable installs the LaunchAgent plist file and bootstraps it via launchctl.
@@ -133,7 +133,7 @@ func Enable(cfg *config.Config, exePath string) error {
 		return fmt.Errorf("failed to create logs directory: %w", err)
 	}
 
-	plistPath := filepath.Join(launchDir, PlistFileName)
+	plistPath := filepath.Join(launchDir, GetPlistFileName())
 	content := GeneratePlistContent(bin, home, logsDir)
 
 	if err := os.WriteFile(plistPath, []byte(content), 0644); err != nil {
@@ -142,10 +142,11 @@ func Enable(cfg *config.Config, exePath string) error {
 
 	// Bootstrap service as current user
 	uid := os.Getuid()
+	label := GetServiceLabel()
 
-	// Best-effort bootout first to clean up any previous instance
-	_ = execCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, ServiceLabel)).Run()
-	_ = execCommand("launchctl", "bootout", fmt.Sprintf("user/%d/%s", uid, ServiceLabel)).Run()
+	// Best-effort bootout first to clean up any previous instance of this specific label
+	_ = execCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, label)).Run()
+	_ = execCommand("launchctl", "bootout", fmt.Sprintf("user/%d/%s", uid, label)).Run()
 
 	// Try bootstrap in gui domain
 	cmd := execCommand("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
@@ -170,11 +171,12 @@ func Enable(cfg *config.Config, exePath string) error {
 // Disable unloads and removes the LaunchAgent plist file. Unrelated plists are never touched.
 func Disable() error {
 	launchDir := getLaunchAgentsDir()
-	plistPath := filepath.Join(launchDir, PlistFileName)
+	plistPath := filepath.Join(launchDir, GetPlistFileName())
 
 	uid := os.Getuid()
-	_ = execCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, ServiceLabel)).Run()
-	_ = execCommand("launchctl", "bootout", fmt.Sprintf("user/%d/%s", uid, ServiceLabel)).Run()
+	label := GetServiceLabel()
+	_ = execCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, label)).Run()
+	_ = execCommand("launchctl", "bootout", fmt.Sprintf("user/%d/%s", uid, label)).Run()
 	_ = execCommand("launchctl", "unload", "-w", plistPath).Run()
 
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
@@ -199,7 +201,7 @@ func Restart(cfg *config.Config, oldMachineID string, exePath string) error {
 
 // Status inspects the current LaunchAgent configuration and execution state.
 func Status() StatusInfo {
-	plistPath := filepath.Join(getLaunchAgentsDir(), PlistFileName)
+	plistPath := filepath.Join(getLaunchAgentsDir(), GetPlistFileName())
 	installed := false
 	if _, err := os.Stat(plistPath); err == nil {
 		installed = true
@@ -210,12 +212,13 @@ func Status() StatusInfo {
 	if installed {
 		detail = "已安装 (未运行)"
 		uid := os.Getuid()
-		out, err := execCommand("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, ServiceLabel)).CombinedOutput()
+		label := GetServiceLabel()
+		out, err := execCommand("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, label)).CombinedOutput()
 		if err == nil && (strings.Contains(string(out), "state = running") || strings.Contains(string(out), "pid = ")) {
 			running = true
 			detail = "LaunchAgent 运行中"
 		} else {
-			listOut, listErr := execCommand("launchctl", "list", ServiceLabel).CombinedOutput()
+			listOut, listErr := execCommand("launchctl", "list", label).CombinedOutput()
 			if listErr == nil && !strings.Contains(string(listOut), "Could not find") {
 				running = true
 				detail = "LaunchAgent 运行中"

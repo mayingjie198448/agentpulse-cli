@@ -35,6 +35,16 @@ func (t *fakeToken) WaitTimeout(d time.Duration) bool { return !t.timeout }
 func (t *fakeToken) Done() <-chan struct{}            { return t.done }
 func (t *fakeToken) Error() error                     { return t.err }
 
+// fakeSubscribeToken implements paho.Token and provides Result() map[string]byte like paho.SubscribeToken.
+type fakeSubscribeToken struct {
+	fakeToken
+	results map[string]byte
+}
+
+func (t *fakeSubscribeToken) Result() map[string]byte {
+	return t.results
+}
+
 // fakeMessage implements paho.Message.
 type fakeMessage struct {
 	topic    string
@@ -61,15 +71,17 @@ type PublishedMessage struct {
 
 // FakeMQTTClient implements paho.Client in memory for tests.
 type FakeMQTTClient struct {
-	mu               sync.Mutex
-	connected        bool
-	subscriptions    map[string]paho.MessageHandler
-	retained         map[string]fakeMessage
-	published        []PublishedMessage
-	unsubscribed     []string
-	disconnectWait   uint
-	subscribeErr     error
-	subscribeTimeout bool
+	mu                  sync.Mutex
+	connected           bool
+	subscriptions       map[string]paho.MessageHandler
+	retained            map[string]fakeMessage
+	published           []PublishedMessage
+	unsubscribed        []string
+	disconnectWait      uint
+	subscribeErr        error
+	subscribeTimeout    bool
+	subscribeResults    map[string]byte
+	onSubscribeMultiple func()
 }
 
 func NewFakeMQTTClient() *FakeMQTTClient {
@@ -148,11 +160,30 @@ func (c *FakeMQTTClient) PublishedMessages() []PublishedMessage {
 
 func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.MessageHandler) paho.Token {
 	c.mu.Lock()
+	if c.subscribeTimeout {
+		c.mu.Unlock()
+		return newTimeoutToken()
+	}
+	if c.subscribeErr != nil {
+		err := c.subscribeErr
+		c.mu.Unlock()
+		return newErrorToken(err)
+	}
+
 	c.subscriptions[topic] = callback
+	code := qos
+	if c.subscribeResults != nil {
+		if custom, ok := c.subscribeResults[topic]; ok {
+			code = custom
+		}
+	}
+
 	var retainedToDeliver []fakeMessage
-	for _, msg := range c.retained {
-		if matchTopic(topic, msg.topic) {
-			retainedToDeliver = append(retainedToDeliver, msg)
+	if code < 0x80 {
+		for _, msg := range c.retained {
+			if matchTopic(topic, msg.topic) {
+				retainedToDeliver = append(retainedToDeliver, msg)
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -161,7 +192,12 @@ func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.Message
 		m := msg
 		callback(c, &m)
 	}
-	return newSuccessToken()
+	done := make(chan struct{})
+	close(done)
+	return &fakeSubscribeToken{
+		fakeToken: fakeToken{done: done, err: nil},
+		results:   map[string]byte{topic: code},
+	}
 }
 
 // SetSubscribeError injects an error for future Subscribe/SubscribeMultiple calls.
@@ -178,6 +214,22 @@ func (c *FakeMQTTClient) SetSubscribeTimeout(timeout bool) {
 	c.subscribeTimeout = timeout
 }
 
+// SetSubscribeResults injects broker SUBACK return codes for specific topics
+// (e.g. 0x80 for rejection).
+func (c *FakeMQTTClient) SetSubscribeResults(results map[string]byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscribeResults = results
+}
+
+// SetOnSubscribeMultiple registers a hook called inside SubscribeMultiple
+// (useful for delivering messages while refresh staging is active).
+func (c *FakeMQTTClient) SetOnSubscribeMultiple(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onSubscribeMultiple = fn
+}
+
 func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) paho.Token {
 	c.mu.Lock()
 	if c.subscribeTimeout {
@@ -189,25 +241,45 @@ func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback pah
 		c.mu.Unlock()
 		return newErrorToken(err)
 	}
-	for filter := range filters {
+	results := make(map[string]byte)
+	for filter, qos := range filters {
 		c.subscriptions[filter] = callback
+		results[filter] = qos
 	}
+	for filter, code := range c.subscribeResults {
+		results[filter] = code
+	}
+
 	var retainedToDeliver []fakeMessage
 	for _, msg := range c.retained {
 		for filter := range filters {
+			if results[filter] >= 0x80 {
+				continue
+			}
 			if matchTopic(filter, msg.topic) {
 				retainedToDeliver = append(retainedToDeliver, msg)
 				break
 			}
 		}
 	}
+	onSub := c.onSubscribeMultiple
 	c.mu.Unlock()
 
 	for _, msg := range retainedToDeliver {
 		m := msg
 		callback(c, &m)
 	}
-	return newSuccessToken()
+
+	if onSub != nil {
+		onSub()
+	}
+
+	done := make(chan struct{})
+	close(done)
+	return &fakeSubscribeToken{
+		fakeToken: fakeToken{done: done, err: nil},
+		results:   results,
+	}
 }
 
 func (c *FakeMQTTClient) Unsubscribe(topics ...string) paho.Token {

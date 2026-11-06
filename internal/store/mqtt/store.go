@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,6 +112,10 @@ func New(cfg Config) (*Store, error) {
 		client.Disconnect(100)
 		return nil, fmt.Errorf("MQTT subscription failed: %w", err)
 	}
+	if err := CheckSubscribeResult(subToken); err != nil {
+		client.Disconnect(100)
+		return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+	}
 
 	go s.runHeartbeatChecker()
 
@@ -157,6 +162,12 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 		token := client.SubscribeMultiple(filters, s.onMQTTMessage)
 		if token != nil {
 			token.WaitTimeout(cfg.Timeout)
+			if err := token.Error(); err != nil {
+				return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+			}
+			if err := CheckSubscribeResult(token); err != nil {
+				return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+			}
 		}
 	}
 
@@ -906,9 +917,49 @@ func (s *Store) CheckStaleMachines() {
 	s.checkStaleMachines()
 }
 
+// CheckSubscribeResult verifies that all subscribed topics were accepted by the broker.
+// Paho's SubscribeToken does not set token.Error() when the broker returns SUBACK with failure code
+// (e.g. 0x80 / 128 in MQTT 3.1.1, or >= 0x80 in MQTT 5.0). This helper extracts Result() and checks
+// for any rejected or missing topic filters.
+func CheckSubscribeResult(token paho.Token, expectedTopics ...string) error {
+	if token == nil {
+		return nil
+	}
+	type resultGetter interface {
+		Result() map[string]byte
+	}
+	rg, ok := token.(resultGetter)
+	if !ok {
+		return nil
+	}
+	results := rg.Result()
+	if len(results) == 0 {
+		return nil
+	}
+	var rejections []string
+	for topic, code := range results {
+		// In MQTT 3.1.1, return code 0x80 (128) means Failure.
+		// In MQTT 5.0, Reason Codes >= 0x80 indicate errors/rejection.
+		if code >= 0x80 {
+			rejections = append(rejections, fmt.Sprintf("%s (code 0x%02x)", topic, code))
+		}
+	}
+	for _, expected := range expectedTopics {
+		if _, exists := results[expected]; !exists {
+			rejections = append(rejections, fmt.Sprintf("%s (missing from SUBACK)", expected))
+		}
+	}
+	if len(rejections) > 0 {
+		sort.Strings(rejections)
+		return fmt.Errorf("broker rejected subscription for topic(s): %s", strings.Join(rejections, ", "))
+	}
+	return nil
+}
+
 // Refresh re-subscribes to MQTT topics, re-pulls and settles retained messages from the broker,
 // and transactionally replaces cached state per docs/mqtt-protocol.md §5.1.
-// If disconnected, canceled, or subscription fails, existing state is left unchanged and an error is returned.
+// If disconnected, canceled, or subscription fails (including broker SUBACK rejection),
+// existing state is left unchanged and an error is returned.
 // Any real-time messages that arrive during the refresh window are safely queued and merged
 // so that no events are lost regardless of whether the refresh succeeds or fails.
 func (s *Store) Refresh(ctx context.Context) error {
@@ -990,6 +1041,9 @@ func (s *Store) Refresh(ctx context.Context) error {
 		}
 		if err := subToken.Error(); err != nil {
 			restoreSub = true
+			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
+		}
+		if err := CheckSubscribeResult(subToken); err != nil {
 			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
 		}
 	}
