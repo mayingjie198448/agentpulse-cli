@@ -9,6 +9,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
@@ -62,6 +63,19 @@ func newDoctorCmd() *cobra.Command {
 					fmt.Fprintf(out, "[WARN] 配置文件: %s (%s, 未配置 machine_id，请运行 'agentpulse config' 配置)\n", confPath, permStr)
 				} else {
 					fmt.Fprintf(out, "[OK] 配置文件: %s (%s, machine_id=%s, rev=%d)\n", confPath, permStr, fileCfg.MachineID, fileCfg.Rev)
+				}
+				if fileCfg.Autostart {
+					fmt.Fprintf(out, "[OK] 开机自启 (LaunchAgent): 已在配置中启用\n")
+				} else {
+					fmt.Fprintf(out, "[INFO] 开机自启 (LaunchAgent): 未启用 (可通过 'agentpulse config' 启用)\n")
+				}
+				if autostart.IsSupported() {
+					st := autostart.Status()
+					if st.Running {
+						fmt.Fprintf(out, "[OK] 常驻守护进程: 运行中 (%s)\n", st.Detail)
+					} else if st.Installed {
+						fmt.Fprintf(out, "[WARN] 常驻守护进程: 已安装但未运行 (%s)\n", st.Detail)
+					}
 				}
 			}
 

@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
+	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
+	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 	"github.com/spf13/cobra"
 )
@@ -15,6 +20,53 @@ import (
 func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet bool) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.OutOrStderr()
+
+	fileCfg, _, _ := loadActiveConfig(cmd)
+	if machineID == "" {
+		if fileCfg != nil && fileCfg.MachineID != "" {
+			machineID = fileCfg.MachineID
+		}
+	}
+
+	host, _ := os.Hostname()
+	if machineName == "" {
+		if host != "" {
+			machineName = host
+		} else {
+			machineName = machineID
+		}
+	}
+
+	// Prepare machine announcement
+	var agentsToProbe []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agentsToProbe = fileCfg.Agents
+	} else {
+		agentsToProbe = config.DefaultAgents()
+	}
+	probedStatuses := config.ProbeAgents(agentsToProbe)
+	var announceAgents []model.AgentAnnounce
+	for _, st := range probedStatuses {
+		announceAgents = append(announceAgents, model.AgentAnnounce{
+			ID:     st.ID,
+			Alias:  st.Alias,
+			Ok:     st.Ok,
+			Detail: st.Detail,
+		})
+	}
+	rev := 1
+	if fileCfg != nil && fileCfg.Rev > 0 {
+		rev = fileCfg.Rev
+	}
+	ann := model.MachineAnnounce{
+		V:         1,
+		MachineID: machineID,
+		TS:        time.Now().UTC(),
+		Rev:       rev,
+		Hostname:  host,
+		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Agents:    announceAgents,
+	}
 
 	mqttCfg := resolveMQTTConfig(cmd)
 	if mqttCfg.BrokerURL == "" {
@@ -54,6 +106,21 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 		OnMQTTConnected: func() {
 			if !quiet {
 				fmt.Fprintf(out, "[agentpulse] Connected to MQTT broker %s\n", pMQTT.BrokerURL)
+			}
+			if ann.MachineID != "" {
+				announceCfg := *pMQTT
+				announceCfg.ClientID = pMQTT.ClientID + "-announce"
+				opts := paho.NewClientOptions()
+				_ = mqtt.ApplyClientOptions(opts, announceCfg)
+				c := paho.NewClient(opts)
+				waitTimeout := announceCfg.Timeout
+				if waitTimeout <= 0 {
+					waitTimeout = 10 * time.Second
+				}
+				if token := c.Connect(); token.WaitTimeout(waitTimeout) && token.Error() == nil {
+					_ = mqtt.PublishAnnounce(c, ann)
+					c.Disconnect(100)
+				}
 			}
 		},
 		OnListening: func(topic string) {

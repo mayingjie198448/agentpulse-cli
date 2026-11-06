@@ -288,3 +288,87 @@ func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 		t.Errorf("expected TLS true")
 	}
 }
+
+func TestRunConfigWizard_AutostartSection(t *testing.T) {
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "box-autostart",
+		Broker: config.BrokerConfig{
+			URL: "tcp://127.0.0.1:1883",
+		},
+		Agents:    config.DefaultAgents(),
+		Autostart: false,
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+
+	// 1. Edit section autostart -> enable with "y"
+	var out bytes.Buffer
+	if err := cli.RunConfigWizardWithSection(strings.NewReader("y\n"), &out, confPath, "autostart"); err != nil {
+		t.Fatalf("wizard autostart failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if runtime.GOOS == "darwin" && !loaded.Autostart {
+		t.Errorf("expected Autostart=true on macOS after enabling")
+	}
+
+	// 2. Edit section autostart -> disable with "n"
+	out.Reset()
+	if err := cli.RunConfigWizardWithSection(strings.NewReader("n\n"), &out, confPath, "autostart"); err != nil {
+		t.Fatalf("wizard autostart failed: %v", err)
+	}
+	loaded, err = config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if loaded.Autostart {
+		t.Errorf("expected Autostart=false after disabling")
+	}
+}
+
+func TestRunConfigWizard_MachineIDChange_AutoRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "old-box-id",
+		Broker: config.BrokerConfig{
+			URL: "tcp://127.0.0.1:1883",
+		},
+		Agents:    config.DefaultAgents(),
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("failed to save initial config: %v", err)
+	}
+
+	var out bytes.Buffer
+	// Edit machine_id section: enter "new-box-id"
+	if err := cli.RunConfigWizardWithSection(strings.NewReader("new-box-id\n"), &out, confPath, "machine_id"); err != nil {
+		t.Fatalf("wizard machine_id failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if loaded.MachineID != "new-box-id" {
+		t.Errorf("expected MachineID 'new-box-id', got %q", loaded.MachineID)
+	}
+
+	outStr := out.String()
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(outStr, "检测到 machine_id 变更") || !strings.Contains(outStr, "old-box-id") {
+			t.Errorf("expected notification about machine_id change from old-box-id, got:\n%s", outStr)
+		}
+	}
+}

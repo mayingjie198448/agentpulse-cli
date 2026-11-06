@@ -10,6 +10,7 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
@@ -44,7 +45,8 @@ func newConfigCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&section, "section", "", "直接编辑指定配置分段 (broker, agents, machine_id, all)")
+	cmd.Flags().StringVar(&section, "section", "", "直接编辑指定配置分段 (broker, agents, machine_id, autostart, all)")
+	cmd.AddCommand(newAutostartCmd())
 	return cmd
 }
 
@@ -120,6 +122,7 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		cfg.MachineID = existingCfg.MachineID
 		cfg.Broker = existingCfg.Broker
 		cfg.Agents = existingCfg.Agents
+		cfg.Autostart = existingCfg.Autostart
 	} else {
 		cfg.Broker = config.BrokerConfig{
 			URL: "tls://broker.example:8883",
@@ -154,14 +157,21 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		if len(agentSummary) == 0 {
 			agentSummary = []string{"无"}
 		}
-		fmt.Fprintf(out, "  • 本机 Agent: %s\n\n", strings.Join(agentSummary, ", "))
+		fmt.Fprintf(out, "  • 本机 Agent: %s\n", strings.Join(agentSummary, ", "))
+
+		autostartDesc := "未启用"
+		if cfg.Autostart {
+			autostartDesc = "已启用 (LaunchAgent)"
+		}
+		fmt.Fprintf(out, "  • 开机自启常驻后台: %s\n\n", autostartDesc)
 
 		fmt.Fprintln(out, "请选择配置模式 (按回车默认编辑全部):")
 		fmt.Fprintln(out, "  1) 完整重新配置 (按步骤配置全部项目)")
 		fmt.Fprintln(out, "  2) 仅编辑 MQTT Broker 配置")
 		fmt.Fprintln(out, "  3) 仅编辑 本机 Agent CLI 配置")
 		fmt.Fprintln(out, "  4) 仅编辑 机器标识 (machine_id)")
-		choice := promptLine(reader, out, "请选择 [1/2/3/4]", "1")
+		fmt.Fprintln(out, "  5) 仅编辑 开机自启常驻后台 (LaunchAgent)")
+		choice := promptLine(reader, out, "请选择 [1/2/3/4/5]", "1")
 		switch choice {
 		case "2", "broker":
 			section = "broker"
@@ -169,6 +179,8 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 			section = "agents"
 		case "4", "machine_id", "machine":
 			section = "machine_id"
+		case "5", "autostart", "daemon":
+			section = "autostart"
 		default:
 			section = "all"
 		}
@@ -183,6 +195,8 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, true)
 	case "machine_id":
 		cfg.MachineID = configureMachineIDSection(reader, out, cfg.MachineID)
+	case "autostart":
+		cfg.Autostart = configureAutostartSection(reader, out, cfg.Autostart)
 	default:
 		// Guided all
 		fmt.Fprintln(out, "[步骤 1/3] 配置本机机器标识 (machine_id)")
@@ -193,6 +207,11 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 
 		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (agy, opencode 等)")
 		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, false)
+
+		if autostart.IsSupported() {
+			fmt.Fprintln(out, "[开机自启] 配置常驻后台守护进程 (LaunchAgent)")
+			cfg.Autostart = configureAutostartSection(reader, out, cfg.Autostart)
+		}
 	}
 
 	// Write 0600 yaml
@@ -200,6 +219,53 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
 	fmt.Fprintf(out, "[✓] 配置文件已安全保存至: %s (权限: 0600)\n\n", configPath)
+
+	// Synchronize autostart daemon / LaunchAgent state
+	if autostart.IsSupported() {
+		oldMachineID := ""
+		oldBroker := config.BrokerConfig{}
+		wasAutostart := false
+		if existingCfg != nil {
+			oldMachineID = existingCfg.MachineID
+			oldBroker = existingCfg.Broker
+			wasAutostart = existingCfg.Autostart
+		}
+
+		if cfg.Autostart {
+			if wasAutostart && oldMachineID != "" && oldMachineID != cfg.MachineID {
+				fmt.Fprintf(out, "[!] 检测到 machine_id 变更 (%s -> %s)，正在同步下线旧节点并重启常驻后台服务...\n", oldMachineID, cfg.MachineID)
+				if err := autostart.PublishOffline(oldBroker, oldMachineID); err == nil {
+					fmt.Fprintf(out, "  [✓] 已向 Broker 发布旧节点 %s 离线状态 (避免长效双在线)\n", oldMachineID)
+				}
+				if err := autostart.Restart(cfg, oldMachineID, ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 重启常驻守护进程失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "  [✓] 已重启常驻守护进程并更新配置 (LaunchAgent)")
+				}
+			} else if !wasAutostart {
+				if err := autostart.Enable(cfg, ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 安装 LaunchAgent 失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "[✓] 已成功配置并启动 macOS 开机自启常驻守护进程 (LaunchAgent)")
+				}
+			} else {
+				if oldBroker.URL != cfg.Broker.URL {
+					_ = autostart.Restart(cfg, "", "")
+				}
+			}
+		} else {
+			if wasAutostart || autostart.Status().Installed {
+				if oldMachineID != "" {
+					_ = autostart.PublishOffline(oldBroker, oldMachineID)
+				}
+				if err := autostart.Disable(); err != nil {
+					fmt.Fprintf(out, "  [WARN] 卸载 LaunchAgent 失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "[✓] 已卸载 macOS 开机自启常驻后台 (LaunchAgent 已移除)")
+				}
+			}
+		}
+	}
 
 	// Immediately verify: broker connect + CLI probe (reusing doctor logic)
 	VerifyConfigDiagnostics(out, cfg)
@@ -235,6 +301,24 @@ func configureMachineIDSection(reader *bufio.Reader, out io.Writer, currentID st
 	}
 	fmt.Fprintf(out, "[✓] 机器标识已确认为: %s\n\n", machineID)
 	return machineID
+}
+
+func configureAutostartSection(reader *bufio.Reader, out io.Writer, current bool) bool {
+	fmt.Fprintln(out, "------------------------------------------------------------")
+	if !autostart.IsSupported() {
+		fmt.Fprintf(out, "当前平台 (%s) 暂未支持开机自启常驻后台守护进程 (目前支持 macOS LaunchAgent)\n\n", runtime.GOOS)
+		return false
+	}
+	st := autostart.Status()
+	fmt.Fprintf(out, "当前后台自启状态: %s\n", st.Detail)
+	enabled := promptBool(reader, out, "是否开启 macOS 用户开机自启 / 后台常驻守护进程 (LaunchAgent)", current)
+	if enabled {
+		fmt.Fprintln(out, "[✓] 开机自启常驻后台: 开启")
+	} else {
+		fmt.Fprintln(out, "[✓] 开机自启常驻后台: 关闭")
+	}
+	fmt.Fprintln(out)
+	return enabled
 }
 
 func configureBrokerSection(reader *bufio.Reader, out io.Writer, current config.BrokerConfig) config.BrokerConfig {
