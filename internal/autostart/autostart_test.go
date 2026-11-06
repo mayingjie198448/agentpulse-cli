@@ -308,3 +308,119 @@ func TestDifferentLabelsDoNotBootoutEachOther(t *testing.T) {
 		t.Errorf("expected plist A to still exist unharmed after Label B disable, got: %v", err)
 	}
 }
+
+// Regression test for FAIL3:
+// When bootstrap gui & user fail with exit status 5, and legacy load exits 0 but prints
+// "Load failed: 5: Input/output error", Enable MUST NOT treat this as success; it must return a non-nil error.
+func TestEnable_BootstrapFailsAndLoadOutputsErrorWithExit0(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("skipping macOS LaunchAgent test on non-darwin")
+	}
+
+	tmpLaunchDir := t.TempDir()
+	tmpLogsDir := t.TempDir()
+	testLaunchAgentsDir = tmpLaunchDir
+	testLogsDir = tmpLogsDir
+	defer func() {
+		testLaunchAgentsDir = ""
+		testLogsDir = ""
+	}()
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		if len(args) == 0 {
+			return exec.Command("true")
+		}
+		switch args[0] {
+		case "bootout":
+			// Bootout exits with code 3 when process not found
+			return exec.Command("sh", "-c", "echo 'Boot-out failed: 3: No such process' >&2; exit 3")
+		case "bootstrap":
+			// Bootstrap fails with exit status 5
+			return exec.Command("sh", "-c", "echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5")
+		case "load":
+			// Legacy load prints failure message but exits with code 0!
+			return exec.Command("sh", "-c", "echo 'Load failed: 5: Input/output error'; exit 0")
+		case "print":
+			return exec.Command("sh", "-c", "echo 'Bad request. Could not find service' >&2; exit 113")
+		case "list":
+			return exec.Command("sh", "-c", "echo 'Could not find service'; exit 1")
+		default:
+			return exec.Command("true")
+		}
+	}
+
+	cfg := &config.Config{
+		MachineID: "test-fail3-node",
+		Autostart: true,
+	}
+
+	err := Enable(cfg, "/usr/local/bin/agentpulse")
+	if err == nil {
+		t.Fatalf("CRITICAL BUG: Enable returned nil when bootstrap failed and load exited 0 with 'Load failed' output!")
+	}
+	if !strings.Contains(err.Error(), "all launchctl attempts failed") && !strings.Contains(err.Error(), "Load failed") {
+		t.Errorf("expected error message to report launchctl failure, got: %v", err)
+	}
+}
+
+// Regression test for FAIL3:
+// When launchctl attempts appear to succeed but the service label is not actually registered in launchd domain,
+// Enable must return an error rather than false success.
+func TestEnable_ServiceNotRegisteredFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("skipping macOS LaunchAgent test on non-darwin")
+	}
+
+	tmpLaunchDir := t.TempDir()
+	tmpLogsDir := t.TempDir()
+	testLaunchAgentsDir = tmpLaunchDir
+	testLogsDir = tmpLogsDir
+	defer func() {
+		testLaunchAgentsDir = ""
+		testLogsDir = ""
+	}()
+
+	oldExec := execCommand
+	defer func() { execCommand = oldExec }()
+
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		if len(args) == 0 {
+			return exec.Command("true")
+		}
+		switch args[0] {
+		case "bootout":
+			return exec.Command("true")
+		case "bootstrap":
+			// Bootstrap fails
+			return exec.Command("sh", "-c", "exit 1")
+		case "load":
+			// Load exits 0 with no output (pretending success)
+			return exec.Command("true")
+		case "print":
+			// Service not found in domain
+			return exec.Command("sh", "-c", "echo 'Bad request. Could not find service' >&2; exit 113")
+		case "list":
+			// Service not found in list
+			return exec.Command("sh", "-c", "echo 'Could not find service'; exit 1")
+		default:
+			return exec.Command("true")
+		}
+	}
+
+	cfg := &config.Config{
+		MachineID: "test-unregistered-node",
+		Autostart: true,
+	}
+
+	err := Enable(cfg, "/usr/local/bin/agentpulse")
+	if err == nil {
+		t.Fatalf("expected Enable to fail when service is not registered in launchd domain, got nil")
+	}
+	if !strings.Contains(err.Error(), "not registered in launchd domain") {
+		t.Errorf("expected error to indicate service not registered, got: %v", err)
+	}
+}
+

@@ -3,7 +3,6 @@
 package autostart
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -148,21 +147,33 @@ func Enable(cfg *config.Config, exePath string) error {
 	_ = execCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", uid, label)).Run()
 	_ = execCommand("launchctl", "bootout", fmt.Sprintf("user/%d/%s", uid, label)).Run()
 
-	// Try bootstrap in gui domain
-	cmd := execCommand("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		// Fall back to user domain (e.g. headless/ssh session)
+	// 1. Try bootstrap in gui domain
+	cmdGui := execCommand("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
+	outGui, errGui := cmdGui.CombinedOutput()
+	guiSuccess := errGui == nil && !isLaunchctlFailure(outGui)
+
+	if !guiSuccess {
+		// 2. Fall back to user domain (e.g. headless/ssh session)
 		cmdUser := execCommand("launchctl", "bootstrap", fmt.Sprintf("user/%d", uid), plistPath)
-		if errUser := cmdUser.Run(); errUser != nil {
-			// Legacy fallback
+		outUser, errUser := cmdUser.CombinedOutput()
+		userSuccess := errUser == nil && !isLaunchctlFailure(outUser)
+
+		if !userSuccess {
+			// 3. Legacy fallback to load -w
 			cmdLoad := execCommand("launchctl", "load", "-w", plistPath)
-			if errLoad := cmdLoad.Run(); errLoad != nil {
-				return fmt.Errorf("failed to enable LaunchAgent: all launchctl attempts failed (bootstrap gui: %v; bootstrap user: %v; load: %w)", err, errUser, errLoad)
+			outLoad, errLoad := cmdLoad.CombinedOutput()
+			if errLoad != nil || isLaunchctlFailure(outLoad) {
+				return fmt.Errorf("failed to enable LaunchAgent: all launchctl attempts failed (bootstrap gui: %v [%s]; bootstrap user: %v [%s]; load: %v [%s])",
+					errGui, strings.TrimSpace(string(outGui)),
+					errUser, strings.TrimSpace(string(outUser)),
+					errLoad, strings.TrimSpace(string(outLoad)))
 			}
 		}
+	}
+
+	// 4. Verify that the service is actually registered in launchd domain
+	if !isServiceRegistered(uid, label) {
+		return fmt.Errorf("failed to enable LaunchAgent: service %q is not registered in launchd domain after bootstrap/load", label)
 	}
 
 	return nil
@@ -233,4 +244,39 @@ func Status() StatusInfo {
 		Detail:    detail,
 		PlistPath: plistPath,
 	}
+}
+
+func isLaunchctlFailure(out []byte) bool {
+	if len(out) == 0 {
+		return false
+	}
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "failed") ||
+		strings.Contains(s, "input/output error") ||
+		strings.Contains(s, "could not find") ||
+		strings.Contains(s, "bad request") ||
+		strings.Contains(s, "error:") ||
+		strings.Contains(s, "not found")
+}
+
+func isServiceRegistered(uid int, label string) bool {
+	// Try launchctl print gui/<uid>/<label>
+	outPrintGui, errPrintGui := execCommand("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, label)).CombinedOutput()
+	if errPrintGui == nil && !isLaunchctlFailure(outPrintGui) {
+		return true
+	}
+
+	// Try launchctl print user/<uid>/<label>
+	outPrintUser, errPrintUser := execCommand("launchctl", "print", fmt.Sprintf("user/%d/%s", uid, label)).CombinedOutput()
+	if errPrintUser == nil && !isLaunchctlFailure(outPrintUser) {
+		return true
+	}
+
+	// Try launchctl list <label>
+	outList, errList := execCommand("launchctl", "list", label).CombinedOutput()
+	if errList == nil && !strings.Contains(string(outList), "Could not find") && !isLaunchctlFailure(outList) {
+		return true
+	}
+
+	return false
 }

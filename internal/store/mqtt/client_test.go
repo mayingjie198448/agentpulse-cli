@@ -170,12 +170,16 @@ func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.Message
 		return newErrorToken(err)
 	}
 
-	c.subscriptions[topic] = callback
 	code := qos
 	if c.subscribeResults != nil {
 		if custom, ok := c.subscribeResults[topic]; ok {
 			code = custom
 		}
+	}
+	if code < 0x80 {
+		c.subscriptions[topic] = callback
+	} else {
+		delete(c.subscriptions, topic)
 	}
 
 	var retainedToDeliver []fakeMessage
@@ -243,11 +247,17 @@ func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback pah
 	}
 	results := make(map[string]byte)
 	for filter, qos := range filters {
-		c.subscriptions[filter] = callback
 		results[filter] = qos
 	}
 	for filter, code := range c.subscribeResults {
 		results[filter] = code
+	}
+	for filter, code := range results {
+		if code < 0x80 {
+			c.subscriptions[filter] = callback
+		} else {
+			delete(c.subscriptions, filter)
+		}
 	}
 
 	var retainedToDeliver []fakeMessage
