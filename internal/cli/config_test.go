@@ -157,7 +157,7 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 	}
 
 	outStr := out.String()
-	if !strings.Contains(outStr, "为系统内置适配引擎，不可作为自定义 CLI 追加") {
+	if !strings.Contains(outStr, "为系统预置引擎，不可作为自定义 CLI 追加") {
 		t.Errorf("expected rejection of builtin agent name as custom, output:\n%s", outStr)
 	}
 
@@ -427,10 +427,190 @@ func TestRunConfigWizard_RescanAndSectionAgents(t *testing.T) {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 
-	if len(loaded.Agents) != 1 || loaded.Agents[0].ID != "claude" {
-		t.Fatalf("expected 1 agent 'claude', got: %+v", loaded.Agents)
+	// Untouched 'agy' must be preserved, and 'claude' added.
+	if len(loaded.Agents) != 2 {
+		t.Fatalf("expected 2 agents [agy, claude], got %d: %+v", len(loaded.Agents), loaded.Agents)
 	}
-	if loaded.Agents[0].Path != "/opt/bin/claude" {
-		t.Errorf("expected path '/opt/bin/claude', got %q", loaded.Agents[0].Path)
+	if loaded.Agents[0].ID != "agy" {
+		t.Errorf("expected first agent to be preserved 'agy', got %q", loaded.Agents[0].ID)
+	}
+	if loaded.Agents[1].ID != "claude" {
+		t.Errorf("expected second agent to be 'claude', got %q", loaded.Agents[1].ID)
+	}
+	if loaded.Agents[1].Path != "/opt/bin/claude" {
+		t.Errorf("expected path '/opt/bin/claude', got %q", loaded.Agents[1].Path)
+	}
+}
+
+func TestRunConfigWizard_PreserveExistingAgentsAndNoDuplicates(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
+
+	enabledTrue := true
+	enabledFalse := false
+
+	// Seed existing config with 1 custom agent and 2 built-in agents (one enabled, one disabled)
+	initialCfg := &config.Config{
+		Version:   1,
+		MachineID: "preserve-node",
+		Broker: config.BrokerConfig{
+			URL: "tcp://127.0.0.1:1883",
+		},
+		Agents: []config.AgentConfig{
+			{
+				ID:      "agy",
+				Path:    "/custom/bin/agy",
+				Alias:   []string{"agy", "ai"},
+				Enabled: &enabledTrue,
+				Custom:  false,
+			},
+			{
+				ID:      "custom-runner",
+				Path:    "/opt/tools/custom-runner",
+				Alias:   []string{"cr", "runner"},
+				Enabled: &enabledTrue,
+				Custom:  true,
+			},
+			{
+				ID:      "codex",
+				Path:    "/usr/bin/codex",
+				Alias:   []string{"codex"},
+				Enabled: &enabledFalse,
+				Custom:  false,
+			},
+		},
+	}
+	if err := config.SaveConfig(confPath, initialCfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	// Scenario 1: Re-run wizard agents section, select only claude (3), attempt duplicate custom-runner & agy
+	// Inputs:
+	// 1. auto-scan: y
+	// 2. rescan: n
+	// 3. select builtin: 3 (claude only)
+	// 4. confirm claude: enabled y, path /opt/bin/claude, alias claude,c
+	// 5. add custom: y
+	// 6. custom ID: custom-runner (duplicate of existing custom -> rejected!)
+	// 7. add custom: y
+	// 8. custom ID: agy (duplicate of builtin -> rejected!)
+	// 9. add custom: n (exit custom loop)
+	inputLines := []string{
+		"y",
+		"n",
+		"3",
+		"y",
+		"/opt/bin/claude",
+		"claude,c",
+		"y",
+		"custom-runner",
+		"y",
+		"agy",
+		"n",
+	}
+	input := strings.Join(inputLines, "\n") + "\n"
+
+	var out bytes.Buffer
+	err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "agents")
+	if err != nil {
+		t.Fatalf("RunConfigWizardWithSection failed: %v", err)
+	}
+
+	outStr := out.String()
+	if !strings.Contains(outStr, "Agent ID \"custom-runner\" 已在列表中，请勿重复添加") {
+		t.Errorf("expected duplicate custom-runner warning in output:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "为系统预置引擎，不可作为自定义 CLI 追加") {
+		t.Errorf("expected builtin agy rejection as custom in output:\n%s", outStr)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	// Should contain 4 agents: agy, custom-runner, codex (untouched), and claude (added)
+	if len(loaded.Agents) != 4 {
+		t.Fatalf("expected 4 agents, got %d: %+v", len(loaded.Agents), loaded.Agents)
+	}
+
+	// Verify untouched agy
+	agy := loaded.Agents[0]
+	if agy.ID != "agy" || agy.Path != "/custom/bin/agy" || len(agy.Alias) != 2 || agy.Alias[1] != "ai" || !agy.IsEnabled() || agy.IsCustom() {
+		t.Errorf("untouched agy properties were corrupted: %+v", agy)
+	}
+
+	// Verify untouched custom-runner
+	cr := loaded.Agents[1]
+	if cr.ID != "custom-runner" || cr.Path != "/opt/tools/custom-runner" || len(cr.Alias) != 2 || cr.Alias[0] != "cr" || !cr.IsEnabled() || !cr.IsCustom() {
+		t.Errorf("untouched custom-runner properties were corrupted: %+v", cr)
+	}
+
+	// Verify untouched codex (disabled)
+	codex := loaded.Agents[2]
+	if codex.ID != "codex" || codex.Path != "/usr/bin/codex" || codex.IsEnabled() || codex.IsCustom() {
+		t.Errorf("untouched codex properties were corrupted: %+v", codex)
+	}
+
+	// Verify newly added claude
+	claude := loaded.Agents[3]
+	if claude.ID != "claude" || claude.Path != "/opt/bin/claude" || len(claude.Alias) != 2 || !claude.IsEnabled() || claude.IsCustom() {
+		t.Errorf("added claude properties mismatch: %+v", claude)
+	}
+
+	// Verify no duplicate IDs
+	seenIDs := make(map[string]bool)
+	for _, ag := range loaded.Agents {
+		idLower := strings.ToLower(ag.ID)
+		if seenIDs[idLower] {
+			t.Errorf("duplicate agent ID found: %s", ag.ID)
+		}
+		seenIDs[idLower] = true
+	}
+
+	// Scenario 2: Re-run wizard on the updated config, selecting agy (1) and hitting Enter for defaults
+	// User confirms agy without typing new path -> existing path /custom/bin/agy must NOT be overwritten!
+	// Inputs:
+	// 1. auto-scan: n
+	// 2. select builtin: 1 (agy)
+	// 3. confirm agy: enabled (Enter -> true), path (Enter -> keep /custom/bin/agy), alias (Enter -> keep agy, ai)
+	// 4. add custom: n
+	inputLines2 := []string{
+		"n",
+		"1",
+		"",
+		"",
+		"",
+		"n",
+	}
+	input2 := strings.Join(inputLines2, "\n") + "\n"
+
+	var out2 bytes.Buffer
+	err2 := cli.RunConfigWizardWithSection(strings.NewReader(input2), &out2, confPath, "agents")
+	if err2 != nil {
+		t.Fatalf("RunConfigWizardWithSection run 2 failed: %v", err2)
+	}
+
+	loaded2, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig run 2 failed: %v", err)
+	}
+
+	if len(loaded2.Agents) != 4 {
+		t.Fatalf("expected 4 agents after run 2, got %d: %+v", len(loaded2.Agents), loaded2.Agents)
+	}
+	if loaded2.Agents[0].Path != "/custom/bin/agy" {
+		t.Errorf("expected agy path to remain '/custom/bin/agy', got %q", loaded2.Agents[0].Path)
+	}
+
+	// No duplicate IDs after second run
+	seenIDs2 := make(map[string]bool)
+	for _, ag := range loaded2.Agents {
+		idLower := strings.ToLower(ag.ID)
+		if seenIDs2[idLower] {
+			t.Errorf("duplicate agent ID found in run 2: %s", ag.ID)
+		}
+		seenIDs2[idLower] = true
 	}
 }

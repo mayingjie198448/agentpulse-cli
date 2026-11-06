@@ -126,7 +126,7 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 			URL: "tls://broker.example:8883",
 			TLS: true,
 		}
-		cfg.Agents = config.DefaultAgents()
+		cfg.Agents = nil
 	}
 
 	fmt.Fprintln(out, "============================================================")
@@ -159,7 +159,7 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		if len(builtinSummary) == 0 {
 			builtinSummary = []string{"无"}
 		}
-		fmt.Fprintf(out, "  • 本机内置 Agent: %s\n", strings.Join(builtinSummary, ", "))
+		fmt.Fprintf(out, "  • 本机预置 Agent: %s\n", strings.Join(builtinSummary, ", "))
 		if len(customSummary) > 0 {
 			fmt.Fprintf(out, "  • 本机自定义 Agent: %s\n", strings.Join(customSummary, ", "))
 		}
@@ -187,10 +187,16 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 	section = strings.ToLower(strings.TrimSpace(section))
 	switch section {
 	case "broker":
+		if len(cfg.Agents) == 0 {
+			cfg.Agents = config.DefaultAgents()
+		}
 		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
 	case "agents":
 		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, true)
 	case "machine_id":
+		if len(cfg.Agents) == 0 {
+			cfg.Agents = config.DefaultAgents()
+		}
 		cfg.MachineID = configureMachineIDSection(reader, out, cfg.MachineID)
 	default:
 		// Guided all
@@ -200,7 +206,7 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		fmt.Fprintln(out, "[步骤 2/3] 配置 MQTT Broker 连接与鉴权")
 		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
 
-		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (扫描、勾选内置与自定义追加)")
+		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (扫描、勾选预置支持引擎与自定义追加)")
 		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, !configExists)
 	}
 
@@ -325,9 +331,9 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 		fmt.Fprintln(out, "[✓] 已跳过自动扫描。")
 	}
 
-	// 2. Multi-select built-in adapted engines
-	fmt.Fprintln(out, "\n[步骤 2/4] 勾选内置已适配引擎")
-	fmt.Fprintln(out, "内置引擎列表 (适配心跳/流式日志/远程派活协议，headless 优先):")
+	// 2. Multi-select built-in candidate engines
+	fmt.Fprintln(out, "\n[步骤 2/4] 勾选预置支持引擎")
+	fmt.Fprintln(out, "预置候选引擎列表 (支持自动路径探测与通用命令调度；心跳/流式/派活深度协议按各引擎能力逐步适配):")
 
 	builtinDefs := config.BuiltinEngineDefs()
 	discoveredMap := make(map[string]config.DiscoveredAgent)
@@ -345,10 +351,25 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 		num := i + 1
 		idxStr := strconv.Itoa(num)
 		statusMark := "✗ 未发现"
-		if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok {
+		if existing, ok := existingMap[strings.ToLower(def.ID)]; ok {
+			if existing.IsEnabled() {
+				if existing.Path != "" {
+					statusMark = fmt.Sprintf("✓ 已配置: %s", existing.Path)
+				} else if disc, okDisc := discoveredMap[strings.ToLower(def.ID)]; okDisc && disc.Path != "" {
+					statusMark = fmt.Sprintf("✓ 已配置 (发现: %s)", disc.Path)
+				} else {
+					statusMark = "✓ 已配置"
+				}
+				defaultIndices = append(defaultIndices, idxStr)
+			} else {
+				if existing.Path != "" {
+					statusMark = fmt.Sprintf("- 已配置(禁用): %s", existing.Path)
+				} else {
+					statusMark = "- 已配置(禁用)"
+				}
+			}
+		} else if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok {
 			statusMark = fmt.Sprintf("✓ 已发现: %s", disc.Path)
-			defaultIndices = append(defaultIndices, idxStr)
-		} else if existing, ok := existingMap[strings.ToLower(def.ID)]; ok && existing.IsEnabled() {
 			defaultIndices = append(defaultIndices, idxStr)
 		}
 		fmt.Fprintf(out, "  %2d) [%-20s] %-10s (%s)\n", num, statusMark, def.ID, def.Name)
@@ -357,11 +378,15 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 
 	defaultSelectStr := strings.Join(defaultIndices, ",")
 	if defaultSelectStr == "" {
-		defaultSelectStr = "1,2"
+		if len(currentAgents) > 0 {
+			defaultSelectStr = "none"
+		} else {
+			defaultSelectStr = "1,2"
+		}
 	}
 
-	fmt.Fprintln(out, "请勾选要启用的内置引擎序号 (多个用逗号隔开，如 '1,2'；'all' 全部，'none' 留空)")
-	selectInput := promptLine(reader, out, "勾选内置引擎", defaultSelectStr)
+	fmt.Fprintln(out, "请勾选要启用的预置引擎序号 (多个用逗号隔开，如 '1,2'；'all' 全部，'none' 留空)")
+	selectInput := promptLine(reader, out, "勾选预置引擎", defaultSelectStr)
 
 	var selectedDefs []config.BuiltinEngineDef
 	selectInput = strings.TrimSpace(selectInput)
@@ -385,10 +410,10 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 	}
 
 	// 3. Item-by-item confirmation
-	fmt.Fprintln(out, "\n[步骤 3/4] 对勾选的内置引擎逐项确认 (预填扫描路径与别名)")
-	var updatedAgents []config.AgentConfig
+	fmt.Fprintln(out, "\n[步骤 3/4] 对勾选的预置引擎逐项确认 (预填扫描路径与别名)")
+	editedAgents := make(map[string]config.AgentConfig)
 	for _, def := range selectedDefs {
-		fmt.Fprintf(out, "\n[确认内置引擎: %s (%s)]\n", def.ID, def.Name)
+		fmt.Fprintf(out, "\n[确认预置引擎: %s (%s)]\n", def.ID, def.Name)
 		defaultEnabled := true
 		if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && ex.Enabled != nil {
 			defaultEnabled = *ex.Enabled
@@ -399,10 +424,10 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 		var aliases []string
 		if enabled {
 			defaultPath := ""
-			if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok && disc.Path != "" {
-				defaultPath = disc.Path
-			} else if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && ex.Path != "" {
+			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && ex.Path != "" {
 				defaultPath = ex.Path
+			} else if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok && disc.Path != "" {
+				defaultPath = disc.Path
 			}
 			path = promptLine(reader, out, "  可执行文件路径 (留空自动搜索 PATH)", defaultPath)
 
@@ -423,28 +448,35 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 				aliases = ex.Alias
 			}
 		}
-		updatedAgents = append(updatedAgents, config.AgentConfig{
+		editedAgents[strings.ToLower(def.ID)] = config.AgentConfig{
 			ID:      def.ID,
 			Path:    path,
 			Alias:   aliases,
 			Enabled: &enabled,
 			Custom:  false,
-		})
+		}
 	}
 
 	// 4. Custom CLI append
 	fmt.Fprintln(out, "\n[步骤 4/4] 追加自定义 CLI (可选)")
-	fmt.Fprintln(out, "注意: 自定义 CLI 未内置适配，探测、流式日志与派活能力可能弱于内置引擎。")
-	fmt.Fprintln(out, "      内置与自定义分库存，自定义 CLI 勿使用系统内置引擎 ID。")
+	fmt.Fprintln(out, "注意: 自定义 CLI 需手动指定路径与别名，支持通用命令行执行；预置候选引擎已包含已知安装路径与别名探测规则。")
+	fmt.Fprintln(out, "      内置预置与自定义分库存放，自定义 CLI 勿使用系统预置引擎 ID。")
 
-	if len(scanRes.DiscoveredCustom) > 0 {
+	var unconfiguredCustom []config.DiscoveredAgent
+	for _, c := range scanRes.DiscoveredCustom {
+		if _, ok := existingMap[strings.ToLower(c.ID)]; !ok {
+			unconfiguredCustom = append(unconfiguredCustom, c)
+		}
+	}
+	if len(unconfiguredCustom) > 0 {
 		var candNames []string
-		for _, c := range scanRes.DiscoveredCustom {
+		for _, c := range unconfiguredCustom {
 			candNames = append(candNames, fmt.Sprintf("%s (%s)", c.ID, c.Path))
 		}
 		fmt.Fprintf(out, "扫描到其他可能的终端 CLI: %s\n", strings.Join(candNames, "; "))
 	}
 
+	var newCustomAgents []config.AgentConfig
 	for {
 		addCustom := promptBool(reader, out, "是否追加自定义本地 Agent CLI？", false)
 		if !addCustom {
@@ -456,14 +488,26 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 			break
 		}
 		if config.IsBuiltinEngine(customID) {
-			fmt.Fprintf(out, "  [!] 错误: %q 为系统内置适配引擎，不可作为自定义 CLI 追加。请在步骤 2 内置引擎中配置。\n", customID)
+			fmt.Fprintf(out, "  [!] 错误: %q 为系统预置引擎，不可作为自定义 CLI 追加。请在步骤 2 内置引擎中配置。\n", customID)
 			continue
 		}
+
+		lowerCustomID := strings.ToLower(customID)
 		isDup := false
-		for _, ag := range updatedAgents {
-			if strings.EqualFold(ag.ID, customID) {
+		if _, ok := existingMap[lowerCustomID]; ok {
+			isDup = true
+		}
+		if !isDup {
+			if _, ok := editedAgents[lowerCustomID]; ok {
 				isDup = true
-				break
+			}
+		}
+		if !isDup {
+			for _, ag := range newCustomAgents {
+				if strings.ToLower(ag.ID) == lowerCustomID {
+					isDup = true
+					break
+				}
 			}
 		}
 		if isDup {
@@ -488,31 +532,71 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 			}
 		}
 		enabled := promptBool(reader, out, fmt.Sprintf("  是否启用 %s", customID), true)
-		updatedAgents = append(updatedAgents, config.AgentConfig{
+		cAgent := config.AgentConfig{
 			ID:      customID,
 			Path:    path,
 			Alias:   aliases,
 			Enabled: &enabled,
 			Custom:  true,
-		})
+		}
+		newCustomAgents = append(newCustomAgents, cAgent)
+		editedAgents[lowerCustomID] = cAgent
 		fmt.Fprintf(out, "  [✓] 已添加自定义 Agent: %s (custom: true)\n", customID)
+	}
+
+	var finalAgents []config.AgentConfig
+	seen := make(map[string]bool)
+
+	// 1. Process current agents in their original order
+	// Preserves untouched items (both built-in and custom) with all their attributes intact!
+	for _, ag := range currentAgents {
+		lowerID := strings.ToLower(ag.ID)
+		if seen[lowerID] {
+			continue
+		}
+		seen[lowerID] = true
+		if updated, ok := editedAgents[lowerID]; ok {
+			finalAgents = append(finalAgents, updated)
+		} else {
+			finalAgents = append(finalAgents, ag)
+		}
+	}
+
+	// 2. Append newly selected built-in engines that were not previously configured
+	for _, def := range selectedDefs {
+		lowerID := strings.ToLower(def.ID)
+		if !seen[lowerID] {
+			seen[lowerID] = true
+			if updated, ok := editedAgents[lowerID]; ok {
+				finalAgents = append(finalAgents, updated)
+			}
+		}
+	}
+
+	// 3. Append newly added custom agents
+	for _, c := range newCustomAgents {
+		lowerID := strings.ToLower(c.ID)
+		if !seen[lowerID] {
+			seen[lowerID] = true
+			finalAgents = append(finalAgents, c)
+		}
 	}
 
 	fmt.Fprintln(out, "\n[✓] 本机 Agent 配置已更新。")
 	fmt.Fprintln(out)
-	return updatedAgents
+	return finalAgents
 }
 
 func printScanSummary(out io.Writer, res config.ScanResult) {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "--- 扫描结果 ---")
 	if len(res.DiscoveredBuiltin) > 0 {
-		fmt.Fprintln(out, "  [已发现的内置已适配引擎]:")
+		fmt.Fprintln(out, "  [已发现的预置引擎]:")
 		for _, d := range res.DiscoveredBuiltin {
 			fmt.Fprintf(out, "    ✓ %-10s : %s (%s)\n", d.ID, d.Path, d.Name)
 		}
 	} else {
-		fmt.Fprintln(out, "  [内置已适配引擎]: 未在默认路径中直接探测到内置引擎")
+		fmt.Fprintln(out, "  [预置引擎]: 未在默认路径中直接探测到预置引擎")
 	}
 
 	if len(res.MissingBuiltin) > 0 {
@@ -520,7 +604,7 @@ func printScanSummary(out io.Writer, res config.ScanResult) {
 		for _, m := range res.MissingBuiltin {
 			missingIDs = append(missingIDs, m.ID)
 		}
-		fmt.Fprintf(out, "  [未发现的内置引擎]: %s\n", strings.Join(missingIDs, ", "))
+		fmt.Fprintf(out, "  [未发现的预置引擎]: %s\n", strings.Join(missingIDs, ", "))
 	}
 
 	if len(res.IDEPlugins) > 0 {

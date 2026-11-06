@@ -18,7 +18,7 @@ type BuiltinEngineDef struct {
 	CommonPaths  []string `json:"common_paths,omitempty" yaml:"common_paths,omitempty"`
 }
 
-// BuiltinEngineDefs returns the list of first-batch built-in adapted agent engines.
+// BuiltinEngineDefs returns the list of first-batch preconfigured candidate agent engines.
 // Priority is given to headless/non-interactive terminal agents.
 func BuiltinEngineDefs() []BuiltinEngineDef {
 	return []BuiltinEngineDef{
@@ -201,8 +201,8 @@ var candidateCustomBinaries = []string{
 }
 
 // ScanLocalAgents scans PATH and common installation paths on the local machine.
-// It categorizes results into built-in adapted engines, missing built-in engines,
-// discovered custom/unadapted CLIs, and IDE plugins (e.g. Continue).
+// It categorizes results into built-in candidate engines, missing built-in engines,
+// discovered custom CLIs, and IDE plugins (e.g. Continue).
 func ScanLocalAgents(opts ...ScanOptions) ScanResult {
 	var opt ScanOptions
 	if len(opts) > 0 {
