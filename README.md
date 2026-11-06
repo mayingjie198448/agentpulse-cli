@@ -130,6 +130,8 @@ agentpulse config
   ```yaml
   version: 1
   machine_id: macbook-pro
+  # 本机最大并发作业数（默认 1，保证串行安全）
+  max_concurrent_jobs: 1
   broker:
     url: tls://broker.example:8883
     username: agentpulse
@@ -147,6 +149,14 @@ agentpulse config
       path: ""
       alias: [codex]
   ```
+
+> [!WARNING]
+> **并发执行与工作区 (cwd / worktree) 隔离及资源风险说明**：
+> - `max_concurrent_jobs` 缺省默认为 `1`（严格串行），确保单机默认行为下多任务排队执行，防止工作区冲突。
+> - 若将并发上限配置为 `N > 1`（或通过 `--max-concurrent-jobs N` / `-c N` 启动常驻节点），目标节点将同时拉起多个 Agent 进程并行执行作业，超出并发上限的新下发任务保持在 `QUEUED` 状态排队。
+> - **严禁多个并发任务在同一 Git 仓库物理工作区（相同 `cwd`）下并发运行**：AI Agent 执行中会频繁读写代码文件、调用 `git status`/`git commit` 以及执行编译与测试。若多个 Agent 共享同一目录，将必然发生 `.git/index.lock` 争用、代码冲突覆写或测试产物互相踩踏。
+> - **最佳实践 (Workspace 隔离)**：并发派发时，应为每个任务指定独立的物理目录路径，或通过 `git worktree add <path> <branch>` 为每个作业派生独立的临时工作树（Worktree）；任务完成后再由调度端或人工执行合并与清理。
+> - **计算与配额资源风险**：多 Agent 并发运行时，CPU、系统内存、本地磁盘 I/O 开销将成倍增加；同时底层模型 API（如 Gemini / Claude）存在严格的并发速率与 RPM/TPM 配额限制，请结合目标机器硬件规格与模型配额合理规划并发数。
 
 ---
 
