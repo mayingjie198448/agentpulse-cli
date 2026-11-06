@@ -66,6 +66,14 @@ type Job struct {
 	Error       string     `json:"error,omitempty"`
 }
 
+// LocalStatus represents the on-disk JSON snapshot of local wrapper state.
+type LocalStatus struct {
+	Machine   Machine   `json:"machine"`
+	Job       Job       `json:"job"`
+	PID       int       `json:"pid,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // NeedsAttention reports whether the job requires human attention or follow-up.
 // Job states that need follow-up include failed executions, jobs waiting for user input,
 // and stuck/error states mapped from existing job status and error fields.
@@ -104,6 +112,7 @@ type EventType string
 const (
 	EventMachineUpdated  EventType = "machine_updated"
 	EventJobUpdated      EventType = "job_updated"
+	EventJobDeleted      EventType = "job_deleted"
 	EventLogAdded        EventType = "log_added"
 	EventAnnounceUpdated EventType = "announce_updated"
 )

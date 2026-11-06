@@ -11,7 +11,7 @@ DIST_DIR="${ROOT_DIR}/dist"
 
 VERSION="$(grep -E 'Version\s*=\s*"[^"]+"' "${ROOT_DIR}/internal/version/version.go" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
 if [ -z "${VERSION}" ]; then
-  VERSION="0.6.0"
+  VERSION="0.7.0"
 fi
 
 GIT_COMMIT="$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || echo "dev")"

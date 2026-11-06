@@ -26,6 +26,8 @@ func TestRootCommands(t *testing.T) {
 		{"list_json", []string{"list", "--json"}, "未配置 MQTT Broker URL"},
 		{"logs", []string{"logs", "job-agy-01", "--tail", "5"}, "未配置 MQTT Broker URL"},
 		{"jobs", []string{"jobs"}, "未配置 MQTT Broker URL"},
+		{"jobs_delete", []string{"jobs", "delete", "job-1"}, "未配置 MQTT Broker URL"},
+		{"jobs_rm", []string{"jobs", "rm", "job-1"}, "未配置 MQTT Broker URL"},
 		{"watch", []string{"watch"}, "未配置 MQTT Broker URL"},
 	}
 
@@ -1237,4 +1239,38 @@ func TestDispatchCommand_HelpAndSetInterspersed(t *testing.T) {
 			t.Errorf("expected 'machine ID is required' when flag is misplaced after alias, got: %v", err)
 		}
 	})
+}
+
+func TestJobsDeleteCommand_StructureAndHelp(t *testing.T) {
+	rootCmd := cli.NewRootCmd()
+
+	// 1. Verify subcommand registration and alias
+	jobsCmd, _, err := rootCmd.Find([]string{"jobs"})
+	if err != nil {
+		t.Fatalf("failed to find jobs command: %v", err)
+	}
+
+	deleteCmd, _, err := jobsCmd.Find([]string{"delete"})
+	if err != nil {
+		t.Fatalf("failed to find jobs delete command: %v", err)
+	}
+	if len(deleteCmd.Aliases) == 0 || deleteCmd.Aliases[0] != "rm" {
+		t.Errorf("expected delete alias 'rm', got: %v", deleteCmd.Aliases)
+	}
+
+	// 2. Help text verification
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"jobs", "delete", "--help"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("failed to execute jobs delete --help: %v", err)
+	}
+
+	helpOut := buf.String()
+	for _, expected := range []string{"delete <job-id>", "清除该任务的保留状态", "--force", "-y"} {
+		if !strings.Contains(helpOut, expected) {
+			t.Errorf("expected help output to contain %q, got:\n%s", expected, helpOut)
+		}
+	}
 }

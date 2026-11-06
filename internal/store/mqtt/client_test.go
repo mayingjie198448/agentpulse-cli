@@ -40,12 +40,21 @@ func (m *fakeMessage) MessageID() uint16 { return 0 }
 func (m *fakeMessage) Payload() []byte   { return m.payload }
 func (m *fakeMessage) Ack()              {}
 
+// PublishedMessage records an invocation of Publish for assertions.
+type PublishedMessage struct {
+	Topic    string
+	QoS      byte
+	Retained bool
+	Payload  []byte
+}
+
 // FakeMQTTClient implements paho.Client in memory for tests.
 type FakeMQTTClient struct {
 	mu             sync.Mutex
 	connected      bool
 	subscriptions  map[string]paho.MessageHandler
 	retained       map[string]fakeMessage
+	published      []PublishedMessage
 	unsubscribed   []string
 	disconnectWait uint
 }
@@ -55,6 +64,7 @@ func NewFakeMQTTClient() *FakeMQTTClient {
 		connected:     true,
 		subscriptions: make(map[string]paho.MessageHandler),
 		retained:      make(map[string]fakeMessage),
+		published:     make([]PublishedMessage, 0),
 	}
 }
 
@@ -80,7 +90,47 @@ func (c *FakeMQTTClient) Disconnect(quiesce uint) {
 }
 
 func (c *FakeMQTTClient) Publish(topic string, qos byte, retained bool, payload interface{}) paho.Token {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var data []byte
+	switch p := payload.(type) {
+	case []byte:
+		data = make([]byte, len(p))
+		copy(data, p)
+	case string:
+		data = []byte(p)
+	}
+
+	c.published = append(c.published, PublishedMessage{
+		Topic:    topic,
+		QoS:      qos,
+		Retained: retained,
+		Payload:  data,
+	})
+
+	if retained {
+		if len(data) == 0 {
+			delete(c.retained, topic)
+		} else {
+			c.retained[topic] = fakeMessage{
+				topic:    topic,
+				payload:  data,
+				retained: true,
+				qos:      qos,
+			}
+		}
+	}
 	return newSuccessToken()
+}
+
+// PublishedMessages returns a copy of all published messages recorded by the client.
+func (c *FakeMQTTClient) PublishedMessages() []PublishedMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]PublishedMessage, len(c.published))
+	copy(cp, c.published)
+	return cp
 }
 
 func (c *FakeMQTTClient) Subscribe(topic string, qos byte, callback paho.MessageHandler) paho.Token {

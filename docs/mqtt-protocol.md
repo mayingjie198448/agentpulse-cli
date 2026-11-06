@@ -202,6 +202,13 @@ flowchart TD
 }
 ```
 
+#### 4.2.1 任务删除与 Retained 清理 (Job Deletion & Tombstone)
+
+当用户通过 CLI (`agentpulse jobs delete <id>`) 或大盘 TUI (`d` 键确认) 删除任务时：
+1. **MQTT Clear-Retained**：发布者向该任务的主题 `agentpulse/v1/machines/{machine_id}/jobs/{job_id}/status` 发布 **0 字节（空 payload）**保留消息（QoS 1, `retained=true`）。
+2. **Broker 行为**：Broker 依据 MQTT 规范清除该主题的持久化保留状态，后续重连或新终端不再收到该任务。
+3. **订阅者行为**：各在线客户端匹配到空 payload 墓碑消息后，自动在本地内存 Store 与 TUI 列表中移除该任务及其日志缓存，并清理该任务关联的本地产物。
+
 ---
 
 ### 4.3 任务控制台日志流 (Task Log Stream)

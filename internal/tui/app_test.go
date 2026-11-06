@@ -39,7 +39,9 @@ func (f *fakeStore) GetMachine(_ context.Context, id string) (*model.Machine, er
 }
 
 func (f *fakeStore) ListJobs(context.Context) ([]model.Job, error) {
-	return f.jobs, nil
+	cp := make([]model.Job, len(f.jobs))
+	copy(cp, f.jobs)
+	return cp, nil
 }
 
 func (f *fakeStore) GetJob(_ context.Context, id string) (*model.Job, error) {
@@ -58,6 +60,20 @@ func (f *fakeStore) GetLogs(_ context.Context, jobID string, limit int) ([]model
 		entries = entries[len(entries)-limit:]
 	}
 	return entries, nil
+}
+
+func (f *fakeStore) DeleteJob(_ context.Context, id string) error {
+	for i, j := range f.jobs {
+		if j.ID == id {
+			if j.Status == model.StatusRunning {
+				return fmt.Errorf("任务 %s 正在运行中，无法删除", id)
+			}
+			f.jobs = append(f.jobs[:i], f.jobs[i+1:]...)
+			delete(f.logs, id)
+			return nil
+		}
+	}
+	return fmt.Errorf("job %s not found", id)
 }
 
 func (f *fakeStore) ListAnnounces(context.Context) ([]model.MachineAnnounce, error) {
@@ -589,3 +605,173 @@ func TestTUIModel_TeaProgramSimulation(t *testing.T) {
 		}
 	}
 }
+
+func TestTUIModel_JobsSelectionScrolling_LongIDs(t *testing.T) {
+	// Create a dataset with long job IDs that wrap onto multiple lines in the left column
+	var jobs []model.Job
+	for i := 0; i < 25; i++ {
+		jobs = append(jobs, model.Job{
+			ID:        fmt.Sprintf("job-matrix-runner-prod-deploy-cluster-%02d-long-identifier", i),
+			MachineID: fmt.Sprintf("node-%02d", i%3),
+			Engine:    model.EngineAgy,
+			Status:    model.StatusDone,
+			Progress:  100,
+			Title:     fmt.Sprintf("Task title %d", i),
+		})
+	}
+	machs := []model.Machine{
+		{ID: "node-00", Name: "node-00", Online: true},
+		{ID: "node-01", Name: "node-01", Online: true},
+		{ID: "node-02", Name: "node-02", Online: true},
+	}
+
+	st := &fakeStore{machines: machs, jobs: jobs}
+	defer st.Close()
+
+	// Heights 24 (tight) and 40 (normal), widths 80 (tight 38-col left pane) and 120 (44-col left pane)
+	for _, h := range []int{24, 40} {
+		for _, w := range []int{80, 120} {
+			m := tui.NewModel(st)
+			var tm tea.Model = m
+			tm, _ = tm.Update(tea.WindowSizeMsg{Width: w, Height: h})
+
+			// 1. Initial selection at 0 must be visible
+			v := tm.View()
+			token0 := fmt.Sprintf("cluster-%02d-long-identifier", 0)
+			if !strings.Contains(v, token0) {
+				t.Fatalf("w=%d h=%d: initial job 0 token %q not visible in view:\n%s", w, h, token0, v)
+			}
+
+			// 2. Step down all the way to 24 using 'j'
+			for step := 1; step < len(jobs); step++ {
+				tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+				currView := tm.View()
+				currLines := strings.Split(currView, "\n")
+				if len(currLines) > h {
+					t.Fatalf("w=%d h=%d step=%d: view lines %d exceeded height %d", w, h, step, len(currLines), h)
+				}
+				// The currently selected job must be visible in the JOBS pane!
+				tokenStep := fmt.Sprintf("cluster-%02d-long-identifier", step)
+				if !strings.Contains(currView, tokenStep) {
+					t.Fatalf("w=%d h=%d: after %d 'j' presses, selected job %d (%s) not visible in view:\n%s",
+						w, h, step, step, jobs[step].ID, currView)
+				}
+			}
+
+			// 3. Step back up using 'k'
+			for step := len(jobs) - 2; step >= 0; step-- {
+				tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+				currView := tm.View()
+				currLines := strings.Split(currView, "\n")
+				if len(currLines) > h {
+					t.Fatalf("w=%d h=%d step_up=%d: view lines %d exceeded height %d", w, h, step, len(currLines), h)
+				}
+				tokenStep := fmt.Sprintf("cluster-%02d-long-identifier", step)
+				if !strings.Contains(currView, tokenStep) {
+					t.Fatalf("w=%d h=%d: after 'k' stepping up to %d (%s), job not visible in view:\n%s",
+						w, h, step, jobs[step].ID, currView)
+				}
+			}
+		}
+	}
+}
+
+func TestTUIModel_DeleteJobFlow(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-run", MachineID: "node-1", Engine: model.EngineAgy, Status: model.StatusRunning, Progress: 30, Title: "Running Task"},
+			{ID: "job-done-1", MachineID: "node-1", Engine: model.EngineOpenCode, Status: model.StatusDone, Progress: 100, Title: "Finished 1"},
+			{ID: "job-done-2", MachineID: "node-1", Engine: model.EngineAgy, Status: model.StatusDone, Progress: 100, Title: "Finished 2"},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// 1. Try deleting running job (index 0)
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	v := tm.View()
+	if !strings.Contains(v, "正在运行中，无法删除") {
+		t.Fatalf("expected running job deletion refusal message, got:\n%s", v)
+	}
+	if len(m.JobsForTest()) != 3 {
+		t.Fatalf("expected 3 jobs to remain after refused delete, got %d", len(m.JobsForTest()))
+	}
+
+	// 2. Navigate down to job-done-1 (index 1)
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if m.SelectedJobIdxForTest() != 1 {
+		t.Fatalf("expected selectedJobIdx 1, got %d", m.SelectedJobIdxForTest())
+	}
+
+	// 3. Press 'd': enter confirmation mode
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if !m.ConfirmDeleteForTest() {
+		t.Fatalf("expected confirmDelete to be true")
+	}
+	v = tm.View()
+	if !strings.Contains(v, "确认删除任务 job-done-1?") {
+		t.Fatalf("expected confirmation prompt for job-done-1, got:\n%s", v)
+	}
+
+	// 4. Press 'n' to cancel
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if m.ConfirmDeleteForTest() {
+		t.Fatalf("expected confirmDelete to be false after cancel")
+	}
+	if len(m.JobsForTest()) != 3 {
+		t.Fatalf("expected 3 jobs after cancel, got %d", len(m.JobsForTest()))
+	}
+
+	// 5. Press 'd' again and confirm with 'y'
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+
+	// Verify job-done-1 removed, job count 2
+	if len(m.JobsForTest()) != 2 {
+		t.Fatalf("expected 2 jobs after deletion, got %d", len(m.JobsForTest()))
+	}
+	// Selection should move to index 1 (which is now job-done-2, the neighbor)
+	if m.SelectedJobIdxForTest() != 1 || m.JobsForTest()[1].ID != "job-done-2" {
+		t.Fatalf("expected selection to point to neighbor job-done-2 at index 1, got idx %d", m.SelectedJobIdxForTest())
+	}
+
+	// Header count should update: was 1 done, now 1 done (job-done-2)
+	v = tm.View()
+	if !strings.Contains(v, "1 done") {
+		t.Fatalf("expected header to show '1 done', got:\n%s", v)
+	}
+
+	// 6. Delete job-done-2 (the last job)
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if len(m.JobsForTest()) != 1 {
+		t.Fatalf("expected 1 job after deletion, got %d", len(m.JobsForTest()))
+	}
+	// Selection moves back to index 0 (job-run)
+	if m.SelectedJobIdxForTest() != 0 || m.JobsForTest()[0].ID != "job-run" {
+		t.Fatalf("expected selection to fall back to index 0 (job-run), got %d", m.SelectedJobIdxForTest())
+	}
+
+	// 7. EventJobDeleted reception from broker
+	tm, _ = tm.Update(model.Event{
+		Type: model.EventJobDeleted,
+		Job:  &model.Job{ID: "job-run"},
+	})
+	if len(m.JobsForTest()) != 0 {
+		t.Fatalf("expected 0 jobs after EventJobDeleted, got %d", len(m.JobsForTest()))
+	}
+	if m.SelectedJobIdxForTest() != 0 {
+		t.Fatalf("expected selectedJobIdx 0 when empty, got %d", m.SelectedJobIdxForTest())
+	}
+	v = tm.View()
+	if !strings.Contains(v, "No active jobs") {
+		t.Fatalf("expected 'No active jobs' when all jobs deleted, got:\n%s", v)
+	}
+}
+

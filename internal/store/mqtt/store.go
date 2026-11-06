@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -211,6 +212,28 @@ func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
 }
 
 func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		// Empty payload is an MQTT clear-retained tombstone per docs/mqtt-protocol.md
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		deletedJob, exists := s.jobs[pt.jobID]
+		delete(s.jobs, pt.jobID)
+		delete(s.logs, pt.jobID)
+		s.mu.Unlock()
+
+		if exists && deletedJob != nil {
+			s.broadcast(model.Event{
+				Type:      model.EventJobDeleted,
+				Job:       deletedJob,
+				Timestamp: time.Now(),
+			})
+		}
+		return
+	}
+
 	var j model.Job
 	if err := json.Unmarshal(payload, &j); err != nil {
 		return
@@ -427,6 +450,62 @@ func (s *Store) GetJob(ctx context.Context, id string) (*model.Job, error) {
 	return nil, fmt.Errorf("job not found: %s", id)
 }
 
+// DeleteJob removes a job and its logs from the store, publishes an empty retained payload
+// to the job status topic to clear broker retained state, and cleans up local artifacts.
+// If the job is currently running, it refuses deletion with a clear Chinese error.
+func (s *Store) DeleteJob(ctx context.Context, id string) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("store is closed")
+	}
+
+	job, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("job not found: %s", id)
+	}
+
+	if job.Status == model.StatusRunning {
+		s.mu.Unlock()
+		return fmt.Errorf("任务 %s 正在运行中，无法删除", id)
+	}
+
+	machineID := job.MachineID
+	deletedJob := *job
+
+	// Remove from in-memory cache
+	delete(s.jobs, id)
+	delete(s.logs, id)
+	client := s.client
+	s.mu.Unlock()
+
+	// Publish empty retained payload on agentpulse/v1/machines/{machine_id}/jobs/{job_id}/status
+	// to clear broker retained status per MQTT spec
+	if client != nil && client.IsConnected() {
+		topic := JobStatusTopic(machineID, id)
+		token := client.Publish(topic, 1, true, []byte{})
+		if !token.WaitTimeout(s.cfg.Timeout) {
+			return fmt.Errorf("MQTT publish clear-retained timed out for %s", topic)
+		}
+		if err := token.Error(); err != nil {
+			return fmt.Errorf("MQTT publish clear-retained failed: %w", err)
+		}
+	}
+
+	// Clean up AgentPulse-produced local artifacts for this job only
+	_ = store.CleanJobArtifacts(id, "")
+
+	// Broadcast EventJobDeleted to local subscribers
+	s.broadcast(model.Event{
+		Type:      model.EventJobDeleted,
+		Job:       &deletedJob,
+		Timestamp: time.Now(),
+	})
+
+	return nil
+}
+
 // GetLogs returns the most recent logs for a specific job from the ring buffer.
 func (s *Store) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) {
 	s.mu.RLock()
@@ -544,7 +623,7 @@ func (s *Store) broadcast(ev model.Event) {
 			// Backpressure policy per docs/mqtt-protocol.md §6.3:
 			// For high-frequency log events: drop when consumer buffer is full.
 			// For critical state updates (machine/job): evict an older item and enqueue state change.
-			if eventCopy.Type == model.EventMachineUpdated || eventCopy.Type == model.EventJobUpdated {
+			if eventCopy.Type == model.EventMachineUpdated || eventCopy.Type == model.EventJobUpdated || eventCopy.Type == model.EventJobDeleted {
 				select {
 				case <-ch: // evict one old event
 				default:
