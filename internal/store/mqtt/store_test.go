@@ -1427,3 +1427,229 @@ func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_FailedRefresh(t *testing.T
 		t.Errorf("expected subscriber to receive EventJobUpdated for job-realtime-important after failed refresh replay")
 	}
 }
+
+// Regression test for SUBACK 0x80 rejection on all topics.
+// Reproduces ops isolation test FAIL: broker returns SUBACK with code 0x80, token.Error() is nil,
+// semi-finished staging (containing injected qa-partial) must NOT replace live cache.
+// Live cache must be retained, staging discarded, and concurrent real-time events must not be lost.
+func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_AllTopics(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 50 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Initial store state before refresh
+	machOld := `{"id":"mach-old","name":"mach-old","online":true,"job_count":1}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-old/status", []byte(machOld), true)
+
+	jobOld := `{"id":"job-old","machine_id":"mach-old","status":"running","title":"Existing Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-old/status", []byte(jobOld), true)
+
+	// Verify initial store state
+	machines, err := st.ListMachines(ctx)
+	if err != nil || len(machines) != 1 || machines[0].ID != "mach-old" {
+		t.Fatalf("initial machines mismatch: %+v", machines)
+	}
+
+	// Subscribe to live events
+	subCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Configure broker to return SUBACK 0x80 rejection for all subscribed topic filters.
+	// In Paho, token.Error() remains nil, but token.Result() returns 0x80 for each topic.
+	fakeClient.SetSubscribeResults(map[string]byte{
+		mqttstore.TopicMachinesStatus:           0x80,
+		mqttstore.TopicJobsStatus:               0x80,
+		mqttstore.TopicJobsLogs:                 0x80,
+		mqttstore.TopicAnnounceWildcard:         0x80,
+		mqttstore.TopicMachinesAnnounceWildcard: 0x80,
+	})
+
+	// While staging is active inside SubscribeMultiple:
+	// 1. Deliver retained qa-partial (staging snapshot injection)
+	// 2. Deliver concurrent real-time job-realtime event (retained: false)
+	injectedAll := false
+	fakeClient.SetOnSubscribeMultiple(func() {
+		if injectedAll {
+			return
+		}
+		injectedAll = true
+		// qa-partial is a broker retained message injected during the refresh window
+		qaPartial := `{"id":"qa-partial","name":"qa-partial","online":true,"job_count":0}`
+		fakeClient.Deliver("agentpulse/v1/machines/qa-partial/status", []byte(qaPartial), true)
+
+		// Concurrent real-time message (not retained)
+		realtimeJob := `{"id":"job-concurrent-realtime","machine_id":"mach-old","status":"running","title":"Concurrent Realtime Job"}`
+		fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-concurrent-realtime/status", []byte(realtimeJob), false)
+	})
+
+	// Refresh must fail with error because broker rejected the subscription with SUBACK 0x80
+	refreshErr := st.Refresh(ctx)
+	if refreshErr == nil {
+		t.Fatalf("expected Refresh to fail when broker returns SUBACK 0x80, got nil")
+	}
+	if !strings.Contains(refreshErr.Error(), "0x80") {
+		t.Errorf("expected error message to mention rejection code 0x80, got: %v", refreshErr)
+	}
+
+	// Verify live store state after failed refresh:
+	// 1. Original machine (mach-old) MUST remain intact!
+	// 2. Staging machine (qa-partial) MUST NOT be present (staging discarded, no semi-finished commit)!
+	machinesAfter, err := st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	hasOld := false
+	hasQAPartial := false
+	for _, m := range machinesAfter {
+		if m.ID == "mach-old" {
+			hasOld = true
+		}
+		if m.ID == "qa-partial" {
+			hasQAPartial = true
+		}
+	}
+	if !hasOld {
+		t.Errorf("mach-old must remain intact in cache after rejected refresh")
+	}
+	if hasQAPartial {
+		t.Fatalf("CRITICAL BUG: qa-partial from semi-finished staging was falsely committed into live cache!")
+	}
+
+	// 3. Concurrent real-time message MUST NOT be lost!
+	jRealtime, err := st.GetJob(ctx, "job-concurrent-realtime")
+	if err != nil || jRealtime == nil {
+		t.Fatalf("job-concurrent-realtime was lost during failed refresh: %v", err)
+	}
+	jOld, err := st.GetJob(ctx, "job-old")
+	if err != nil || jOld == nil {
+		t.Fatalf("job-old was lost during failed refresh: %v", err)
+	}
+
+	// 4. Subscriber should receive event for concurrent real-time message
+	receivedRealtime := false
+	drainDone := false
+	for !drainDone {
+		select {
+		case ev := <-subCh:
+			if ev.Type == model.EventJobUpdated && ev.Job != nil && ev.Job.ID == "job-concurrent-realtime" {
+				receivedRealtime = true
+			}
+		case <-time.After(50 * time.Millisecond):
+			drainDone = true
+		}
+	}
+	if !receivedRealtime {
+		t.Errorf("expected subscriber to receive event for job-concurrent-realtime")
+	}
+}
+
+// Regression test for partial subscription rejection:
+// When one topic (TopicJobsStatus) is rejected (0x80) while others succeed (QoS 1),
+// Refresh must fail and NOT commit a partial snapshot.
+func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_PartialRejection(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 50 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Initial store state
+	machKeep := `{"id":"mach-keep","name":"mach-keep","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-keep/status", []byte(machKeep), true)
+
+	jobKeep := `{"id":"job-keep","machine_id":"mach-keep","status":"done","title":"Keep Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-keep/jobs/job-keep/status", []byte(jobKeep), true)
+
+	// Configure partial rejection:
+	// Machines topic is granted QoS 1, but Jobs status topic is rejected with 0x80
+	fakeClient.SetSubscribeResults(map[string]byte{
+		mqttstore.TopicJobsStatus: 0x80,
+	})
+
+	injectedPartial := false
+	fakeClient.SetOnSubscribeMultiple(func() {
+		if injectedPartial {
+			return
+		}
+		injectedPartial = true
+		// qa-partial is delivered to the accepted TopicMachinesStatus
+		qaPartial := `{"id":"qa-partial","name":"qa-partial","online":true}`
+		fakeClient.Deliver("agentpulse/v1/machines/qa-partial/status", []byte(qaPartial), true)
+	})
+
+	// Refresh must fail due to partial rejection
+	refreshErr := st.Refresh(ctx)
+	if refreshErr == nil {
+		t.Fatalf("expected Refresh to fail on partial subscription rejection, got nil")
+	}
+	if !strings.Contains(refreshErr.Error(), "0x80") {
+		t.Errorf("expected error to mention rejection code 0x80, got: %v", refreshErr)
+	}
+
+	// Verify staging was discarded and NOT committed:
+	// mach-keep must still exist, qa-partial must NOT exist, job-keep must still exist
+	machines, err := st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines error: %v", err)
+	}
+	for _, m := range machines {
+		if m.ID == "qa-partial" {
+			t.Fatalf("CRITICAL BUG: qa-partial committed on partial rejection!")
+		}
+	}
+	if len(machines) != 1 || machines[0].ID != "mach-keep" {
+		t.Errorf("expected only mach-keep, got: %+v", machines)
+	}
+
+	job, err := st.GetJob(ctx, "job-keep")
+	if err != nil || job == nil {
+		t.Errorf("expected job-keep to remain intact, got err=%v", err)
+	}
+}
+
+func TestMQTTStore_NewWithClient_BrokerRejection_SUBACK80(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	fakeClient.SetSubscribeResults(map[string]byte{
+		mqttstore.TopicMachinesStatus: 0x80,
+	})
+
+	cfg := mqttstore.DefaultConfig()
+	_, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err == nil {
+		t.Fatalf("expected NewWithClient to fail when initial subscription is rejected with SUBACK 0x80, got nil")
+	}
+	if !strings.Contains(err.Error(), "0x80") {
+		t.Errorf("expected error to mention 0x80 rejection code, got: %v", err)
+	}
+}
+
+func TestCheckSubscribeResult_Unit(t *testing.T) {
+	// 1. Nil token
+	if err := mqttstore.CheckSubscribeResult(nil); err != nil {
+		t.Errorf("expected nil error for nil token, got %v", err)
+	}
+
+	// 2. Token without resultGetter
+	fakeBase := mqttstore.NewFakeMQTTClient()
+	if err := mqttstore.CheckSubscribeResult(fakeBase.Connect()); err != nil {
+		t.Errorf("expected nil error for non-subscribe token, got %v", err)
+	}
+}
