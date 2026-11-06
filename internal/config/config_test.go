@@ -287,6 +287,51 @@ func TestHasAgyModelEvidence(t *testing.T) {
 			output:   "Error: failed to connect",
 			expected: false,
 		},
+		{
+			name:     "service temporarily unavailable",
+			output:   "service temporarily unavailable",
+			expected: false,
+		},
+		{
+			name:     "503 service unavailable",
+			output:   "503 Service Unavailable",
+			expected: false,
+		},
+		{
+			name:     "arbitrary two word normal sentence: hello world",
+			output:   "hello world",
+			expected: false,
+		},
+		{
+			name:     "arbitrary two word normal sentence: system ready",
+			output:   "system ready",
+			expected: false,
+		},
+		{
+			name:     "arbitrary two word normal sentence: internal server error",
+			output:   "internal server error",
+			expected: false,
+		},
+		{
+			name:     "storage notice and service temporarily unavailable",
+			output:   "Using file-based token storage because SSH session detected\nservice temporarily unavailable",
+			expected: false,
+		},
+		{
+			name:     "error line mentioning model",
+			output:   "Error: failed to connect to gemini endpoint",
+			expected: false,
+		},
+		{
+			name:     "sentence with failure words",
+			output:   "failed to fetch available models",
+			expected: false,
+		},
+		{
+			name:     "structured custom model entry",
+			output:   "custom-llm-v1  Custom LLM V1",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -392,4 +437,119 @@ func TestProbeAgyAuth(t *testing.T) {
 			t.Errorf("expected detail mentioning 未知输出, got %q", detail)
 		}
 	})
+}
+
+func TestProbeAgent_ExplicitPath_Regressions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script mock test on windows")
+	}
+
+	createMockScript := func(t *testing.T, content string) string {
+		tmpDir := t.TempDir()
+		scriptPath := filepath.Join(tmpDir, "mock-agy-explicit")
+		script := fmt.Sprintf("#!/bin/sh\n%s\n", content)
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write mock script: %v", err)
+		}
+		return scriptPath
+	}
+
+	t.Run("explicit path unauthenticated script must not be ok", func(t *testing.T) {
+		bin := createMockScript(t, `echo "Please sign in to view available models"; exit 1`)
+		st := config.ProbeAgent(config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("expected Ok=false for unauthenticated explicit path, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "未登录") {
+			t.Errorf("expected detail mentioning 未登录, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path error script must not be ok", func(t *testing.T) {
+		bin := createMockScript(t, `echo "connection reset by peer"; exit 2`)
+		st := config.ProbeAgent(config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("expected Ok=false for error exit explicit path, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "探测失败") {
+			t.Errorf("expected detail mentioning 探测失败, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path timeout script must not be ok", func(t *testing.T) {
+		bin := createMockScript(t, `sleep 1; exit 0`)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		st := config.ProbeAgentContext(ctx, config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("expected Ok=false for timeout explicit path, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "超时") {
+			t.Errorf("expected detail mentioning 超时, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path unknown two-word output must not be ok", func(t *testing.T) {
+		bin := createMockScript(t, `echo "service temporarily unavailable"; exit 0`)
+		st := config.ProbeAgent(config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("expected Ok=false for unknown two-word explicit path, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "未知输出") {
+			t.Errorf("expected detail mentioning 未知输出, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path valid model output must be ok", func(t *testing.T) {
+		bin := createMockScript(t, `echo "gemini-3.8-flash-high Gemini 3.8 Flash (High)"; exit 0`)
+		st := config.ProbeAgent(config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if !st.Ok {
+			t.Errorf("expected Ok=true for valid model explicit path, got Ok=false, detail=%q", st.Detail)
+		}
+		if !strings.Contains(st.Detail, "已登录就绪") {
+			t.Errorf("expected detail mentioning 已登录就绪, got %q", st.Detail)
+		}
+	})
+}
+
+func TestProbeAgent_PATH_UnknownTwoWord(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script mock test on windows")
+	}
+
+	tmpDir := t.TempDir()
+	scriptPath := filepath.Join(tmpDir, "agy")
+	script := "#!/bin/sh\necho \"service temporarily unavailable\"\nexit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write mock agy: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", fmt.Sprintf("%s%c%s", tmpDir, os.PathListSeparator, origPath))
+
+	st := config.ProbeAgent(config.AgentConfig{
+		ID:    "agy",
+		Alias: []string{"agy"},
+	})
+	if st.Ok {
+		t.Errorf("expected Ok=false for unknown two-word PATH output, got Ok=true")
+	}
+	if !strings.Contains(st.Detail, "未知输出") {
+		t.Errorf("expected detail mentioning 未知输出, got %q", st.Detail)
+	}
 }
