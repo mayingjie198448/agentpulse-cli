@@ -60,10 +60,34 @@ type Job struct {
 	Cwd         string     `json:"cwd"`
 	Command     string     `json:"command"`
 	Title       string     `json:"title"`
+	Repo        string     `json:"repo,omitempty"`
+	Project     string     `json:"project,omitempty"`
+	Prompt      string     `json:"prompt,omitempty"` // Sanitized prompt summary (max length bounded, secrets redacted)
 	StartedAt   time.Time  `json:"started_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+	EndedAt     time.Time  `json:"ended_at,omitempty"`
 	DurationStr string     `json:"duration_str,omitempty"`
+	RequestedBy string     `json:"requested_by,omitempty"`
 	Error       string     `json:"error,omitempty"`
+}
+
+// RepoOrProject returns the primary repository or project name for the job.
+func (j Job) RepoOrProject() string {
+	if r := strings.TrimSpace(j.Repo); r != "" {
+		return r
+	}
+	if p := strings.TrimSpace(j.Project); p != "" {
+		return p
+	}
+	return ""
+}
+
+// DisplayTitle returns the human-readable title or falls back to Job ID.
+func (j Job) DisplayTitle() string {
+	if t := strings.TrimSpace(j.Title); t != "" {
+		return t
+	}
+	return j.ID
 }
 
 // LocalStatus represents the on-disk JSON snapshot of local wrapper state.
@@ -174,9 +198,11 @@ type DispatchCommand struct {
 	Command        string            `json:"command"`
 	Args           []string          `json:"args"`
 	Title          string            `json:"title"`
+	Repo           string            `json:"repo,omitempty"`
+	Project        string            `json:"project,omitempty"`
+	Prompt         string            `json:"prompt,omitempty"` // Sanitized prompt summary
 	TimeoutSeconds int               `json:"timeout_seconds"`
 	Env            map[string]string `json:"env,omitempty"`
 	RequestedBy    string            `json:"requested_by"`
 	Timestamp      time.Time         `json:"timestamp"`
 }
-

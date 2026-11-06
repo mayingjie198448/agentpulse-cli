@@ -51,3 +51,14 @@ func (m *Model) ConfirmDeleteForTest() bool {
 func (m *Model) DeleteErrorForTest() string {
 	return m.deleteError
 }
+
+// GroupingForTest returns the current grouping mode for test assertions.
+func (m *Model) GroupingForTest() JobGrouping {
+	return m.grouping
+}
+
+// SetGroupingForTest sets the grouping mode for test assertions.
+func (m *Model) SetGroupingForTest(g JobGrouping) {
+	m.grouping = g
+	m.applyGrouping()
+}

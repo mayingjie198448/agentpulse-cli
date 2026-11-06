@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +22,50 @@ const (
 	PaneJobs ActivePane = iota
 	PaneLogs
 )
+
+// JobGrouping defines the grouping/sorting strategy applied to the jobs view.
+type JobGrouping int
+
+const (
+	GroupDefault   JobGrouping = iota // 默认：状态优先 + ID
+	GroupRepo                         // 按仓库/项目 (repo/project)
+	GroupMachine                      // 按目标机 (machine)
+	GroupStatus                       // 按完成状态 (status)
+	GroupEngine                       // 按 agent CLI 类型 (engine)
+	GroupStarted                      // 按开始时间 (started_at)
+	GroupRequested                    // 按发起者 (requested_by)
+)
+
+// AllGroupings lists all available grouping strategies in cycling order.
+var AllGroupings = []JobGrouping{
+	GroupDefault,
+	GroupRepo,
+	GroupMachine,
+	GroupStatus,
+	GroupEngine,
+	GroupStarted,
+	GroupRequested,
+}
+
+// String returns the human-readable Chinese description of the grouping.
+func (g JobGrouping) String() string {
+	switch g {
+	case GroupRepo:
+		return "仓库/项目"
+	case GroupMachine:
+		return "目标机"
+	case GroupStatus:
+		return "完成状态"
+	case GroupEngine:
+		return "Agent类型"
+	case GroupStarted:
+		return "开始时间"
+	case GroupRequested:
+		return "发起者"
+	default:
+		return "默认"
+	}
+}
 
 type tickMsg time.Time
 
@@ -52,6 +97,7 @@ type Model struct {
 	confirmDelete    bool
 	deleteTargetID   string
 	deleteError      string
+	grouping         JobGrouping
 }
 
 // BrokerConnected returns true if the MQTT broker is currently connected.
@@ -211,6 +257,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logs[curJob.ID] = []model.LogEntry{}
 				m.updateViewportContent()
 			}
+
+		case "g":
+			m.nextGrouping()
+
+		case "G":
+			m.prevGrouping()
 
 		case "d":
 			if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) {
@@ -415,6 +467,161 @@ func (m *Model) ensureLogsLoadedForSelectedJob() {
 			m.logs[curJob.ID] = lgs
 		}
 	}
+}
+
+func jobStatusWeight(st model.JobStatus) int {
+	switch st {
+	case model.StatusRunning:
+		return 0
+	case model.StatusQueued:
+		return 1
+	case model.StatusFailed:
+		return 2
+	case model.StatusDone:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func (m *Model) jobGroupKey(j model.Job) string {
+	switch m.grouping {
+	case GroupRepo:
+		r := j.RepoOrProject()
+		if r == "" {
+			return "未知/未标注"
+		}
+		return r
+	case GroupMachine:
+		mach := strings.TrimSpace(j.MachineID)
+		if mach == "" {
+			return "未知/未标注"
+		}
+		return mach
+	case GroupStatus:
+		st := strings.TrimSpace(string(j.Status))
+		if st == "" {
+			return "未知/未标注"
+		}
+		return strings.ToUpper(st)
+	case GroupEngine:
+		eng := strings.TrimSpace(string(j.Engine))
+		if eng == "" {
+			return "未知/未标注"
+		}
+		return eng
+	case GroupStarted:
+		if j.StartedAt.IsZero() {
+			return "未知/未标注"
+		}
+		return j.StartedAt.Local().Format("2006-01-02")
+	case GroupRequested:
+		req := strings.TrimSpace(j.RequestedBy)
+		if req == "" {
+			return "未知/未标注"
+		}
+		return req
+	default:
+		return ""
+	}
+}
+
+func (m *Model) applyGrouping() {
+	if len(m.jobs) <= 1 {
+		return
+	}
+
+	sort.SliceStable(m.jobs, func(i, j int) bool {
+		if m.grouping != GroupDefault {
+			kI := m.jobGroupKey(m.jobs[i])
+			kJ := m.jobGroupKey(m.jobs[j])
+			if kI != kJ {
+				if kI == "未知/未标注" {
+					return false
+				}
+				if kJ == "未知/未标注" {
+					return true
+				}
+				return kI < kJ
+			}
+		}
+
+		wI, wJ := jobStatusWeight(m.jobs[i].Status), jobStatusWeight(m.jobs[j].Status)
+		if wI != wJ {
+			return wI < wJ
+		}
+		return m.jobs[i].ID < m.jobs[j].ID
+	})
+}
+
+func (m *Model) nextGrouping() {
+	var selectedID string
+	if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
+		selectedID = m.jobs[m.selectedJobIdx].ID
+	}
+
+	m.grouping = (m.grouping + 1) % JobGrouping(len(AllGroupings))
+	m.applyGrouping()
+
+	if selectedID != "" {
+		for i, j := range m.jobs {
+			if j.ID == selectedID {
+				m.selectedJobIdx = i
+				break
+			}
+		}
+	}
+	m.ensureLogsLoadedForSelectedJob()
+	m.updateViewportContent()
+}
+
+func (m *Model) prevGrouping() {
+	var selectedID string
+	if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
+		selectedID = m.jobs[m.selectedJobIdx].ID
+	}
+
+	m.grouping = (m.grouping + JobGrouping(len(AllGroupings)) - 1) % JobGrouping(len(AllGroupings))
+	m.applyGrouping()
+
+	if selectedID != "" {
+		for i, j := range m.jobs {
+			if j.ID == selectedID {
+				m.selectedJobIdx = i
+				break
+			}
+		}
+	}
+	m.ensureLogsLoadedForSelectedJob()
+	m.updateViewportContent()
+}
+
+func (m *Model) renderGroupHeader(groupKey string, count int, width int) string {
+	icon := "📁"
+	switch m.grouping {
+	case GroupMachine:
+		icon = "🖥 "
+	case GroupStatus:
+		icon = "●"
+	case GroupEngine:
+		icon = "⚡"
+	case GroupStarted:
+		icon = "🕒"
+	case GroupRequested:
+		icon = "👤"
+	}
+
+	titleText := fmt.Sprintf("── %s %s (%d) ", icon, groupKey, count)
+	remWidth := width - lipgloss.Width(titleText)
+	if remWidth < 1 {
+		remWidth = 1
+	}
+	tail := strings.Repeat("─", remWidth)
+
+	return lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorHighlight).
+		Render(titleText + tail)
 }
 
 func (m *Model) updateViewportContent() {
@@ -751,7 +958,23 @@ func (m *Model) renderJobItem(j model.Job, isSelected bool) string {
 	idStr := fmt.Sprintf("%-12s", j.ID)
 	machStr := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("@%-7s", j.MachineID))
 
-	line := fmt.Sprintf("%s %s %s %s", engineBadge, idStr, machStr, statusText)
+	line1 := fmt.Sprintf("%s %s %s %s", engineBadge, idStr, machStr, statusText)
+
+	var subParts []string
+	if t := strings.TrimSpace(j.Title); t != "" && t != j.ID {
+		subParts = append(subParts, lipgloss.NewStyle().Foreground(ColorLightText).Render(t))
+	}
+	if r := j.RepoOrProject(); r != "" {
+		subParts = append(subParts, lipgloss.NewStyle().Foreground(ColorPrimary).Render(fmt.Sprintf("[%s]", r)))
+	}
+	if !j.StartedAt.IsZero() {
+		subParts = append(subParts, lipgloss.NewStyle().Foreground(ColorDimText).Render(j.StartedAt.Local().Format("15:04")))
+	}
+
+	line := line1
+	if len(subParts) > 0 {
+		line = line1 + "\n  " + strings.Join(subParts, " ")
+	}
 
 	if isSelected {
 		indicator := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("▶ ")
@@ -767,9 +990,9 @@ func (m *Model) renderJobsBox(width, maxHeight int) string {
 		return ""
 	}
 
-	titleText := "⚡ JOBS (j/k 移动, d 删除, enter 追踪)"
+	titleText := fmt.Sprintf("⚡ JOBS (%s)", m.grouping.String())
 	if len(m.jobs) > 0 {
-		titleText = fmt.Sprintf("⚡ JOBS (%d/%d) (j/k 移动, d 删除)", m.selectedJobIdx+1, len(m.jobs))
+		titleText = fmt.Sprintf("⚡ JOBS (%d/%d, %s)", m.selectedJobIdx+1, len(m.jobs), m.grouping.String())
 	}
 	title := BoxTitleStyle.Render(titleText)
 	titleHeight := lipgloss.Height(title)
@@ -807,8 +1030,29 @@ func (m *Model) renderJobsBox(width, maxHeight int) string {
 	measureStyle := lipgloss.NewStyle().Width(innerWidth)
 	heights := make([]int, len(m.jobs))
 	renderedItems := make([]string, len(m.jobs))
+
+	groupCounts := make(map[string]int)
+	if m.grouping != GroupDefault {
+		for _, j := range m.jobs {
+			groupCounts[m.jobGroupKey(j)]++
+		}
+	}
+
+	var prevGroup string
 	for i, j := range m.jobs {
-		renderedItems[i] = m.renderJobItem(j, i == m.selectedJobIdx)
+		jobItemStr := m.renderJobItem(j, i == m.selectedJobIdx)
+		if m.grouping != GroupDefault {
+			currGroup := m.jobGroupKey(j)
+			if i == 0 || currGroup != prevGroup {
+				header := m.renderGroupHeader(currGroup, groupCounts[currGroup], innerWidth)
+				renderedItems[i] = header + "\n" + jobItemStr
+				prevGroup = currGroup
+			} else {
+				renderedItems[i] = jobItemStr
+			}
+		} else {
+			renderedItems[i] = jobItemStr
+		}
 		heights[i] = lipgloss.Height(measureStyle.Render(renderedItems[i]))
 		if heights[i] < 1 {
 			heights[i] = 1
@@ -917,6 +1161,43 @@ func (m *Model) renderJobDetailBox(width int) string {
 		statusBadge,
 	)
 	b.WriteString(metaRow + "\n")
+
+	// Meta row 2: Repo/Project, StartedAt, EndedAt, RequestedBy
+	var metaParts []string
+	if r := curJob.RepoOrProject(); r != "" {
+		metaParts = append(metaParts, lipgloss.NewStyle().Foreground(ColorDimText).Render("Repo/Project: ")+
+			lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render(r))
+	}
+	if !curJob.StartedAt.IsZero() {
+		metaParts = append(metaParts, lipgloss.NewStyle().Foreground(ColorDimText).Render("Started: ")+
+			lipgloss.NewStyle().Foreground(ColorLightText).Render(curJob.StartedAt.Local().Format("2006-01-02 15:04:05")))
+	}
+	if !curJob.EndedAt.IsZero() {
+		metaParts = append(metaParts, lipgloss.NewStyle().Foreground(ColorDimText).Render("Ended: ")+
+			lipgloss.NewStyle().Foreground(ColorLightText).Render(curJob.EndedAt.Local().Format("15:04:05")))
+	}
+	if curJob.RequestedBy != "" {
+		metaParts = append(metaParts, lipgloss.NewStyle().Foreground(ColorDimText).Render("By: ")+
+			lipgloss.NewStyle().Foreground(ColorLightText).Render(curJob.RequestedBy))
+	}
+	if len(metaParts) > 0 {
+		b.WriteString(strings.Join(metaParts, "  •  ") + "\n")
+	}
+
+	// Prompt summary row
+	if curJob.Prompt != "" {
+		promptSummary := curJob.Prompt
+		maxPromptLen := width - 18
+		if maxPromptLen < 20 {
+			maxPromptLen = 20
+		}
+		if len(promptSummary) > maxPromptLen {
+			promptSummary = promptSummary[:maxPromptLen-3] + "..."
+		}
+		promptLine := lipgloss.NewStyle().Foreground(ColorDimText).Render("Prompt: ") +
+			lipgloss.NewStyle().Foreground(ColorHighlight).Italic(true).Render(fmt.Sprintf("%q", promptSummary))
+		b.WriteString(promptLine + "\n")
+	}
 
 	// Info row: CWD and Command
 	cwd := curJob.Cwd
@@ -1046,6 +1327,7 @@ func (m *Model) renderFooter() string {
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("q"), FooterDescStyle.Render("退出")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("tab"), FooterDescStyle.Render("切换面板")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("j/k"), FooterDescStyle.Render("选择任务")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("g"), FooterDescStyle.Render("切换分组")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("d"), FooterDescStyle.Render("删除任务")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("enter"), FooterDescStyle.Render("追踪/聚焦")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("space"), FooterDescStyle.Render(pauseText)),

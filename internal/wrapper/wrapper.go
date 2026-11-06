@@ -49,6 +49,10 @@ type Config struct {
 	JobID             string
 	Engine            model.EngineType // "agy" or "opencode"
 	Title             string
+	Repo              string
+	Project           string
+	Prompt            string
+	RequestedBy       string
 	Command           string
 	Args              []string
 	Cwd               string
@@ -113,8 +117,27 @@ func New(cfg Config) (*Wrapper, error) {
 		cfg.JobID = generateJobID(cfg.Engine)
 	}
 
+	if cfg.Prompt == "" {
+		cfg.Prompt = ExtractPrompt(cfg.Args)
+	}
+	if cfg.Prompt != "" {
+		cfg.Prompt = SanitizePrompt(cfg.Prompt, DefaultMaxPromptLength)
+	}
+
 	if cfg.Title == "" {
-		cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		if cfg.Prompt != "" {
+			cfg.Title = SanitizePrompt(cfg.Prompt, 60)
+		} else {
+			cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		}
+	}
+
+	if cfg.Repo == "" && cfg.Project == "" {
+		cfg.Repo, cfg.Project = InferRepoAndProject(cfg.Cwd)
+	} else if cfg.Repo == "" {
+		cfg.Repo = cfg.Project
+	} else if cfg.Project == "" {
+		cfg.Project = cfg.Repo
 	}
 
 	if cfg.Command == "" && len(cfg.Args) > 0 {
@@ -144,16 +167,20 @@ func New(cfg Config) (*Wrapper, error) {
 	}
 
 	job := model.Job{
-		ID:        cfg.JobID,
-		MachineID: cfg.MachineID,
-		Engine:    cfg.Engine,
-		Status:    model.StatusRunning,
-		Progress:  0.0,
-		Cwd:       cfg.Cwd,
-		Command:   cfg.Command,
-		Title:     cfg.Title,
-		StartedAt: now,
-		UpdatedAt: now,
+		ID:          cfg.JobID,
+		MachineID:   cfg.MachineID,
+		Engine:      cfg.Engine,
+		Status:      model.StatusRunning,
+		Progress:    0.0,
+		Cwd:         cfg.Cwd,
+		Command:     cfg.Command,
+		Title:       cfg.Title,
+		Repo:        cfg.Repo,
+		Project:     cfg.Project,
+		Prompt:      cfg.Prompt,
+		RequestedBy: cfg.RequestedBy,
+		StartedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	w := &Wrapper{
@@ -194,6 +221,7 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		w.mu.Lock()
 		finishTime := time.Now().UTC()
 		w.job.UpdatedAt = finishTime
+		w.job.EndedAt = finishTime
 		w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
 		if runErr != nil {
 			w.job.Status = model.StatusFailed
@@ -576,10 +604,14 @@ func (w *Wrapper) publishAlert() {
 		"engine":       string(j.Engine),
 		"status":       string(j.Status),
 		"title":        j.Title,
+		"repo":         j.Repo,
+		"project":      j.Project,
+		"prompt":       j.Prompt,
 		"cwd":          j.Cwd,
 		"duration_str": j.DurationStr,
 		"started_at":   j.StartedAt.Format(time.RFC3339),
 		"finished_at":  j.UpdatedAt.Format(time.RFC3339),
+		"requested_by": j.RequestedBy,
 		"error":        j.Error,
 	}
 

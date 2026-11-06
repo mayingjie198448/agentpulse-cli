@@ -183,16 +183,20 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 		}
 	}
 	job := model.Job{
-		ID:        cmd.JobID,
-		MachineID: l.cfg.MachineID,
-		Engine:    cmd.Engine,
-		Status:    model.StatusQueued,
-		Progress:  0.0,
-		Cwd:       cmd.Cwd,
-		Command:   cmdStr,
-		Title:     cmd.Title,
-		StartedAt: now,
-		UpdatedAt: now,
+		ID:          cmd.JobID,
+		MachineID:   l.cfg.MachineID,
+		Engine:      cmd.Engine,
+		Status:      model.StatusQueued,
+		Progress:    0.0,
+		Cwd:         cmd.Cwd,
+		Command:     cmdStr,
+		Title:       cmd.Title,
+		Repo:        cmd.Repo,
+		Project:     cmd.Project,
+		Prompt:      cmd.Prompt,
+		RequestedBy: cmd.RequestedBy,
+		StartedAt:   now,
+		UpdatedAt:   now,
 	}
 	topic := mqtt.JobStatusTopic(l.cfg.MachineID, cmd.JobID)
 	data, err := json.Marshal(job)
@@ -541,6 +545,10 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		JobID:             cmd.JobID,
 		Engine:            cmd.Engine,
 		Title:             cmd.Title,
+		Repo:              cmd.Repo,
+		Project:           cmd.Project,
+		Prompt:            cmd.Prompt,
+		RequestedBy:       cmd.RequestedBy,
 		Args:              args,
 		Cwd:               cmd.Cwd,
 		Env:               cmd.Env,

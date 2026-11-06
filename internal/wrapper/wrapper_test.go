@@ -2,6 +2,7 @@ package wrapper_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1033,5 +1034,237 @@ func TestListener_MachineIdentityDefaults(t *testing.T) {
 	}
 	if l2.Machine().ID != "worker-node-beta" {
 		t.Errorf("expected sanitized ID 'worker-node-beta', got %q", l2.Machine().ID)
+	}
+}
+
+func TestSanitizePrompt_SecretRedaction(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "empty prompt",
+			input:    "",
+			maxLen:   256,
+			expected: "",
+		},
+		{
+			name:     "clean prompt without secrets",
+			input:    "Refactor database connection pool and verify unit tests",
+			maxLen:   256,
+			expected: "Refactor database connection pool and verify unit tests",
+		},
+		{
+			name:     "redact openai api key",
+			input:    "Use sk-abcdef1234567890abcdef1234567890 for testing completion",
+			maxLen:   256,
+			expected: "Use sk-[REDACTED] for testing completion",
+		},
+		{
+			name:     "redact anthropic api key",
+			input:    "Config with ant-abcdef1234567890abcdef1234567890 model",
+			maxLen:   256,
+			expected: "Config with ant-[REDACTED] model",
+		},
+		{
+			name:     "redact github token",
+			input:    "Clone with ghp_1234567890abcdef1234567890abcdef123456",
+			maxLen:   256,
+			expected: "Clone with [REDACTED_TOKEN]",
+		},
+		{
+			name:     "redact bearer token",
+			input:    "Send header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.test.sig to api",
+			maxLen:   256,
+			expected: "Send header Authorization: Bearer [REDACTED] to api",
+		},
+		{
+			name:     "redact key-value password and secret",
+			input:    "Run migration with password=SuperSecretPass123! and token:mySecretTokenVal",
+			maxLen:   256,
+			expected: "Run migration with password=[REDACTED] and token:[REDACTED]",
+		},
+		{
+			name:     "redact embedded url credentials",
+			input:    "Fetch repo from https://admin:mySecretPass@github.com/org/repo.git",
+			maxLen:   256,
+			expected: "Fetch repo from https://admin:[REDACTED]@github.com/org/repo.git",
+		},
+		{
+			name:     "redact private key block",
+			input:    "Key is -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY----- done",
+			maxLen:   256,
+			expected: "Key is [PRIVATE_KEY_REDACTED] done",
+		},
+		{
+			name:     "enforce max length truncation",
+			input:    "This is a very long prompt task description that exceeds the maximum length limit configured for MQTT retained payload",
+			maxLen:   40,
+			expected: "This is a very long prompt task descr...",
+		},
+		{
+			name:     "normalize multiple newlines and spaces",
+			input:    "Line 1\n\n\n   Line 2\t\tLine 3",
+			maxLen:   256,
+			expected: "Line 1 Line 2 Line 3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapper.SanitizePrompt(tc.input, tc.maxLen)
+			if got != tc.expected {
+				t.Errorf("SanitizePrompt(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestExtractPrompt(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected string
+	}{
+		{
+			name:     "no prompt flag",
+			args:     []string{"run", "--verbose"},
+			expected: "",
+		},
+		{
+			name:     "short flag -p",
+			args:     []string{"run", "-p", "Optimize auth cache"},
+			expected: "Optimize auth cache",
+		},
+		{
+			name:     "long flag --prompt",
+			args:     []string{"run", "--prompt", "Build release artifacts"},
+			expected: "Build release artifacts",
+		},
+		{
+			name:     "long flag with equals --prompt=...",
+			args:     []string{"run", "--prompt=Fix flaky test"},
+			expected: "Fix flaky test",
+		},
+		{
+			name:     "task flag --task",
+			args:     []string{"run", "--task", "Update docs"},
+			expected: "Update docs",
+		},
+		{
+			name:     "task flag with equals --task=...",
+			args:     []string{"run", "--task=Update schema"},
+			expected: "Update schema",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapper.ExtractPrompt(tc.args)
+			if got != tc.expected {
+				t.Errorf("ExtractPrompt(%v) = %q, want %q", tc.args, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestInferRepoAndProject(t *testing.T) {
+	// Inside current workspace, which is a git repo
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to getwd: %v", err)
+	}
+
+	repo, proj := wrapper.InferRepoAndProject(cwd)
+	if proj == "" {
+		t.Errorf("expected non-empty project inferred from cwd %q", cwd)
+	}
+	if repo == "" {
+		t.Errorf("expected non-empty repo inferred from cwd %q", cwd)
+	}
+
+	// For a non-git temporary folder
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "my-test-proj")
+	_ = os.MkdirAll(subDir, 0755)
+
+	repo2, proj2 := wrapper.InferRepoAndProject(subDir)
+	if proj2 != "my-test-proj" {
+		t.Errorf("expected project 'my-test-proj', got %q", proj2)
+	}
+	if repo2 != "my-test-proj" {
+		t.Errorf("expected repo 'my-test-proj', got %q", repo2)
+	}
+}
+
+func TestWrapper_ExtendedFieldsInStatusAndAlert(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:   "box-node-1",
+		JobID:       "job-fields-01",
+		Engine:      model.EngineAgy,
+		Title:       "Deploy Auth Proxy",
+		Repo:        "org/auth-proxy",
+		Project:     "auth-proxy",
+		Prompt:      "Deploy auth proxy with sk-1234567890abcdef1234567890 key",
+		RequestedBy: "dev@workstation",
+		StatusFile:  statusFile,
+		MQTTClient:  mockClient,
+		Stub:        true,
+		Quiet:       true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	// Verify sanitized prompt in job
+	if strings.Contains(w.Job().Prompt, "sk-1234567890") {
+		t.Errorf("prompt was not sanitized, contains raw key: %q", w.Job().Prompt)
+	}
+	if !strings.Contains(w.Job().Prompt, "sk-[REDACTED]") {
+		t.Errorf("prompt missing redacted placeholder: %q", w.Job().Prompt)
+	}
+	if w.Job().Repo != "org/auth-proxy" || w.Job().Project != "auth-proxy" {
+		t.Errorf("unexpected repo/project: repo=%q proj=%q", w.Job().Repo, w.Job().Project)
+	}
+	if w.Job().RequestedBy != "dev@workstation" {
+		t.Errorf("unexpected requested_by: %q", w.Job().RequestedBy)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("w.Run failed: %v", err)
+	}
+
+	// Verify EndedAt populated
+	if w.Job().EndedAt.IsZero() {
+		t.Errorf("expected non-zero EndedAt on completed job")
+	}
+
+	// Verify published alert contains extended fields
+	var alertMap map[string]interface{}
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == "agentpulse/v1/notifications/alerts" {
+			_ = json.Unmarshal(m.Payload, &alertMap)
+		}
+	}
+	if alertMap == nil {
+		t.Fatalf("expected alert publication")
+	}
+	if alertMap["repo"] != "org/auth-proxy" || alertMap["project"] != "auth-proxy" {
+		t.Errorf("unexpected alert repo/project: %+v", alertMap)
+	}
+	if alertMap["requested_by"] != "dev@workstation" {
+		t.Errorf("unexpected alert requested_by: %+v", alertMap)
+	}
+	if alertMap["finished_at"] == "" {
+		t.Errorf("expected finished_at in alert payload")
 	}
 }

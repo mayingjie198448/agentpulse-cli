@@ -791,3 +791,116 @@ func TestListener_QueuedStatusAndJobCount(t *testing.T) {
 		t.Errorf("expected queued status, got %s", queuedJob.Status)
 	}
 }
+
+func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "ext-status.json")
+
+	var jobMu sync.Mutex
+	var startedJob *model.Job
+	var completedJob *model.Job
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	listeningCh := make(chan struct{})
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:  "worker-fields-1",
+		StatusFile: statusFile,
+		MQTTClient: mockClient,
+		Stub:       true,
+		Quiet:      true,
+		OnListening: func(_ string) {
+			close(listeningCh)
+		},
+		OnJobStart: func(j model.Job) {
+			jobMu.Lock()
+			cp := j
+			startedJob = &cp
+			jobMu.Unlock()
+		},
+		OnJobComplete: func(j model.Job, err error) {
+			jobMu.Lock()
+			cp := j
+			completedJob = &cp
+			jobMu.Unlock()
+			wg.Done()
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	listenerDone := make(chan error, 1)
+	go func() {
+		listenerDone <- l.Run(ctx)
+	}()
+
+	select {
+	case <-listeningCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for OnListening")
+	}
+
+	cmd := model.DispatchCommand{
+		CommandID:   "cmd-fields-101",
+		JobID:       "job-fields-stub-1",
+		Engine:      model.EngineAgy,
+		Command:     "agy",
+		Args:        []string{"run", "--prompt", "Optimize auth queries"},
+		Title:       "Optimize auth queries",
+		Repo:        "org/auth-service",
+		Project:     "auth-service",
+		Prompt:      "Optimize auth queries for fast login",
+		RequestedBy: "lead@laptop",
+		Timestamp:   time.Now().UTC(),
+	}
+	payload, _ := json.Marshal(cmd)
+	mockClient.Publish(mqtt.MachineDispatchTopic("worker-fields-1"), 1, false, payload)
+
+	wg.Wait()
+	cancel()
+	<-listenerDone
+
+	jobMu.Lock()
+	defer jobMu.Unlock()
+
+	if startedJob == nil {
+		t.Fatalf("expected started job")
+	}
+	if startedJob.Repo != "org/auth-service" || startedJob.Project != "auth-service" {
+		t.Errorf("unexpected repo/project: repo=%q project=%q", startedJob.Repo, startedJob.Project)
+	}
+	if startedJob.Prompt != "Optimize auth queries for fast login" {
+		t.Errorf("unexpected prompt: %q", startedJob.Prompt)
+	}
+	if startedJob.RequestedBy != "lead@laptop" {
+		t.Errorf("unexpected requested_by: %q", startedJob.RequestedBy)
+	}
+	if completedJob == nil || completedJob.Status != model.StatusDone {
+		t.Errorf("expected completed job with StatusDone")
+	}
+
+	// Verify queued status published with extended fields
+	var queuedJob *model.Job
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == mqtt.JobStatusTopic("worker-fields-1", "job-fields-stub-1") {
+			var j model.Job
+			if err := json.Unmarshal(m.Payload, &j); err == nil && j.Status == model.StatusQueued {
+				cp := j
+				queuedJob = &cp
+			}
+		}
+	}
+	if queuedJob == nil {
+		t.Fatalf("expected queued job status message")
+	}
+	if queuedJob.Repo != "org/auth-service" || queuedJob.Project != "auth-service" || queuedJob.RequestedBy != "lead@laptop" {
+		t.Errorf("unexpected queued job fields: %+v", queuedJob)
+	}
+}
+

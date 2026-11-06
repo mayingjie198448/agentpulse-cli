@@ -775,3 +775,169 @@ func TestTUIModel_DeleteJobFlow(t *testing.T) {
 	}
 }
 
+func TestTUIModel_GroupingAndSelectionPreservation(t *testing.T) {
+	t1 := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 2, 11, 30, 0, 0, time.UTC)
+
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "Studio M2", Online: true},
+			{ID: "node-2", Name: "Linux Box", Online: true},
+		},
+		jobs: []model.Job{
+			{
+				ID:        "job-legacy",
+				MachineID: "node-1",
+				Engine:    model.EngineAgy,
+				Status:    model.StatusRunning,
+				Title:     "Legacy Task without fields",
+				Progress:  50,
+			},
+			{
+				ID:          "job-repo-a",
+				MachineID:   "node-1",
+				Engine:      model.EngineAgy,
+				Status:      model.StatusRunning,
+				Title:       "Task Alpha",
+				Repo:        "owner/repo-a",
+				Project:     "repo-a",
+				Prompt:      "Implement secret sauce algorithm",
+				StartedAt:   t1,
+				RequestedBy: "alice@company.internal",
+				Progress:    75,
+			},
+			{
+				ID:          "job-repo-b",
+				MachineID:   "node-2",
+				Engine:      model.EngineOpenCode,
+				Status:      model.StatusDone,
+				Title:       "Task Beta",
+				Repo:        "owner/repo-b",
+				Project:     "repo-b",
+				Prompt:      "Refactor legacy database access layer",
+				StartedAt:   t1,
+				EndedAt:     t2,
+				RequestedBy: "bob@remote",
+				Progress:    100,
+			},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-repo-a": {{JobID: "job-repo-a", Message: "step 1"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 45})
+
+	// Initial grouping should be GroupDefault
+	if m.GroupingForTest() != tui.GroupDefault {
+		t.Fatalf("expected initial grouping to be GroupDefault, got %v", m.GroupingForTest())
+	}
+
+	// Navigate selection to job-repo-b
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-repo-b" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("failed to navigate to job-repo-b")
+	}
+
+	// Press 'g': GroupDefault -> GroupRepo
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRepo {
+		t.Fatalf("expected GroupRepo after 'g', got %v", m.GroupingForTest())
+	}
+	// Selection must remain on job-repo-b
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("expected selection preserved on job-repo-b, got %s", m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+	}
+
+	// View must contain repo headers and fallback for legacy job
+	viewRepo := tm.View()
+	if !strings.Contains(viewRepo, "owner/repo-a") || !strings.Contains(viewRepo, "owner/repo-b") {
+		t.Errorf("expected view to contain repo names, got:\n%s", viewRepo)
+	}
+	if !strings.Contains(viewRepo, "未知/未标注") {
+		t.Errorf("expected view to contain fallback header '未知/未标注' for legacy job, got:\n%s", viewRepo)
+	}
+
+	// Press 'g' again: GroupRepo -> GroupMachine
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupMachine {
+		t.Fatalf("expected GroupMachine after 'g', got %v", m.GroupingForTest())
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("expected selection preserved on job-repo-b, got %s", m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+	}
+	viewMach := tm.View()
+	if !strings.Contains(viewMach, "node-1") || !strings.Contains(viewMach, "node-2") {
+		t.Errorf("expected view to contain machine IDs, got:\n%s", viewMach)
+	}
+
+	// Press 'g': GroupMachine -> GroupStatus
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupStatus {
+		t.Fatalf("expected GroupStatus, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupStatus -> GroupEngine
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupEngine {
+		t.Fatalf("expected GroupEngine, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupEngine -> GroupStarted
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupStarted {
+		t.Fatalf("expected GroupStarted, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupStarted -> GroupRequested
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRequested {
+		t.Fatalf("expected GroupRequested, got %v", m.GroupingForTest())
+	}
+	viewReq := tm.View()
+	if !strings.Contains(viewReq, "alice@company.internal") || !strings.Contains(viewReq, "bob@remote") {
+		t.Errorf("expected view to contain requested_by usernames, got:\n%s", viewReq)
+	}
+
+	// Press 'g': GroupRequested -> GroupDefault
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupDefault {
+		t.Fatalf("expected cycle back to GroupDefault, got %v", m.GroupingForTest())
+	}
+
+	// Press 'G' (shift-g): cycle backwards GroupDefault -> GroupRequested
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	if m.GroupingForTest() != tui.GroupRequested {
+		t.Fatalf("expected GroupRequested after 'G', got %v", m.GroupingForTest())
+	}
+
+	// Navigate to job-repo-a to inspect detail box
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-repo-a" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-a" {
+		t.Fatalf("failed to navigate to job-repo-a")
+	}
+
+	viewDetail := tm.View()
+	if !strings.Contains(viewDetail, "Prompt: \"Implement secret sauce algorithm\"") {
+		t.Errorf("expected detail box to display prompt, got:\n%s", viewDetail)
+	}
+	if !strings.Contains(viewDetail, "owner/repo-a") {
+		t.Errorf("expected detail box to display repo, got:\n%s", viewDetail)
+	}
+	if !strings.Contains(viewDetail, "alice@company.internal") {
+		t.Errorf("expected detail box to display requested_by, got:\n%s", viewDetail)
+	}
+}
