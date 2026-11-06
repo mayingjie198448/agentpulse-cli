@@ -80,9 +80,9 @@
 5. **支持显式关闭**：运行 `agentpulse listen --no-attach` 可按需完全禁用裸进程挂接功能。
 
 ### 4.2 内部测试与隔离依赖注入 (Testing & Isolation Injection)
-为了避免自动化验收或集成测试在全局运行 `ps -A` 时扫描到开发机上其他并行编码进程的命令行与提示词（如宿主机正在运行的其他 `agy` 或 `opencode` 会话），系统提供全套内部依赖注入 Hook，同时保证默认生产扫描行为不变：
+为了避免自动化验收或集成测试扫到开发机上其他并行编码进程的命令行与提示词（如宿主机正在运行的其他 `agy` 或 `opencode` 会话），系统提供内部依赖注入。名单非空时，默认 OS 发现在读取命令行之前就限定到指定 PID。名单未设置或为空时，生产全表扫描行为不变：
 1. **`ProcessLister`**：支持注入自定义进程列表枚举器，测试完全无需执行系统级 `ps -A`；
-2. **`PIDAllowlist` / 环境变量 `AGENTPULSE_ATTACH_PID_ALLOWLIST`**：限制挂接器仅关注指定的 PID 列表（如合成测试子进程 PID）。未在白名单中的进程在扫描最外层被立即过滤，绝不提取其命令行、提示词或环境变量；
+2. **`PIDAllowlist` / 环境变量 `AGENTPULSE_ATTACH_PID_ALLOWLIST`**：名单非空且使用默认发现时，在调用操作系统读取命令行之前就限定为这些 PID。Linux 只读 `/proc/<pid>/cmdline` 与 `/proc/<pid>/stat`（以及该 PID 自己的 cwd、它自己打开的日志 fd），不运行 `ps -A`，也不读取名单外 PID 的命令行或日志。其他系统只运行 `ps -p <pid列表>`，同样不先做全表采集。日志只打开文件名精确含有该 PID 的文件，或该 PID 自己打开且位于日志目录中的日志，不会为了匹配去读旁路 PID 的日志内容。调用方注入了 `ProcessLister` 时，仍由注入方提供数据，名单只跳过未列入的条目；
 3. **`AgyLogDir` / `AgyBrainDir` / 环境变量 `AGENTPULSE_TEST_AGY_LOG_DIR`**：支持指定临时隔离的日志目录，彻底杜绝测试读取宿主机真实用户 `~/.gemini` 下的历史日志；
 4. **`OpenCodeLogDir` / 环境变量 `AGENTPULSE_TEST_OPENCODE_LOG_DIR`**：支持指定隔离的 OpenCode 测试日志目录；
 5. **`ProcessExitChecker`**：支持注入子进程退出码探测器，供受限合成测试精确校验 exit≠0（如 exit=7）或退出码无法判定时的终态转换；
@@ -111,5 +111,5 @@
 4. **验证大盘与日志流**：
    - 在终端 3 执行 `agentpulse jobs` 或在看板 TUI 的 JOBS 列表中观察：应立刻出现一个状态为 `RUNNING`、标题为 `"测试自动挂接任务"` 的任务；
    - 执行 `agentpulse watch` 或进入该任务详情：能够正常看到实时的日志与进度流动；
-   - 待 `agy` 进程执行完毕退出后，看板中该任务自动跃迁为 `DONE`，并准确记录运行时长；
+   - 待 `agy` 进程退出后，按可靠终态判定更新看板并记录运行时长：只有可靠确认退出码为 0 才标为 `DONE`（进度 100%）；退出码非 0（例如 7）标为 `failed` 并写明退出码，进度不得为 100%；无法取得退出码时标为 `failed`，错误说明无法判定退出码，不得标为 `DONE` 或 100%；
    - 验证执行 `grep agy` 或 `vim agy.go` 等非 Agent 进程时，JOBS 列表中不会产生异常误收任务。
