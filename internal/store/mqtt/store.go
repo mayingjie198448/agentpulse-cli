@@ -33,6 +33,10 @@ type Store struct {
 	closed      bool
 	refreshMu   sync.Mutex
 	staging     *refreshStaging
+
+	activeRefreshGen uint64
+	refreshAborted   bool
+	subRestoring     bool
 }
 
 type refreshStaging struct {
@@ -118,6 +122,7 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	go s.runHeartbeatChecker()
+	go s.runSubscriptionMaintainer()
 
 	// Cold-start retained settle per docs/mqtt-protocol.md §5.1:
 	// Wait briefly for retained messages from broker to settle so one-shot queries (list/logs)
@@ -172,6 +177,7 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 	}
 
 	go s.runHeartbeatChecker()
+	go s.runSubscriptionMaintainer()
 
 	if cfg.SettleTimeout > 0 {
 		time.Sleep(cfg.SettleTimeout)
@@ -183,6 +189,68 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 
 func (s *Store) onMQTTMessage(_ paho.Client, msg paho.Message) {
 	s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), msg.Retained())
+}
+
+// onRefreshMessage handles incoming MQTT messages for a specific Refresh generation.
+func (s *Store) onRefreshMessage(gen uint64, msg paho.Message) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+
+	// Check if this message belongs to an aborted/expired generation or staging was cleared
+	if gen != s.activeRefreshGen || s.refreshAborted || s.staging == nil {
+		s.mu.Unlock()
+		if msg.Retained() {
+			// Discard late-arriving retained messages from aborted/cancelled refresh window.
+			// They must NEVER leak into live cache.
+			return
+		}
+		// Real-time message arriving concurrent with or after abort: forward to live store.
+		s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), false)
+		return
+	}
+
+	pt := parseTopic(msg.Topic())
+	if pt.typ == topicUnknown {
+		s.mu.Unlock()
+		return
+	}
+
+	if !msg.Retained() {
+		// Real-time message during refresh: record for live replay & broadcast
+		payloadCopy := make([]byte, len(msg.Payload()))
+		copy(payloadCopy, msg.Payload())
+		s.staging.realtimeQueue = append(s.staging.realtimeQueue, rawMessage{
+			topic:      msg.Topic(),
+			payload:    payloadCopy,
+			isRetained: false,
+		})
+	}
+
+	// Apply to staging
+	switch pt.typ {
+	case topicMachineStatus:
+		s.applyMachineStatusStaging(pt, msg.Payload())
+	case topicJobStatus:
+		s.applyJobStatusStaging(pt, msg.Payload())
+	case topicJobLog:
+		// Logs are streaming events, not retained state, so they don't enter staging snapshot.
+	case topicAnnounce:
+		s.applyAnnounceStaging(pt, msg.Payload())
+	}
+	s.mu.Unlock()
+}
+
+// onRestoreMessage handles incoming MQTT messages for subscriptions restored after a failed/cancelled refresh.
+// Historical retained messages delivered by the broker immediately following the restore SUBSCRIBE are discarded
+// so they do not contaminate or overwrite the existing cache; subsequent real-time events are processed normally.
+func (s *Store) onRestoreMessage(_ paho.Client, msg paho.Message) {
+	if msg.Retained() {
+		return
+	}
+	s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), false)
 }
 
 // HandleMessage parses and handles incoming MQTT messages for machine status,
@@ -987,11 +1055,14 @@ func (s *Store) Refresh(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	s.activeRefreshGen++
+	gen := s.activeRefreshGen
+	s.refreshAborted = false
 	s.staging = staging
 	s.mu.Unlock()
 
 	committed := false
-	restoreSub := false
+	unsubscribed := false
 	filters := map[string]byte{
 		TopicMachinesStatus:           1,
 		TopicJobsStatus:               1,
@@ -1010,6 +1081,7 @@ func (s *Store) Refresh(ctx context.Context) error {
 	defer func() {
 		if !committed {
 			s.mu.Lock()
+			s.refreshAborted = true
 			var pendingQueue []rawMessage
 			if s.staging == staging {
 				s.staging = nil
@@ -1023,24 +1095,27 @@ func (s *Store) Refresh(ctx context.Context) error {
 				s.HandleMessageWithRetain(msg.topic, msg.payload, false)
 			}
 
-			if restoreSub {
-				_ = client.SubscribeMultiple(filters, s.onMQTTMessage)
+			if unsubscribed {
+				_ = s.restoreSubscriptions(filters)
 			}
 		}
 	}()
 
 	if token := client.Unsubscribe(unsubTopics...); token != nil {
+		unsubscribed = true
 		token.WaitTimeout(s.cfg.Timeout)
 	}
 
-	subToken := client.SubscribeMultiple(filters, s.onMQTTMessage)
+	refreshCallback := func(_ paho.Client, msg paho.Message) {
+		s.onRefreshMessage(gen, msg)
+	}
+
+	subToken := client.SubscribeMultiple(filters, refreshCallback)
 	if subToken != nil {
 		if !subToken.WaitTimeout(s.cfg.Timeout) {
-			restoreSub = true
 			return fmt.Errorf("MQTT subscription timed out during refresh")
 		}
 		if err := subToken.Error(); err != nil {
-			restoreSub = true
 			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
 		}
 		if err := CheckSubscribeResult(subToken); err != nil {
@@ -1107,4 +1182,103 @@ func (s *Store) RawJobPointer(id string) *model.Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.jobs[id]
+}
+
+func (s *Store) setSubRestoring(restoring bool) {
+	s.mu.Lock()
+	s.subRestoring = restoring
+	s.mu.Unlock()
+}
+
+// restoreSubscriptions re-subscribes to all product filters after a failed or cancelled refresh.
+// It verifies the subscription return token and results, ensuring failure is visible and recorded.
+func (s *Store) restoreSubscriptions(filters map[string]byte) error {
+	s.mu.RLock()
+	client := s.client
+	closed := s.closed
+	s.mu.RUnlock()
+
+	if closed || client == nil || !client.IsConnected() {
+		s.setSubRestoring(true)
+		return fmt.Errorf("MQTT client not connected")
+	}
+
+	token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+	if token == nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription returned nil token")
+	}
+
+	timeout := s.cfg.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if !token.WaitTimeout(timeout) {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription timed out")
+	}
+	if err := token.Error(); err != nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription failed: %w", err)
+	}
+	if err := CheckSubscribeResult(token); err != nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription rejected: %w", err)
+	}
+
+	s.setSubRestoring(false)
+	return nil
+}
+
+// runSubscriptionMaintainer periodically retries subscribing to all filters when subscriptions
+// were rejected or degraded (e.g. temporary Dynamic Security broker ACL denial), so that as soon
+// as broker ACL is restored, the store automatically resumes receiving all live heartbeats and jobs.
+func (s *Store) runSubscriptionMaintainer() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	filters := map[string]byte{
+		TopicMachinesStatus:           1,
+		TopicJobsStatus:               1,
+		TopicJobsLogs:                 0,
+		TopicAnnounceWildcard:         1,
+		TopicMachinesAnnounceWildcard: 1,
+	}
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			restoring := s.subRestoring
+			closed := s.closed
+			client := s.client
+			s.mu.RUnlock()
+
+			if closed || !restoring || client == nil || !client.IsConnected() {
+				continue
+			}
+
+			token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+			if token == nil {
+				continue
+			}
+			timeout := s.cfg.Timeout
+			if timeout <= 0 {
+				timeout = 500 * time.Millisecond
+			}
+			if !token.WaitTimeout(timeout) {
+				continue
+			}
+			if token.Error() != nil {
+				continue
+			}
+			if err := CheckSubscribeResult(token); err != nil {
+				continue
+			}
+
+			s.setSubRestoring(false)
+		}
+	}
 }

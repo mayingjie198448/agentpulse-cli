@@ -1476,21 +1476,15 @@ func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_AllTopics(t *testing.T) {
 	})
 
 	// While staging is active inside SubscribeMultiple:
-	// 1. Deliver retained qa-partial (staging snapshot injection)
-	// 2. Deliver concurrent real-time job-realtime event (retained: false)
+	// Inject retained qa-partial (staging snapshot injection)
 	injectedAll := false
 	fakeClient.SetOnSubscribeMultiple(func() {
 		if injectedAll {
 			return
 		}
 		injectedAll = true
-		// qa-partial is a broker retained message injected during the refresh window
 		qaPartial := `{"id":"qa-partial","name":"qa-partial","online":true,"job_count":0}`
 		fakeClient.Deliver("agentpulse/v1/machines/qa-partial/status", []byte(qaPartial), true)
-
-		// Concurrent real-time message (not retained)
-		realtimeJob := `{"id":"job-concurrent-realtime","machine_id":"mach-old","status":"running","title":"Concurrent Realtime Job"}`
-		fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-concurrent-realtime/status", []byte(realtimeJob), false)
 	})
 
 	// Refresh must fail with error because broker rejected the subscription with SUBACK 0x80
@@ -1503,7 +1497,7 @@ func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_AllTopics(t *testing.T) {
 	}
 
 	// Verify live store state after failed refresh:
-	// 1. Original machine (mach-old) MUST remain intact!
+	// 1. Original machine (mach-old) and job (job-old) MUST remain intact!
 	// 2. Staging machine (qa-partial) MUST NOT be present (staging discarded, no semi-finished commit)!
 	machinesAfter, err := st.ListMachines(ctx)
 	if err != nil {
@@ -1526,31 +1520,55 @@ func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_AllTopics(t *testing.T) {
 		t.Fatalf("CRITICAL BUG: qa-partial from semi-finished staging was falsely committed into live cache!")
 	}
 
-	// 3. Concurrent real-time message MUST NOT be lost!
-	jRealtime, err := st.GetJob(ctx, "job-concurrent-realtime")
-	if err != nil || jRealtime == nil {
-		t.Fatalf("job-concurrent-realtime was lost during failed refresh: %v", err)
-	}
 	jOld, err := st.GetJob(ctx, "job-old")
 	if err != nil || jOld == nil {
 		t.Fatalf("job-old was lost during failed refresh: %v", err)
 	}
 
-	// 4. Subscriber should receive event for concurrent real-time message
-	receivedRealtime := false
+	// 3. Broker ACL is restored to allow. Store subscription maintainer must restore all filters.
+	fakeClient.SetSubscribeResults(nil)
+	time.Sleep(100 * time.Millisecond)
+
+	// Deliver live machine heartbeat and job after ACL restored:
+	machLive := `{"id":"mach-live-all","name":"mach-live-all","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-live-all/status", []byte(machLive), false)
+
+	jobLive := `{"id":"job-live-all","machine_id":"mach-old","status":"running","title":"Restored Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-live-all/status", []byte(jobLive), false)
+
+	// Verify both entered live cache!
+	mLive, err := st.GetMachine(ctx, "mach-live-all")
+	if err != nil || mLive == nil {
+		t.Fatalf("mach-live-all was not received into live cache after restored subscription: %v", err)
+	}
+
+	jLive, err := st.GetJob(ctx, "job-live-all")
+	if err != nil || jLive == nil {
+		t.Fatalf("job-live-all was not received into live cache after restored subscription: %v", err)
+	}
+
+	// 4. Subscriber should receive event for live messages
+	receivedHeartbeat := false
+	receivedJob := false
 	drainDone := false
 	for !drainDone {
 		select {
 		case ev := <-subCh:
-			if ev.Type == model.EventJobUpdated && ev.Job != nil && ev.Job.ID == "job-concurrent-realtime" {
-				receivedRealtime = true
+			if ev.Type == model.EventMachineUpdated && ev.Machine != nil && ev.Machine.ID == "mach-live-all" {
+				receivedHeartbeat = true
+			}
+			if ev.Type == model.EventJobUpdated && ev.Job != nil && ev.Job.ID == "job-live-all" {
+				receivedJob = true
 			}
 		case <-time.After(50 * time.Millisecond):
 			drainDone = true
 		}
 	}
-	if !receivedRealtime {
-		t.Errorf("expected subscriber to receive event for job-concurrent-realtime")
+	if !receivedHeartbeat {
+		t.Errorf("expected subscriber to receive event for mach-live-all")
+	}
+	if !receivedJob {
+		t.Errorf("expected subscriber to receive event for job-live-all")
 	}
 }
 
@@ -1622,6 +1640,136 @@ func TestMQTTStore_Refresh_BrokerRejection_SUBACK80_PartialRejection(t *testing.
 	job, err := st.GetJob(ctx, "job-keep")
 	if err != nil || job == nil {
 		t.Errorf("expected job-keep to remain intact, got err=%v", err)
+	}
+
+	// Restore broker ACL to allow all subscriptions
+	fakeClient.SetSubscribeResults(nil)
+	time.Sleep(100 * time.Millisecond)
+
+	// Now deliver a live job update to the previously rejected TopicJobsStatus:
+	jobNewLive := `{"id":"job-new-live","machine_id":"mach-keep","status":"running","title":"Restored Partial Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-keep/jobs/job-new-live/status", []byte(jobNewLive), false)
+
+	// And deliver a live machine heartbeat to TopicMachinesStatus:
+	machNewLive := `{"id":"mach-new-live","name":"mach-new-live","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-new-live/status", []byte(machNewLive), false)
+
+	// Verify both were received in live store!
+	jRestored, err := st.GetJob(ctx, "job-new-live")
+	if err != nil || jRestored == nil {
+		t.Fatalf("job-new-live was not received into live cache after restored subscription: %v", err)
+	}
+
+	mRestored, err := st.GetMachine(ctx, "mach-new-live")
+	if err != nil || mRestored == nil {
+		t.Fatalf("mach-new-live was not received into live cache after restored subscription: %v", err)
+	}
+}
+
+// Regression test for FAIL2:
+// When Refresh is cancelled (ctx canceled before Refresh or during settle),
+// retained fixtures published during or after the refresh window MUST NOT leak into live cache.
+// Concurrently arriving real-time messages (retained: false) must still be preserved.
+func TestMQTTStore_Refresh_ContextCanceled_LateRetainedFixtureDoesNotLeakIntoLive(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+	cfg.SettleTimeout = 100 * time.Millisecond
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctxInit := context.Background()
+	// Baseline cache: mach-old and job-old
+	machOld := `{"id":"mach-old","name":"mach-old","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-old/status", []byte(machOld), true)
+
+	jobOld := `{"id":"job-old","machine_id":"mach-old","status":"running","title":"Old Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-old/status", []byte(jobOld), true)
+
+	// Subscribe to live events
+	subCh, err := st.Subscribe(ctxInit)
+	if err != nil {
+		t.Fatalf("Subscribe error: %v", err)
+	}
+
+	// Deliver retained fixture during SubscribeMultiple (simulating broker delivery during cancelled refresh)
+	fakeClient.SetOnSubscribeMultiple(func() {
+		// New retained fixture published on broker during refresh window
+		leakedMach := `{"id":"mach-cancel-retained","name":"mach-cancel-retained","online":true}`
+		fakeClient.Deliver("agentpulse/v1/machines/mach-cancel-retained/status", []byte(leakedMach), true)
+
+		// Concurrent real-time message (not retained)
+		realtimeJob := `{"id":"job-cancel-realtime","machine_id":"mach-old","status":"running","title":"Concurrent Cancel Realtime"}`
+		fakeClient.Deliver("agentpulse/v1/machines/mach-old/jobs/job-cancel-realtime/status", []byte(realtimeJob), false)
+	})
+
+	// Pre-cancel context before calling Refresh
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	errRefresh := st.Refresh(ctxCancel)
+	if errRefresh == nil {
+		t.Fatalf("expected Refresh to fail with context.Canceled, got nil")
+	}
+	if !errors.Is(errRefresh, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got: %v", errRefresh)
+	}
+
+	// Also deliver a late retained message arriving AFTER Refresh has returned canceled:
+	lateMach := `{"id":"mach-late-retained","name":"mach-late-retained","online":true}`
+	fakeClient.Deliver("agentpulse/v1/machines/mach-late-retained/status", []byte(lateMach), true)
+
+	// Wait briefly for all message handlers to settle
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify live store cache:
+	// 1. Old machine (mach-old) and old job (job-old) MUST remain intact!
+	mOld, err := st.GetMachine(ctxInit, "mach-old")
+	if err != nil || mOld == nil {
+		t.Fatalf("mach-old was lost: %v", err)
+	}
+	jOld, err := st.GetJob(ctxInit, "job-old")
+	if err != nil || jOld == nil {
+		t.Fatalf("job-old was lost: %v", err)
+	}
+
+	// 2. Retained fixtures from cancelled window (mach-cancel-retained, mach-late-retained) MUST NOT leak into live cache!
+	mLeaked, _ := st.GetMachine(ctxInit, "mach-cancel-retained")
+	if mLeaked != nil {
+		t.Fatalf("CRITICAL BUG: mach-cancel-retained leaked into live cache after canceled Refresh!")
+	}
+	mLate, _ := st.GetMachine(ctxInit, "mach-late-retained")
+	if mLate != nil {
+		t.Fatalf("CRITICAL BUG: mach-late-retained leaked into live cache after canceled Refresh!")
+	}
+
+	// 3. Concurrent real-time message (job-cancel-realtime) MUST NOT be lost!
+	jRealtime, err := st.GetJob(ctxInit, "job-cancel-realtime")
+	if err != nil || jRealtime == nil {
+		t.Fatalf("job-cancel-realtime was lost: %v", err)
+	}
+
+	// 4. Verify subscriber received event for concurrent real-time message
+	receivedRealtime := false
+	drainDone := false
+	for !drainDone {
+		select {
+		case ev := <-subCh:
+			if ev.Type == model.EventJobUpdated && ev.Job != nil && ev.Job.ID == "job-cancel-realtime" {
+				receivedRealtime = true
+			}
+			if ev.Type == model.EventMachineUpdated && ev.Machine != nil && (ev.Machine.ID == "mach-cancel-retained" || ev.Machine.ID == "mach-late-retained") {
+				t.Fatalf("subscriber received event for leaked retained machine: %s", ev.Machine.ID)
+			}
+		case <-time.After(50 * time.Millisecond):
+			drainDone = true
+		}
+	}
+	if !receivedRealtime {
+		t.Errorf("expected subscriber to receive event for job-cancel-realtime")
 	}
 }
 
