@@ -24,6 +24,10 @@ type Store interface {
 	// GetJob returns a specific job by its ID.
 	GetJob(ctx context.Context, id string) (*model.Job, error)
 
+	// DeleteJob removes a job and its logs from the store, clears the retained status
+	// on the MQTT broker, and cleans up local artifacts for that job.
+	DeleteJob(ctx context.Context, id string) error
+
 	// GetLogs returns the most recent logs for a specific job.
 	GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error)
 

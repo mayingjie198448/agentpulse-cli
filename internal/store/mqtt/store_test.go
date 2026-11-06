@@ -770,3 +770,144 @@ func TestMQTTStore_Announce(t *testing.T) {
 		t.Errorf("unexpected ListAnnounces: %+v", announces)
 	}
 }
+
+func TestMQTTStore_DeleteJob(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	subCh, err := st.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	// Deliver 2 jobs: one done, one running
+	donePayload := `{"id":"job-done-01","machine_id":"ccdq","engine":"opencode","status":"done","progress":100.0,"title":"Done Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-done-01/status", []byte(donePayload), true)
+
+	runningPayload := `{"id":"job-run-02","machine_id":"ccdq","engine":"agy","status":"running","progress":50.0,"title":"Running Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-run-02/status", []byte(runningPayload), true)
+
+	// Deliver a log for job-done-01
+	logPayload := `{"job_id":"job-done-01","machine_id":"ccdq","level":"INFO","message":"Finished execution"}`
+	fakeClient.Deliver("agentpulse/v1/machines/ccdq/jobs/job-done-01/logs", []byte(logPayload), false)
+
+	// Verify both exist initially
+	jobs, err := st.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs failed: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
+	}
+
+	// 1. Refuse deleting running job
+	if err := st.DeleteJob(ctx, "job-run-02"); err == nil {
+		t.Fatalf("expected error when deleting running job, got nil")
+	}
+
+	// 2. Delete non-existent job
+	if err := st.DeleteJob(ctx, "unknown-job"); err == nil {
+		t.Fatalf("expected error when deleting non-existent job, got nil")
+	}
+
+	// 3. Delete done job
+	if err := st.DeleteJob(ctx, "job-done-01"); err != nil {
+		t.Fatalf("DeleteJob failed for job-done-01: %v", err)
+	}
+
+	// 4. Verify in-memory list has only job-run-02
+	jobs, err = st.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs failed: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "job-run-02" {
+		t.Fatalf("expected only job-run-02 to remain, got %+v", jobs)
+	}
+
+	// 5. Verify logs removed
+	if _, err := st.GetLogs(ctx, "job-done-01", 10); err == nil {
+		t.Fatalf("expected GetLogs for deleted job to fail, got nil error")
+	}
+
+	// 6. Verify MQTT publish with clear-retained (empty payload, Retained=true, QoS=1)
+	published := fakeClient.PublishedMessages()
+	var clearMsg *mqttstore.PublishedMessage
+	for i := range published {
+		if published[i].Topic == "agentpulse/v1/machines/ccdq/jobs/job-done-01/status" {
+			clearMsg = &published[i]
+			break
+		}
+	}
+	if clearMsg == nil {
+		t.Fatalf("expected clear-retained publish for job-done-01, found none in %+v", published)
+	}
+	if !clearMsg.Retained {
+		t.Errorf("expected clearMsg.Retained to be true")
+	}
+	if clearMsg.QoS != 1 {
+		t.Errorf("expected clearMsg.QoS to be 1, got %d", clearMsg.QoS)
+	}
+	if len(clearMsg.Payload) != 0 {
+		t.Errorf("expected empty payload for clear-retained tombstone, got %d bytes", len(clearMsg.Payload))
+	}
+
+	// 7. Verify EventJobDeleted event was broadcast
+	var foundDeletedEvent bool
+	timeout := time.After(500 * time.Millisecond)
+loop:
+	for {
+		select {
+		case ev := <-subCh:
+			if ev.Type == model.EventJobDeleted && ev.Job != nil && ev.Job.ID == "job-done-01" {
+				foundDeletedEvent = true
+				break loop
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+	if !foundDeletedEvent {
+		t.Errorf("expected EventJobDeleted for job-done-01 to be broadcast")
+	}
+}
+
+func TestMQTTStore_TombstoneClearsJob(t *testing.T) {
+	fakeClient := mqttstore.NewFakeMQTTClient()
+	cfg := mqttstore.DefaultConfig()
+
+	st, err := mqttstore.NewWithClient(cfg, fakeClient)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Initial deliver
+	donePayload := `{"id":"job-ext-01","machine_id":"node-ext","status":"done","title":"Ext Job"}`
+	fakeClient.Deliver("agentpulse/v1/machines/node-ext/jobs/job-ext-01/status", []byte(donePayload), true)
+
+	job, err := st.GetJob(ctx, "job-ext-01")
+	if err != nil || job.ID != "job-ext-01" {
+		t.Fatalf("expected job-ext-01 to exist, got %v", err)
+	}
+
+	// Broker delivers empty payload tombstone (e.g. from another client)
+	fakeClient.Deliver("agentpulse/v1/machines/node-ext/jobs/job-ext-01/status", []byte{}, true)
+
+	// Verify job is removed from store
+	if _, err := st.GetJob(ctx, "job-ext-01"); err == nil {
+		t.Fatalf("expected job-ext-01 to be removed after tombstone, but still exists")
+	}
+}
+

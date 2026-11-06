@@ -43,11 +43,15 @@ type Model struct {
 	logs           map[string][]model.LogEntry
 
 	// Views
-	activePane      ActivePane
-	viewport        viewport.Model
-	autoScroll      bool
-	ready           bool
-	brokerConnected bool
+	activePane       ActivePane
+	viewport         viewport.Model
+	autoScroll       bool
+	ready            bool
+	brokerConnected  bool
+	jobsScrollOffset int
+	confirmDelete    bool
+	deleteTargetID   string
+	deleteError      string
 }
 
 // BrokerConnected returns true if the MQTT broker is currently connected.
@@ -137,6 +141,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.confirmDelete {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				targetID := m.deleteTargetID
+				m.confirmDelete = false
+				m.deleteTargetID = ""
+				m.deleteError = ""
+				if m.store != nil {
+					if err := m.store.DeleteJob(m.ctx, targetID); err != nil {
+						m.deleteError = err.Error()
+						return m, nil
+					}
+				}
+				m.removeJobFromModel(targetID)
+				return m, nil
+			case "n", "N", "esc":
+				m.confirmDelete = false
+				m.deleteTargetID = ""
+				m.deleteError = ""
+				return m, nil
+			default:
+				m.confirmDelete = false
+				m.deleteTargetID = ""
+				return m, nil
+				m.deleteTargetID = ""
+				return m, nil
+			}
+		}
+
+		if m.deleteError != "" && msg.String() != "d" {
+			m.deleteError = ""
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.cancel()
@@ -175,6 +212,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateViewportContent()
 			}
 
+		case "d":
+			if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) {
+				curJob := m.jobs[m.selectedJobIdx]
+				if curJob.Status == model.StatusRunning {
+					m.deleteError = fmt.Sprintf("任务 %s 正在运行中，无法删除", curJob.ID)
+					m.confirmDelete = false
+				} else {
+					m.confirmDelete = true
+					m.deleteTargetID = curJob.ID
+					m.deleteError = ""
+				}
+			}
+
 		// Job selection navigation
 		case "up", "k":
 			if m.activePane == PaneJobs && len(m.jobs) > 0 {
@@ -207,6 +257,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "pgdown":
 			m.viewport.HalfViewDown()
+		}
+
+	case tea.MouseMsg:
+		if m.activePane == PaneJobs && len(m.jobs) > 0 {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				if m.selectedJobIdx > 0 {
+					m.selectedJobIdx--
+					m.autoScroll = true
+					m.ensureLogsLoadedForSelectedJob()
+					m.updateViewportContent()
+				}
+			case tea.MouseWheelDown:
+				if m.selectedJobIdx < len(m.jobs)-1 {
+					m.selectedJobIdx++
+					m.autoScroll = true
+					m.ensureLogsLoadedForSelectedJob()
+					m.updateViewportContent()
+				}
+			}
 		}
 
 	case tea.WindowSizeMsg:
@@ -276,6 +346,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
+			case model.EventJobDeleted:
+				if msg.Job != nil && msg.Job.ID != "" {
+					m.removeJobFromModel(msg.Job.ID)
+				}
+
 			case model.EventLogAdded:
 				if msg.Log != nil {
 					m.logs[msg.Log.JobID] = append(m.logs[msg.Log.JobID], *msg.Log)
@@ -302,6 +377,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) removeJobFromModel(jobID string) {
+	foundIdx := -1
+	for i, j := range m.jobs {
+		if j.ID == jobID {
+			foundIdx = i
+			break
+		}
+	}
+	if foundIdx == -1 {
+		return
+	}
+
+	m.jobs = append(m.jobs[:foundIdx], m.jobs[foundIdx+1:]...)
+	delete(m.logs, jobID)
+
+	if len(m.jobs) == 0 {
+		m.selectedJobIdx = 0
+		m.jobsScrollOffset = 0
+	} else if m.selectedJobIdx >= len(m.jobs) {
+		m.selectedJobIdx = len(m.jobs) - 1
+	}
+
+	m.ensureLogsLoadedForSelectedJob()
+	m.updateViewportContent()
 }
 
 func (m *Model) ensureLogsLoadedForSelectedJob() {
@@ -637,15 +738,40 @@ func (m *Model) renderMachinesBox(width, maxHeight int) string {
 	return style.Render(b.String())
 }
 
+func (m *Model) renderJobItem(j model.Job, isSelected bool) string {
+	var engineBadge string
+	if j.Engine == model.EngineAgy {
+		engineBadge = AgyBadge
+	} else {
+		engineBadge = OpenCodeBadge
+	}
+
+	statusText := JobStatusGlyph(j)
+
+	idStr := fmt.Sprintf("%-12s", j.ID)
+	machStr := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("@%-7s", j.MachineID))
+
+	line := fmt.Sprintf("%s %s %s %s", engineBadge, idStr, machStr, statusText)
+
+	if isSelected {
+		indicator := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("▶ ")
+		return ListItemSelected.Render(indicator + line)
+	}
+
+	indicator := "  "
+	return ListItemNormal.Render(indicator + line)
+}
+
 func (m *Model) renderJobsBox(width, maxHeight int) string {
 	if maxHeight <= 0 {
 		return ""
 	}
 
-	var b strings.Builder
-	title := BoxTitleStyle.Render("⚡ JOBS (j/k 移动, enter 追踪)")
-	b.WriteString(title + "\n")
-
+	titleText := "⚡ JOBS (j/k 移动, d 删除, enter 追踪)"
+	if len(m.jobs) > 0 {
+		titleText = fmt.Sprintf("⚡ JOBS (%d/%d) (j/k 移动, d 删除)", m.selectedJobIdx+1, len(m.jobs))
+	}
+	title := BoxTitleStyle.Render(titleText)
 	titleHeight := lipgloss.Height(title)
 	overhead := BoxStyle.GetVerticalFrameSize() + titleHeight
 	availRows := maxHeight - overhead
@@ -654,58 +780,105 @@ func (m *Model) renderJobsBox(width, maxHeight int) string {
 	}
 
 	if len(m.jobs) == 0 {
-		b.WriteString(lipgloss.NewStyle().Foreground(ColorDimText).Render("No active jobs"))
-	} else {
-		startIdx := 0
-		endIdx := len(m.jobs)
-		if len(m.jobs) > availRows {
-			startIdx = m.selectedJobIdx - availRows/2
-			if startIdx < 0 {
-				startIdx = 0
-			}
-			endIdx = startIdx + availRows
-			if endIdx > len(m.jobs) {
-				endIdx = len(m.jobs)
-				startIdx = endIdx - availRows
-				if startIdx < 0 {
-					startIdx = 0
-				}
-			}
+		content := lipgloss.NewStyle().Foreground(ColorDimText).Render("No active jobs")
+		style := BoxStyle.Width(width).MaxHeight(maxHeight)
+		if m.activePane == PaneJobs {
+			style = BoxFocusedStyle.Width(width).MaxHeight(maxHeight)
 		}
+		var b strings.Builder
+		b.WriteString(title + "\n")
+		b.WriteString(content)
+		return style.Render(b.String())
+	}
 
-		for i := startIdx; i < endIdx; i++ {
-			j := m.jobs[i]
-			isSelected := i == m.selectedJobIdx
+	innerWidth := width - BoxStyle.GetHorizontalFrameSize()
+	if innerWidth < 10 {
+		innerWidth = 10
+	}
 
-			var engineBadge string
-			if j.Engine == model.EngineAgy {
-				engineBadge = AgyBadge
-			} else {
-				engineBadge = OpenCodeBadge
-			}
+	if m.selectedJobIdx < 0 {
+		m.selectedJobIdx = 0
+	}
+	if m.selectedJobIdx >= len(m.jobs) {
+		m.selectedJobIdx = len(m.jobs) - 1
+	}
 
-			statusText := JobStatusGlyph(j)
-
-			idStr := fmt.Sprintf("%-12s", j.ID)
-			machStr := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("@%-7s", j.MachineID))
-
-			line := fmt.Sprintf("%s %s %s %s", engineBadge, idStr, machStr, statusText)
-
-			if isSelected {
-				indicator := lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true).Render("▶ ")
-				line = ListItemSelected.Render(indicator + line)
-			} else {
-				indicator := "  "
-				line = ListItemNormal.Render(indicator + line)
-			}
-			b.WriteString(line + "\n")
+	// 1. Measure wrapped height of each job item formatted at innerWidth
+	measureStyle := lipgloss.NewStyle().Width(innerWidth)
+	heights := make([]int, len(m.jobs))
+	renderedItems := make([]string, len(m.jobs))
+	for i, j := range m.jobs {
+		renderedItems[i] = m.renderJobItem(j, i == m.selectedJobIdx)
+		heights[i] = lipgloss.Height(measureStyle.Render(renderedItems[i]))
+		if heights[i] < 1 {
+			heights[i] = 1
 		}
 	}
+
+	// 2. Adjust jobsScrollOffset:
+	// a. If jobsScrollOffset is beyond selectedJobIdx, pull it up
+	if m.jobsScrollOffset > m.selectedJobIdx {
+		m.jobsScrollOffset = m.selectedJobIdx
+	}
+	if m.jobsScrollOffset < 0 {
+		m.jobsScrollOffset = 0
+	}
+
+	// b. If height from jobsScrollOffset down to selectedJobIdx exceeds availRows,
+	// advance jobsScrollOffset until selectedJobIdx fits inside availRows
+	subH := 0
+	for i := m.jobsScrollOffset; i <= m.selectedJobIdx; i++ {
+		subH += heights[i]
+	}
+	for subH > availRows && m.jobsScrollOffset < m.selectedJobIdx {
+		subH -= heights[m.jobsScrollOffset]
+		m.jobsScrollOffset++
+	}
+
+	// c. If there is leftover vertical room, expand jobsScrollOffset upwards so
+	// the pane does not leave awkward blank space at the bottom while earlier jobs exist
+	for m.jobsScrollOffset > 0 {
+		testH := 0
+		for i := m.jobsScrollOffset - 1; i <= m.selectedJobIdx; i++ {
+			testH += heights[i]
+		}
+		tailH := 0
+		for i := m.jobsScrollOffset - 1; i < len(m.jobs); i++ {
+			tailH += heights[i]
+		}
+		if testH <= availRows && tailH <= availRows {
+			m.jobsScrollOffset--
+		} else {
+			break
+		}
+	}
+
+	// 3. Determine visible slice [startIdx, endIdx]
+	startIdx := m.jobsScrollOffset
+	endIdx := startIdx
+	currH := 0
+	for i := startIdx; i < len(m.jobs); i++ {
+		if currH+heights[i] > availRows && i > m.selectedJobIdx {
+			break
+		}
+		currH += heights[i]
+		endIdx = i + 1
+	}
+
+	var visibleItems []string
+	for i := startIdx; i < endIdx; i++ {
+		visibleItems = append(visibleItems, renderedItems[i])
+	}
+	bodyContent := strings.Join(visibleItems, "\n")
 
 	style := BoxStyle.Width(width).MaxHeight(maxHeight)
 	if m.activePane == PaneJobs {
 		style = BoxFocusedStyle.Width(width).MaxHeight(maxHeight)
 	}
+
+	var b strings.Builder
+	b.WriteString(title + "\n")
+	b.WriteString(bodyContent)
 	return style.Render(b.String())
 }
 
@@ -787,6 +960,20 @@ func (m *Model) renderJobDetailBox(width int) string {
 		b.WriteString(errText + "\n")
 	}
 
+	if m.confirmDelete {
+		confirmBanner := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorAmber).
+			Render(fmt.Sprintf("⚠ 确认删除任务 %s？ [y/Enter 确认删除 • n/Esc 取消]", m.deleteTargetID))
+		b.WriteString(confirmBanner + "\n")
+	} else if m.deleteError != "" {
+		errBanner := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorRed).
+			Render(fmt.Sprintf("✖ %s", m.deleteError))
+		b.WriteString(errBanner + "\n")
+	}
+
 	return BoxStyle.Width(width).Render(b.String())
 }
 
@@ -837,6 +1024,19 @@ func (m *Model) renderLogsBox(width, maxHeight int) string {
 }
 
 func (m *Model) renderFooter() string {
+	if m.confirmDelete {
+		prompt := fmt.Sprintf("%s  %s %s  •  %s %s",
+			lipgloss.NewStyle().Bold(true).Foreground(ColorAmber).Render("⚠ 确认删除任务 "+m.deleteTargetID+"?"),
+			FooterKeyStyle.Render("y/Enter"), FooterDescStyle.Render("确认删除"),
+			FooterKeyStyle.Render("n/Esc"), FooterDescStyle.Render("取消"),
+		)
+		style := FooterContainerStyle
+		if m.width > 2 {
+			style = style.Width(m.width - 2)
+		}
+		return style.Render(prompt)
+	}
+
 	pauseText := "暂停"
 	if m.paused {
 		pauseText = "继续 (PAUSED)"
@@ -846,6 +1046,7 @@ func (m *Model) renderFooter() string {
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("q"), FooterDescStyle.Render("退出")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("tab"), FooterDescStyle.Render("切换面板")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("j/k"), FooterDescStyle.Render("选择任务")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("d"), FooterDescStyle.Render("删除任务")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("enter"), FooterDescStyle.Render("追踪/聚焦")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("space"), FooterDescStyle.Render(pauseText)),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("a"), FooterDescStyle.Render("自动滚动")),
@@ -857,6 +1058,10 @@ func (m *Model) renderFooter() string {
 		sep = " • "
 	}
 	bar := strings.Join(keys, sep)
+	if m.deleteError != "" {
+		errStr := lipgloss.NewStyle().Bold(true).Foreground(ColorRed).Render("✖ " + m.deleteError)
+		bar = errStr + "  |  " + bar
+	}
 	style := FooterContainerStyle
 	if m.width > 2 {
 		style = style.Width(m.width - 2)

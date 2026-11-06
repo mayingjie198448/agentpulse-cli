@@ -36,3 +36,18 @@ func (m *Model) ActivePaneForTest() ActivePane {
 func (m *Model) AutoScrollForTest() bool {
 	return m.autoScroll
 }
+
+// JobsScrollOffsetForTest returns the current jobs scroll offset for test assertions.
+func (m *Model) JobsScrollOffsetForTest() int {
+	return m.jobsScrollOffset
+}
+
+// ConfirmDeleteForTest returns the confirmation dialog state for test assertions.
+func (m *Model) ConfirmDeleteForTest() bool {
+	return m.confirmDelete
+}
+
+// DeleteErrorForTest returns the current delete error message for test assertions.
+func (m *Model) DeleteErrorForTest() string {
+	return m.deleteError
+}
