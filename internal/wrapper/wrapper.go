@@ -80,6 +80,11 @@ type Wrapper struct {
 	mqttClient paho.Client
 	ownsMQTT   bool
 
+	authFailed atomic.Bool
+	authErrMu  sync.Mutex
+	authErrMsg string
+	procCancel context.CancelFunc
+
 	heartbeatRunning bool
 	stopHeartbeat    chan struct{}
 	heartbeatDone    chan struct{}
@@ -388,7 +393,14 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 		return fmt.Errorf("command binary %q not found: %w", bin, err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, w.cfg.Args[1:]...)
+	procCtx, procCancel := context.WithCancel(ctx)
+	defer procCancel()
+
+	w.mu.Lock()
+	w.procCancel = procCancel
+	w.mu.Unlock()
+
+	cmd := exec.CommandContext(procCtx, bin, w.cfg.Args[1:]...)
 	cmd.Dir = w.cfg.Cwd
 	cmdEnv := config.FilterChildProcessEnv(os.Environ())
 	if len(w.cfg.Env) > 0 {
@@ -423,6 +435,17 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 	err := cmd.Wait()
 	stdoutWriter.Flush()
 	stderrWriter.Flush()
+
+	if w.authFailed.Load() {
+		w.authErrMu.Lock()
+		msg := w.authErrMsg
+		w.authErrMu.Unlock()
+		if msg == "" {
+			msg = "Agent CLI 未登录认证 (检测到未登录状态，请先在目标节点运行 'agy' 登录)"
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
 	return err
 }
 
@@ -454,9 +477,91 @@ func (w *Wrapper) runStub(ctx context.Context) error {
 	return nil
 }
 
+// IsUnauthenticatedOutput detects output emitted when an agent CLI (e.g. agy) is unauthenticated
+// or blocked waiting for interactive OAuth approval in a non-interactive session.
+// Informational notices (such as using file-based token storage) and ordinary model/code outputs
+// are carefully distinguished to avoid false-positive kills.
+func IsUnauthenticatedOutput(line string) (bool, string) {
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+
+	// Explicitly ignore benign informational token storage notices
+	if strings.Contains(lower, "using file-based token storage") {
+		return false, ""
+	}
+
+	// 1. Antigravity specific unauthenticated errors
+	if strings.Contains(lower, "not logged into antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到 'Not logged into Antigravity'，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 2. Token source retrieval failure
+	if strings.Contains(lower, "error getting token source") || strings.Contains(lower, "failed to get token source") {
+		return true, "Agent CLI 未登录认证 (检测到 'error getting token source'，凭据源不可用，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 3. Headless non-interactive session cannot complete login
+	if strings.Contains(lower, "not logged in and no controlling terminal") {
+		return true, "Agent CLI 未登录认证 (检测到非交互终端无法完成登录，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 4. Interactive OAuth prompts blocking the process waiting for user input
+	if strings.Contains(lower, "paste the authorization code") ||
+		strings.Contains(lower, "copy the code displayed in the browser and paste it below") {
+		return true, "Agent CLI 未登录认证 (等待网页授权输入，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+	if strings.HasPrefix(lower, "waiting for authentication") ||
+		strings.Contains(lower, "waiting for authentication...") ||
+		strings.Contains(lower, "waiting for authentication (") {
+		return true, "Agent CLI 未登录认证 (等待网页授权，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 5. Explicit sign-in prompts for agy
+	if strings.Contains(lower, "please sign in to view available models") ||
+		strings.Contains(lower, "please sign in to antigravity") ||
+		strings.Contains(lower, "sign in to antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到需登录提示，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 6. Tightened "authentication required" prompt with URL / visit directive
+	if strings.Contains(lower, "authentication required") &&
+		(strings.Contains(lower, "visit the url") ||
+			strings.Contains(lower, "please visit") ||
+			strings.Contains(lower, "browser") ||
+			strings.Contains(lower, "antigravity")) {
+		return true, "Agent CLI 未登录认证 (检测到 'Authentication required'，请先在目标节点运行 'agy' 登录)"
+	}
+
+	return false, ""
+}
+
+func (w *Wrapper) handleAuthFailure(errMsg string) {
+	if w.authFailed.CompareAndSwap(false, true) {
+		w.authErrMu.Lock()
+		w.authErrMsg = errMsg
+		w.authErrMu.Unlock()
+
+		w.publishLog(model.LevelError, fmt.Sprintf("[agentpulse] 快速失败: %s", errMsg))
+
+		w.mu.Lock()
+		cancel := w.procCancel
+		w.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+	}
+}
+
 // handleOutputLine processes a single line emitted by the agent process.
 func (w *Wrapper) handleOutputLine(line string, isStderr bool) {
 	if strings.TrimSpace(line) == "" {
+		return
+	}
+
+	// Fail fast on unauthenticated / interactive OAuth prompts
+	if isUnauth, reason := IsUnauthenticatedOutput(line); isUnauth {
+		w.handleAuthFailure(reason)
 		return
 	}
 
@@ -869,6 +974,9 @@ func detectLocalIP() string {
 }
 
 // BuildCommandArgs normalizes command and arguments into an argument list for execution.
+// It removes any bare "--" argument that immediately follows the command binary
+// (e.g. "agy -- -p ..." -> ["agy", "-p", ...]), preventing engine CLIs from treating flags
+// as unexpected positional arguments.
 func BuildCommandArgs(command string, args []string) []string {
 	var parts []string
 	if strings.TrimSpace(command) != "" {
@@ -876,6 +984,9 @@ func BuildCommandArgs(command string, args []string) []string {
 	}
 	if len(args) > 0 {
 		parts = append(parts, args...)
+	}
+	for len(parts) >= 2 && parts[1] == "--" {
+		parts = append(parts[:1], parts[2:]...)
 	}
 	return parts
 }

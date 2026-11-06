@@ -33,6 +33,7 @@ type ListenerConfig struct {
 	Quiet                      bool
 	Stdout                     io.Writer
 	Stderr                     io.Writer
+	MaxConcurrentJobs          int
 	OnMQTTConnected            func()
 	OnListening                func(topic string)
 	OnJobStart                 func(job model.Job)
@@ -89,14 +90,16 @@ func (d *commandDeduplicator) SeenOrAdd(commandID string) bool {
 }
 
 // Listener is the background daemon that listens for dispatch commands over MQTT,
-// manages node heartbeats and LWT, and executes jobs serially via thin wrapper runs.
+// manages node heartbeats and LWT, and executes jobs concurrently up to MaxConcurrentJobs.
 //
 // Concurrency design:
-// Jobs are queued and executed serially (one job at a time) to prevent resource contention
-// and conflicting workspace file mutations across autonomous agent invocations.
+// By default MaxConcurrentJobs is 1 for backwards compatibility. When configured > 1,
+// multiple jobs can execute concurrently in isolated worker goroutines. Additional incoming
+// jobs remain in QUEUED status in the dispatch buffer until a concurrency slot becomes available.
 type Listener struct {
 	cfg        ListenerConfig
 	mu         sync.Mutex
+	logMu      sync.Mutex
 	machine    model.Machine
 	mqttClient paho.Client
 	ownsMQTT   bool
@@ -104,8 +107,8 @@ type Listener struct {
 	stopped    atomic.Bool
 	stopCh     chan struct{}
 
-	executingJob atomic.Bool
-	dedup        *commandDeduplicator
+	runningJobs atomic.Int32
+	dedup       *commandDeduplicator
 
 	heartbeatRunning bool
 	stopHeartbeat    chan struct{}
@@ -127,6 +130,9 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	}
 	if cfg.StatusFile == "" {
 		cfg.StatusFile = DefaultStatusFile
+	}
+	if cfg.MaxConcurrentJobs <= 0 {
+		cfg.MaxConcurrentJobs = 1
 	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
@@ -157,13 +163,9 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	}, nil
 }
 
-// currentJobCount returns the number of currently running jobs (0 or 1) + jobs queued in dispatchCh.
+// currentJobCount returns the number of currently running jobs + jobs queued in dispatchCh.
 func (l *Listener) currentJobCount() int {
-	count := len(l.dispatchCh)
-	if l.executingJob.Load() {
-		count++
-	}
-	return count
+	return len(l.dispatchCh) + int(l.runningJobs.Load())
 }
 
 func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
@@ -311,24 +313,32 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 		l.cfg.OnListening(dispatchTopic)
 	}
 
-	// Worker loop: process incoming dispatch commands serially
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-l.stopCh:
-				return
-			case cmd, ok := <-l.dispatchCh:
-				if !ok {
+	// Worker pool: process incoming dispatch commands concurrently up to MaxConcurrentJobs
+	concurrency := l.cfg.MaxConcurrentJobs
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case <-l.stopCh:
+					return
+				case cmd, ok := <-l.dispatchCh:
+					if !ok {
+						return
+					}
+					l.executeJob(ctx, cmd)
 				}
-				l.executeJob(ctx, cmd)
 			}
-		}
-	}()
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -338,7 +348,7 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 	}
 
 	l.stopped.Store(true)
-	<-workerDone
+	workerWg.Wait()
 
 	return runErr
 }
@@ -520,8 +530,7 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		jobCtx = timeoutCtx
 	}
 
-	l.executingJob.Store(true)
-	defer l.executingJob.Store(false)
+	l.runningJobs.Add(1)
 
 	// Update machine job count (running + queued)
 	l.mu.Lock()
@@ -561,9 +570,10 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	})
 	if err != nil {
 		l.logError(fmt.Sprintf("[agentpulse listener] failed to initialize wrapper for job %s: %v", cmd.JobID, err))
-		l.executingJob.Store(false)
+		l.runningJobs.Add(-1)
 		l.mu.Lock()
 		l.machine.JobCount = l.currentJobCount()
+		l.machine.LastHeartbeat = time.Now().UTC()
 		l.mu.Unlock()
 		l.publishMachineStatus()
 		return
@@ -575,17 +585,16 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 
 	runErr := w.Run(jobCtx)
 
-	if l.cfg.OnJobComplete != nil {
-		l.cfg.OnJobComplete(w.Job(), runErr)
-	}
-
-	// Update machine job count based on remaining queue
-	l.executingJob.Store(false)
+	l.runningJobs.Add(-1)
 	l.mu.Lock()
 	l.machine.JobCount = l.currentJobCount()
 	l.machine.LastHeartbeat = time.Now().UTC()
 	l.mu.Unlock()
 	l.publishMachineStatus()
+
+	if l.cfg.OnJobComplete != nil {
+		l.cfg.OnJobComplete(w.Job(), runErr)
+	}
 
 	if !l.cfg.Quiet {
 		if runErr == nil {
@@ -669,12 +678,16 @@ func (l *Listener) publishMachineStatus() {
 
 func (l *Listener) log(msg string) {
 	if l.cfg.Stdout != nil {
+		l.logMu.Lock()
+		defer l.logMu.Unlock()
 		fmt.Fprintln(l.cfg.Stdout, msg)
 	}
 }
 
 func (l *Listener) logError(msg string) {
 	if l.cfg.Stderr != nil {
+		l.logMu.Lock()
+		defer l.logMu.Unlock()
 		fmt.Fprintln(l.cfg.Stderr, msg)
 	}
 }

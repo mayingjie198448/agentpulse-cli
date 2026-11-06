@@ -79,12 +79,19 @@ func newDispatchCmd() *cobra.Command {
 
 			if len(rawArgs) > 0 {
 				agentOrCLI = rawArgs[0]
-				finalArgs = append(finalArgs, rawArgs[1:]...)
+				args := rawArgs[1:]
+				if len(args) > 0 && args[0] == "--" {
+					args = args[1:]
+				}
+				finalArgs = append(finalArgs, args...)
 			} else if commandFlag != "" {
 				agentOrCLI = commandFlag
 			}
 			if len(argFlags) > 0 {
 				finalArgs = append(finalArgs, argFlags...)
+			}
+			if len(finalArgs) > 0 && finalArgs[0] == "--" {
+				finalArgs = finalArgs[1:]
 			}
 
 			if strings.TrimSpace(agentOrCLI) == "" {
