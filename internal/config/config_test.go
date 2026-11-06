@@ -141,15 +141,56 @@ func TestFilterChildProcessEnv(t *testing.T) {
 		"AGENTPULSE_MQTT_PASSWORD=supersecret",
 		"BROKER_PASSWORD=hidden",
 		"USER=alice",
+		"SSH_CLIENT=100.1.2.3 54321 22",
+		"SSH_CONNECTION=100.1.2.3 54321 100.1.2.4 22",
+		"SSH_TTY=/dev/pts/1",
+		"SSH_AUTH_SOCK=/tmp/ssh-agent.sock",
 	}
 	filtered := config.FilterChildProcessEnv(env)
 	for _, item := range filtered {
 		if strings.Contains(item, "supersecret") || strings.Contains(item, "hidden") {
 			t.Errorf("sensitive variable was not filtered: %s", item)
 		}
+		if strings.HasPrefix(item, "SSH_CLIENT=") || strings.HasPrefix(item, "SSH_CONNECTION=") || strings.HasPrefix(item, "SSH_TTY=") {
+			t.Errorf("SSH session variable was not filtered: %s", item)
+		}
 	}
-	if len(filtered) != 2 {
-		t.Fatalf("expected 2 filtered items, got %d: %v", len(filtered), filtered)
+	// Expected kept: PATH, USER, SSH_AUTH_SOCK (3 items)
+	if len(filtered) != 3 {
+		t.Fatalf("expected 3 filtered items, got %d: %v", len(filtered), filtered)
+	}
+}
+
+func TestMaxConcurrentJobsConfig(t *testing.T) {
+	// Test default 1 when omitted
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	yamlContent := "version: 1\nmachine_id: test-mach\n"
+	if err := os.WriteFile(confPath, []byte(yamlContent), 0600); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	cfg, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.MaxConcurrentJobs != 1 {
+		t.Errorf("expected default MaxConcurrentJobs=1, got %d", cfg.MaxConcurrentJobs)
+	}
+
+	// Test custom concurrency
+	cfg.MaxConcurrentJobs = 3
+	if err := config.SaveConfig(confPath, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig after save failed: %v", err)
+	}
+	if loaded.MaxConcurrentJobs != 3 {
+		t.Errorf("expected MaxConcurrentJobs=3, got %d", loaded.MaxConcurrentJobs)
 	}
 }
 
