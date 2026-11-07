@@ -61,6 +61,11 @@ func verifyAndProbe(cfg reexecCfg) error {
 		return fmt.Errorf("profile_mismatch")
 	}
 	if err := applyLandlock(kpath); err != nil {
+		// Keep the ENOTSUP token visible to the parent. The user command is
+		// still not executed: failVerify runs before confirmAndExec.
+		if errors.Is(err, errNoNewPrivsAllThreadsUnsupported) {
+			return fmt.Errorf("landlock_failed: %w", errNoNewPrivsAllThreadsUnsupported)
+		}
 		return fmt.Errorf("landlock_failed")
 	}
 	if err := probeSentinel(cfg.sentinel, before); err != nil {
