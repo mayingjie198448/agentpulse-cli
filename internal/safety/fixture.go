@@ -173,7 +173,12 @@ func escapePaths(rels []string, fake string) []string {
 func noteManifest(b *strings.Builder, registry string, rec *RunRecord) {
 	fmt.Fprintf(b, "registry_dir=%s\n", registry)
 	if rec != nil {
-		fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nphase=root_ready\nmanifest=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, manifestPath(registry, rec.RunID))
+		mpath, merr := manifestPath(registry, rec.RunID)
+		if merr != nil {
+			fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nmanifest_error=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, merr.Error())
+		} else {
+			fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nphase=root_ready\nmanifest=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, mpath)
+		}
 		return
 	}
 	matches, _ := filepath.Glob(filepath.Join(registry, "*.manifest.json"))

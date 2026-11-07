@@ -81,17 +81,36 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	if err != nil {
 		return RunRecord{}, err
 	}
-	prof, err := createAppProfile(runID)
-	if err != nil {
-		return RunRecord{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)
-	}
 	regDir := opts.RegistryDir
 	if regDir == "" {
 		regDir = DefaultRegistryDir()
 	}
+	if err := os.MkdirAll(regDir, 0700); err != nil {
+		return RunRecord{}, err
+	}
 	manifest := RunManifest{
-		RunID: runID, Nonce: nonce, ProfileName: prof.name, PackageSID: prof.sidStr,
-		Phase: "profile_created", ProfileCreated: true, SourceSHA256: opts.ExeHash,
+		RunID: runID, Nonce: nonce, Phase: "creating", SourceSHA256: opts.ExeHash,
+	}
+	hooks := profileEvidence{
+		Persist: func(name string) error {
+			manifest.ProfileName = name
+			manifest.ProfileCreated = true
+			manifest.Phase = "s_ok"
+			return saveManifest(regDir, manifest)
+		},
+		Note: func(phase string) error {
+			manifest.Phase = phase
+			return saveManifest(regDir, manifest)
+		},
+	}
+	prof, err := createAppProfile(runID, hooks)
+	if err != nil {
+		return RunRecord{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)
+	}
+	manifest.PackageSID = prof.sidStr
+	if nerr := hooks.Note("profile_created"); nerr != nil {
+		freeSID(prof.sid)
+		return RunRecord{}, failCreatedProfile(prof.name, nerr, deleteAppProfile, hooks.Note)
 	}
 	failed := true
 	defer func() {
@@ -99,20 +118,20 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 		if failed {
 			if derr := deleteAppProfile(prof.name); derr != nil {
 				manifest.Phase = "delete_failed"
-				_ = os.MkdirAll(regDir, 0700)
-				_ = saveManifest(regDir, manifest)
-				err = fmt.Errorf("%v; profile delete failed: %w; manifest profile=%s sid=%s path=%s", err, derr, prof.name, prof.sidStr, manifestPath(regDir, runID))
-			} else {
-				_ = os.Remove(manifestPath(regDir, runID))
+				serr := saveManifest(regDir, manifest)
+				mpath, _ := manifestPath(regDir, runID)
+				if serr != nil {
+					err = fmt.Errorf("%v; profile delete failed: %w; manifest update failed: %v; profile=%s sid=%s path=%s", err, derr, serr, prof.name, prof.sidStr, mpath)
+				} else {
+					err = fmt.Errorf("%v; profile delete failed: %w; manifest profile=%s sid=%s path=%s", err, derr, prof.name, prof.sidStr, mpath)
+				}
+			} else if mpath, merr := manifestPath(regDir, runID); merr != nil {
+				err = fmt.Errorf("%v; manifest path: %v", err, merr)
+			} else if rerr := os.Remove(mpath); rerr != nil && !os.IsNotExist(rerr) {
+				err = fmt.Errorf("%v; manifest remove failed: %v", err, rerr)
 			}
 		}
 	}()
-	if err := os.MkdirAll(regDir, 0700); err != nil {
-		return RunRecord{}, err
-	}
-	if err := saveManifest(regDir, manifest); err != nil {
-		return RunRecord{}, err
-	}
 
 	rootPath, rootID, err := statNoFollow(prof.folder)
 	if err != nil {

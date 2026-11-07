@@ -299,6 +299,156 @@ type Lifecycle struct {
 // ErrDescendantsActive means cleanup must not start.
 var ErrDescendantsActive = fmt.Errorf("descendants still active")
 
+const (
+	synchronizeAccess  = 0x00100000
+	fileListDirectory  = 0x00000001
+	fileReadAttributes = 0x00000080
+	deleteAccessMask   = 0x00010000
+	waitObject0        = 0
+	waitTimeout        = 0x00000102
+)
+
+// cleanupDirectoryAccess is the mask deleteChildrenHandle requests. It has
+// no SYNCHRONIZE bit; synchronous NT create must add that bit itself.
+func cleanupDirectoryAccess() uint32 {
+	return fileListDirectory | fileReadAttributes | deleteAccessMask
+}
+
+// accessForSyncNT is the access actually passed to NtCreateFile. Every
+// synchronous create in this package ORs FILE_SYNCHRONOUS_IO_NONALERT, which
+// is rejected unless SYNCHRONIZE is present.
+func accessForSyncNT(access uint32) uint32 {
+	return access | synchronizeAccess
+}
+
+// settleWait turns a WaitForSingleObject result into a cleanup gate.
+// WAIT_TIMEOUT and WAIT_FAILED are not a finished process.
+func settleWait(status uint32, err error) error {
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDescendantsActive, err)
+	}
+	if status == waitTimeout {
+		return fmt.Errorf("%w: WAIT_TIMEOUT", ErrDescendantsActive)
+	}
+	if status != waitObject0 {
+		return fmt.Errorf("%w: wait status 0x%08X", ErrDescendantsActive, status)
+	}
+	return nil
+}
+
+// launchSession is the helper wait used by the Windows job. The cancel
+// watcher stays armed until Wait returns, then it is joined before the job
+// handle is released.
+type launchSession struct {
+	Cancel    <-chan struct{}
+	Wait      func() (int, error)
+	Terminate func() error
+	Active    func() (int, error)
+	Release   func()
+}
+
+func (s launchSession) WaitQuiescent() error {
+	if s.Wait == nil || s.Terminate == nil || s.Active == nil || s.Release == nil {
+		return fmt.Errorf("%w: incomplete launch session", ErrDescendantsActive)
+	}
+	stop := make(chan struct{})
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		select {
+		case <-stop:
+		case <-s.Cancel:
+			_ = s.Terminate()
+		}
+	}()
+	code, waitErr := s.Wait()
+	close(stop)
+	<-joined
+	active, qerr := s.Active()
+	if qerr != nil || active != 0 {
+		_ = s.Terminate()
+		active, qerr = s.Active()
+	}
+	if qerr != nil || active != 0 {
+		return fmt.Errorf("%w: active=%d query=%v", ErrDescendantsActive, active, qerr)
+	}
+	s.Release()
+	if err := cleanupAllowed(Lifecycle{HelperExited: true, CancelJoined: true, HandlesReleased: true, ActiveProcesses: active}); err != nil {
+		return err
+	}
+	return exitFromWait(code, waitErr)
+}
+
+// afterProfileCreated records a profile at the S_OK boundary, before later
+// SID or folder calls. A failed record tries the in-call delete and returns
+// both failures. It does not authorize a later delete from a file.
+func afterProfileCreated(name string, persist func(string) error, remove func(string) error) error {
+	if name == "" || persist == nil || remove == nil {
+		return fmt.Errorf("BLOCKED: profile evidence hook is missing")
+	}
+	if err := persist(name); err != nil {
+		if derr := remove(name); derr != nil {
+			return fmt.Errorf("BLOCKED: profile %s created; manifest failed: %v; delete failed: %v", name, err, derr)
+		}
+		return fmt.Errorf("BLOCKED: profile %s manifest failed: %v; profile delete attempted", name, err)
+	}
+	return nil
+}
+
+// failCreatedProfile is the in-call rollback after S_OK evidence exists.
+// The delete function is the API just used to create that name, not a
+// manifest reread.
+func failCreatedProfile(name string, cause error, remove func(string) error, note func(string) error) error {
+	if remove == nil {
+		return fmt.Errorf("%v; profile %s delete was not attempted", cause, name)
+	}
+	derr := remove(name)
+	if derr != nil {
+		if note != nil {
+			if nerr := note("delete_failed"); nerr != nil {
+				return fmt.Errorf("%v; profile %s delete failed: %v; manifest update failed: %v", cause, name, derr, nerr)
+			}
+		}
+		return fmt.Errorf("%v; profile %s delete failed: %v", cause, name, derr)
+	}
+	if note != nil {
+		if nerr := note("delete_attempted"); nerr != nil {
+			return fmt.Errorf("%v; profile %s delete attempted; manifest update failed: %v", cause, name, nerr)
+		}
+	}
+	return cause
+}
+
+// manifestRecovery refuses to delete from a manifest. The file is retained
+// evidence. Name and nonce fields are not an ownership proof.
+func manifestRecovery(m RunManifest) (CleanupOutcome, error) {
+	reason := fmt.Sprintf("profile retained; manifest is not an ownership proof name=%s sid=%s phase=%s", m.ProfileName, m.PackageSID, m.Phase)
+	return CleanupOutcome{Result: "BLOCKED", Reason: reason}, fmt.Errorf("%w: %s", ErrCleanupBlocked, reason)
+}
+
+func exactOwnedPackage(profileName, packageSID, runID string, idMatches bool) bool {
+	return idMatches && packageSID != "" && runID != "" && profileName == "ap"+runID
+}
+
+// homeBlocksDelete rejects the home itself, a parent of the home, and every
+// other descendant. The one exception is the recorded AppContainer package
+// root whose file identity already matched.
+func homeBlocksDelete(home, root, profileName, packageSID, runID string, idMatches bool) bool {
+	if strings.TrimSpace(home) == "" || strings.TrimSpace(root) == "" {
+		return false
+	}
+	if canonicalWinPath(home) == canonicalWinPath(root) || withinCanonical(root, home) {
+		return true
+	}
+	if withinCanonical(home, root) {
+		if protectedPathComponent(root) {
+			return true
+		}
+		return !exactOwnedPackage(profileName, packageSID, runID, idMatches)
+	}
+	return false
+}
+
 func cleanupAllowed(s Lifecycle) error {
 	if !s.HelperExited || !s.CancelJoined || !s.HandlesReleased {
 		return fmt.Errorf("%w: launch is not quiescent", ErrDescendantsActive)
@@ -325,14 +475,11 @@ type RunManifest struct {
 	ProfileCreated bool   `json:"profile_created"`
 }
 
-// cleanupPlan chooses profile-only recovery when the owned root is already
-// gone. It never selects a profile that this manifest did not create.
+// cleanupPlan does not select a profile delete from a missing root. A manifest
+// is not an ownership proof. Callers retain the profile.
 func cleanupPlan(rootMissing bool, idMatches bool, m RunManifest) (string, error) {
 	if rootMissing {
-		if m.ProfileCreated && m.ProfileName != "" && m.Nonce != "" && m.RunID != "" {
-			return "profile_only", nil
-		}
-		return "", fmt.Errorf("%w: root missing and no owned profile manifest", ErrCleanupBlocked)
+		return "", fmt.Errorf("%w: root missing; profile retained because a manifest is not an ownership proof", ErrCleanupBlocked)
 	}
 	if idMatches && (!m.ProfileCreated || (m.ProfileName != "" && m.Nonce != "")) {
 		return "root_then_profile", nil

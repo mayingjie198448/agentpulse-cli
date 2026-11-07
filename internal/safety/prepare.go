@@ -75,6 +75,9 @@ type Prepared struct {
 	startFn func() error
 	waitFn  func() error
 	killFn  func() error
+	// removeFn, when set, replaces deleteOwned. Tests use it to observe cleanup.
+	removeFn       func() (CleanupOutcome, error)
+	blockedCleanup error
 }
 
 // Outcome separates the user child from the controller.
@@ -309,6 +312,7 @@ func (p *Prepared) Start() error {
 		err = p.Cmd.Start()
 	}
 	if err != nil {
+		p.keepRoot(err)
 		p.finishRefused(err.Error(), nil)
 		return fmt.Errorf("%w: %v", ErrRefused, err)
 	}
@@ -348,9 +352,13 @@ func (p *Prepared) readConfirm() error {
 		select {
 		case <-p.ctx.Done():
 			p.killChild()
-			_ = p.waitChild()
+			werr := p.waitChild()
+			p.keepRoot(werr)
 			p.reaped = true
 			p.finishRefused("verification canceled", helperPtr(HelperExitVerify))
+			if werr != nil {
+				return werr
+			}
 			return fmt.Errorf("verification canceled")
 		case g := <-ch:
 			n, readErr = g.n, g.err
@@ -364,7 +372,8 @@ func (p *Prepared) readConfirm() error {
 		return nil
 	}
 	if !p.reaped {
-		_ = p.waitChild()
+		werr := p.waitChild()
+		p.keepRoot(werr)
 		p.reaped = true
 	}
 	if msg == "" {
@@ -413,15 +422,21 @@ func (p *Prepared) Wait() (Outcome, error) {
 	p.audit.IsolationApplied = true
 	p.audit.FSWrite = "verified"
 	if errors.Is(waitErr, ErrDescendantsActive) {
+		p.keepRoot(waitErr)
+	}
+	if p.blockedCleanup != nil {
 		p.audit.ControllerResult = "BLOCKED"
 		p.audit.CleanupResult = "BLOCKED"
-		p.audit.CleanupReason = waitErr.Error()
+		p.audit.CleanupReason = p.blockedCleanup.Error()
 		_ = AppendAudit(p.auditPath(), p.audit)
 		out.ControllerResult = p.audit.ControllerResult
+		if waitErr == nil {
+			waitErr = p.blockedCleanup
+		}
 		return out, waitErr
 	}
 	if p.rec != nil && !p.retainRoot {
-		cout, cerr := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
+		cout, cerr := p.removeRoot()
 		out.Cleanup = cout
 		p.audit.CleanupResult = cout.Result
 		p.audit.CleanupReason = cout.Reason
@@ -446,8 +461,8 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 	p.audit.HelperExit = helper
 	p.audit.ExitCode = ExitRefused
 	p.audit.ChildExit = nil
-	if p.rec != nil {
-		cout, cerr := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
+	if p.rec != nil || p.removeFn != nil {
+		cout, cerr := p.removeRoot()
 		p.audit.CleanupResult = cout.Result
 		p.audit.CleanupReason = cout.Reason
 		p.audit.CleanupTargets = cout.Targets
@@ -459,7 +474,28 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 		}
 	}
 	_ = AppendAudit(p.auditPath(), p.audit)
-	p.rec = nil
+	if p.blockedCleanup == nil {
+		p.rec = nil
+	}
+}
+
+func (p *Prepared) keepRoot(err error) {
+	if errors.Is(err, ErrDescendantsActive) && p.blockedCleanup == nil {
+		p.blockedCleanup = err
+	}
+}
+
+func (p *Prepared) removeRoot() (CleanupOutcome, error) {
+	if p.blockedCleanup != nil {
+		return CleanupOutcome{Result: "BLOCKED", Reason: p.blockedCleanup.Error()}, p.blockedCleanup
+	}
+	if p.removeFn != nil {
+		return p.removeFn()
+	}
+	if p.rec == nil {
+		return CleanupOutcome{}, nil
+	}
+	return deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
 }
 
 func (p *Prepared) auditPath() string { return p.auditFile }

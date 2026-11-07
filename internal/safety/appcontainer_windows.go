@@ -103,7 +103,12 @@ type appProfile struct {
 	folder string
 }
 
-func createAppProfile(runID string) (appProfile, error) {
+type profileEvidence struct {
+	Persist func(name string) error
+	Note    func(phase string) error
+}
+
+func createAppProfile(runID string, hooks profileEvidence) (appProfile, error) {
 	if err := appContainerProcs(); err != nil {
 		return appProfile{}, err
 	}
@@ -126,27 +131,23 @@ func createAppProfile(runID string) (appProfile, error) {
 	if err := acceptCreatedProfile(uint32(r)); err != nil {
 		return appProfile{}, err
 	}
+	if err := afterProfileCreated(name, hooks.Persist, deleteAppProfile); err != nil {
+		freeSID(sid)
+		return appProfile{}, err
+	}
 	if sid == nil {
-		if derr := deleteAppProfile(name); derr != nil {
-			return appProfile{}, fmt.Errorf("BLOCKED: CreateAppContainerProfile returned no SID; delete failed: %v", derr)
-		}
-		return appProfile{}, fmt.Errorf("BLOCKED: CreateAppContainerProfile returned no SID")
+		return appProfile{}, failCreatedProfile(name, fmt.Errorf("BLOCKED: CreateAppContainerProfile returned no SID"), deleteAppProfile, hooks.Note)
 	}
 	sidStr, err := sidString(sid)
 	if err != nil {
 		freeSID(sid)
-		if derr := deleteAppProfile(name); derr != nil {
-			return appProfile{}, fmt.Errorf("%v; profile delete failed: %w", err, derr)
-		}
-		return appProfile{}, err
+		return appProfile{}, failCreatedProfile(name, err, deleteAppProfile, hooks.Note)
 	}
 	folder, err := packageFolder(sidStr)
 	if err != nil {
 		freeSID(sid)
-		if derr := deleteAppProfile(name); derr != nil {
-			return appProfile{}, fmt.Errorf("%v; profile delete failed: %w", err, derr)
-		}
-		return appProfile{}, err
+		sid = nil
+		return appProfile{}, failCreatedProfile(name, err, deleteAppProfile, hooks.Note)
 	}
 	return appProfile{name: name, sid: sid, sidStr: sidStr, folder: folder}, nil
 }

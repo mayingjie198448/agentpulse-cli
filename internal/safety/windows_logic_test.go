@@ -1,10 +1,13 @@
 package safety
 
 import (
+	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAcceptCreatedProfileRejectsCollisionAndOtherErrors(t *testing.T) {
@@ -133,14 +136,14 @@ func TestCleanupBlockedUntilDescendantsQuit(t *testing.T) {
 }
 
 func TestProfileRetryAfterRootRemoved(t *testing.T) {
-	man := RunManifest{RunID: "abc", Nonce: "n", ProfileName: "apabc", ProfileCreated: true, Phase: "root_deleted"}
+	man := RunManifest{RunID: strings.Repeat("ab", 16), Nonce: "n", ProfileName: "ap" + strings.Repeat("ab", 16), ProfileCreated: true, Phase: "root_deleted"}
 	plan, err := cleanupPlan(true, false, man)
-	if err != nil || plan != "profile_only" {
-		t.Fatalf("retry: %s %v", plan, err)
-	}
-	plan, err = cleanupPlan(true, false, RunManifest{})
 	if err == nil || plan != "" {
-		t.Fatal("missing manifest was allowed to delete a profile")
+		t.Fatal("a missing root was allowed to select profile deletion")
+	}
+	out, rerr := manifestRecovery(man)
+	if rerr == nil || out.Result != "BLOCKED" || !strings.Contains(out.Reason, man.ProfileName) {
+		t.Fatalf("recovery: %+v %v", out, rerr)
 	}
 }
 
@@ -209,6 +212,216 @@ func TestFinalizeDeleteDoesNotClaimSuccess(t *testing.T) {
 	out, err = finalizeDelete(true, errors.New("profile busy"))
 	if err == nil || out.Result != "BLOCKED" || !containsAll(out.Reason, "profile delete failed") {
 		t.Fatalf("profile: %+v %v", out, err)
+	}
+}
+
+func TestCleanupSynchronousAccessAddsSynchronize(t *testing.T) {
+	raw := cleanupDirectoryAccess()
+	if raw&synchronizeAccess != 0 {
+		t.Fatal("the cleanup mask itself was changed to include SYNCHRONIZE; the NT wrapper is the contract")
+	}
+	if got := accessForSyncNT(raw); got&synchronizeAccess == 0 || got&^synchronizeAccess != raw {
+		t.Fatalf("synchronous access = %#x", got)
+	}
+}
+
+func TestCancelAfterWaitStartsStillTerminates(t *testing.T) {
+	started := make(chan struct{})
+	terminated := make(chan struct{})
+	released := false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := launchSession{
+		Cancel: ctx.Done(),
+		Wait: func() (int, error) {
+			close(started)
+			select {
+			case <-terminated:
+				return 0, nil
+			case <-time.After(2 * time.Second):
+				return 0, errors.New("watcher was gone before Wait returned")
+			}
+		},
+		Terminate: func() error {
+			close(terminated)
+			return nil
+		},
+		Active:  func() (int, error) { return 0, nil },
+		Release: func() { released = true },
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- sess.WaitQuiescent() }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not start")
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel during Wait did not finish the session")
+	}
+	if !released {
+		t.Fatal("handles were not released after quiescence")
+	}
+}
+
+func TestRefusalAfterLiveDescendantsDoesNotDelete(t *testing.T) {
+	deleted := false
+	p := &Prepared{
+		Confined: true,
+		rec:      &RunRecord{RunID: strings.Repeat("ab", 16), Root: `C:\pkg`},
+		startFn: func() error {
+			return settleWait(waitTimeout, nil)
+		},
+		removeFn: func() (CleanupOutcome, error) {
+			deleted = true
+			return CleanupOutcome{Result: "deleted"}, nil
+		},
+	}
+	if err := p.Start(); err == nil || deleted {
+		t.Fatalf("start err=%v deleted=%v", err, deleted)
+	}
+	if !errors.Is(p.blockedCleanup, ErrDescendantsActive) {
+		t.Fatalf("gate: %v", p.blockedCleanup)
+	}
+	if _, err := p.Wait(); err == nil || deleted {
+		t.Fatalf("Wait deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestConfirmFailureDoesNotDeleteLiveDescendants(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	deleted := false
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Prepared{
+		ctx:      ctx,
+		confirmR: r,
+		Confined: true,
+		rec:      &RunRecord{RunID: strings.Repeat("cd", 16)},
+		waitFn:   func() error { return ErrDescendantsActive },
+		killFn:   func() error { return nil },
+		removeFn: func() (CleanupOutcome, error) {
+			deleted = true
+			return CleanupOutcome{Result: "deleted"}, nil
+		},
+	}
+	cancel()
+	if err := p.readConfirm(); err == nil || !errors.Is(err, ErrDescendantsActive) || deleted {
+		t.Fatalf("confirm err=%v deleted=%v", err, deleted)
+	}
+	if _, err := p.Wait(); deleted || err == nil {
+		t.Fatalf("second cleanup deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestQuiescentRefusalStillDeletes(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := w.Write([]byte("FAIL\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	deleted := false
+	p := &Prepared{
+		confirmR: r,
+		Confined: true,
+		rec:      &RunRecord{RunID: strings.Repeat("ef", 16)},
+		waitFn:   func() error { return nil },
+		removeFn: func() (CleanupOutcome, error) {
+			deleted = true
+			return CleanupOutcome{Result: "deleted"}, nil
+		},
+	}
+	if err := p.readConfirm(); err == nil || !deleted {
+		t.Fatalf("quiescent refusal err=%v deleted=%v", err, deleted)
+	}
+}
+
+func TestOwnedPackageIsTheOnlyHomeDescendant(t *testing.T) {
+	home := `C:\Users\me`
+	runID := strings.Repeat("ab", 16)
+	pkg := `\\?\C:\Users\me\AppData\Local\Packages\ap` + runID
+	if homeBlocksDelete(home, pkg, "ap"+runID, "S-1-15-2-1", runID, true) {
+		t.Fatal("owned package root was refused")
+	}
+	if !homeBlocksDelete(home, pkg, "ap"+runID, "", runID, true) {
+		t.Fatal("package without a SID was accepted")
+	}
+	if !homeBlocksDelete(home, pkg, "someone-else", "S-1-15-2-1", runID, true) {
+		t.Fatal("unrelated profile name was accepted")
+	}
+	if !homeBlocksDelete(home, pkg, "ap"+runID, "S-1-15-2-1", runID, false) {
+		t.Fatal("package whose file identity did not match was accepted")
+	}
+	if !homeBlocksDelete(home, home, "ap"+runID, "S-1-15-2-1", runID, true) {
+		t.Fatal("the home itself was accepted")
+	}
+	if !homeBlocksDelete(home, `C:\Users`, "ap"+runID, "S-1-15-2-1", runID, true) {
+		t.Fatal("a parent of the home was accepted")
+	}
+	if !homeBlocksDelete(home, `C:\Users\me\Documents`, "ap"+runID, "S-1-15-2-1", runID, true) {
+		t.Fatal("another home descendant was accepted")
+	}
+}
+
+func TestManifestCannotDeleteAProfile(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(filepath.Dir(dir), "escaped.manifest.json")
+	if err := os.WriteFile(outside, []byte("{\"run_id\":\"..\\\\escaped\",\"profile_created\":true,\"profile_name\":\"apevil\",\"nonce\":\"n\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := CleanupRun(`..\escaped`, CleanupOptions{RegistryDir: dir})
+	if err == nil || out.Result != "BLOCKED" || strings.Contains(out.Reason, "apevil") {
+		t.Fatalf("traversal: %+v %v", out, err)
+	}
+	id := strings.Repeat("ab", 16)
+	body := []byte(`{"run_id":"` + id + `","nonce":"n","profile_name":"apforeign","package_sid":"S-1-15-2-9","profile_created":true,"phase":"s_ok","root":""}` + "\n")
+	if err := os.WriteFile(filepath.Join(dir, id+".manifest.json"), body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = CleanupRun(id, CleanupOptions{RegistryDir: dir})
+	if err == nil || out.Result != "BLOCKED" || !strings.Contains(out.Reason, "apforeign") || !strings.Contains(out.Reason, "retained") {
+		t.Fatalf("forged: %+v %v", out, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, id+".manifest.json")); err != nil {
+		t.Fatal("manifest evidence was removed")
+	}
+}
+
+func TestFailureImmediatelyAfterSOKReportsBothErrors(t *testing.T) {
+	removed := false
+	err := afterProfileCreated("ap0123", func(string) error {
+		return errors.New("disk full")
+	}, func(name string) error {
+		removed = true
+		if name != "ap0123" {
+			t.Fatalf("removed %s", name)
+		}
+		return errors.New("still exists")
+	})
+	if err == nil || !removed || !strings.Contains(err.Error(), "ap0123") || !strings.Contains(err.Error(), "disk full") || !strings.Contains(err.Error(), "still exists") {
+		t.Fatalf("err=%v removed=%v", err, removed)
+	}
+	err = failCreatedProfile("ap0123", errors.New("no folder"), func(string) error {
+		return errors.New("busy")
+	}, func(string) error {
+		return errors.New("manifest unwritable")
+	})
+	if err == nil || !strings.Contains(err.Error(), "no folder") || !strings.Contains(err.Error(), "busy") || !strings.Contains(err.Error(), "manifest unwritable") {
+		t.Fatal(err)
 	}
 }
 

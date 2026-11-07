@@ -28,8 +28,8 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 	h, err := openMeta(rec.Root, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|deleteAccess)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if man, merr := loadManifest(rec.RegistryDir, rec.RunID); merr == nil && man.ProfileCreated && man.Nonce == rec.Nonce && man.ProfileName == rec.ProfileName && man.ProfileName != "" {
-				return recoverProfile(rec.RegistryDir, man)
+			if man, merr := loadManifest(rec.RegistryDir, rec.RunID); merr == nil {
+				return manifestRecovery(man)
 			}
 		}
 		if os.IsNotExist(err) {
@@ -63,8 +63,8 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		if strings.TrimSpace(home) == "" {
 			continue
 		}
-		if pathsConflate(home, kpath) || pathsConflate(kpath, home) {
-			out.Reason = "recorded root is the protected home or its parent; root retained"
+		if homeBlocksDelete(home, kpath, rec.ProfileName, rec.PackageSID, rec.RunID, id.volume == rec.Dev && id.index == rec.Ino) {
+			out.Reason = "recorded root is the protected home, its parent, or an unowned descendant; root retained"
 			return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 		}
 		if hp, hid, herr := statNoFollow(home); herr == nil && hid.volume == id.volume && hid.index == id.index {
@@ -112,7 +112,9 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 			} else {
 				man.Phase = "delete_failed"
 			}
-			_ = saveManifest(rec.RegistryDir, man)
+			if serr := saveManifest(rec.RegistryDir, man); serr != nil {
+				final.Reason = final.Reason + "; manifest update failed: " + serr.Error()
+			}
 		}
 		out.Result = "BLOCKED"
 		out.Reason = final.Reason
@@ -125,7 +127,13 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 			return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 		}
 	}
-	if err := os.Remove(manifestPath(rec.RegistryDir, rec.RunID)); err != nil && !os.IsNotExist(err) {
+	mpath, merr := manifestPath(rec.RegistryDir, rec.RunID)
+	if merr != nil {
+		out.Result = "BLOCKED"
+		out.Reason = merr.Error()
+		return out, merr
+	}
+	if err := os.Remove(mpath); err != nil && !os.IsNotExist(err) {
 		out.Result = "BLOCKED"
 		out.Reason = "manifest remove failed after delete: " + err.Error()
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
@@ -185,7 +193,7 @@ func deleteChildrenHandle(dir windows.Handle, depth int) error {
 		return err
 	}
 	for _, name := range names {
-		child, err := openRelative(dir, name, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|deleteAccess)
+		child, err := openRelative(dir, name, cleanupDirectoryAccess())
 		if err != nil {
 			return err
 		}

@@ -180,66 +180,61 @@ func startAppContainer(p *Prepared) error {
 	}
 	proc, err := os.FindProcess(int(pi.ProcessId))
 	if err != nil {
-		abandonLaunch(pi.Thread, pi.Process, 0)
+		if qerr := abandonLaunch(pi.Thread, pi.Process, 0); qerr != nil {
+			return qerr
+		}
 		return err
 	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		abandonLaunch(pi.Thread, pi.Process, 0)
+		if qerr := abandonLaunch(pi.Thread, pi.Process, 0); qerr != nil {
+			return qerr
+		}
 		return fmt.Errorf("BLOCKED: CreateJobObject: %v", err)
 	}
 	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		abandonLaunch(pi.Thread, pi.Process, job)
+		if qerr := abandonLaunch(pi.Thread, pi.Process, job); qerr != nil {
+			return qerr
+		}
 		return fmt.Errorf("BLOCKED: job lifecycle limit: %v", err)
 	}
 	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
-		abandonLaunch(pi.Thread, pi.Process, job)
+		if qerr := abandonLaunch(pi.Thread, pi.Process, job); qerr != nil {
+			return qerr
+		}
 		return fmt.Errorf("BLOCKED: AssignProcessToJobObject: %v", err)
 	}
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
-		abandonLaunch(pi.Thread, pi.Process, job)
+		if qerr := abandonLaunch(pi.Thread, pi.Process, job); qerr != nil {
+			return qerr
+		}
 		return fmt.Errorf("BLOCKED: ResumeThread: %v", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
 	p.pid = int(pi.ProcessId)
-	stop := make(chan struct{})
-	joined := make(chan struct{})
-	go func() {
-		defer close(joined)
-		select {
-		case <-stop:
-		case <-waitCtx(p):
-			_ = windows.TerminateJobObject(job, 1)
-		}
-	}()
 	p.waitFn = func() error {
-		close(stop)
-		<-joined
-		state, waitErr := proc.Wait()
-		active, qerr := jobActiveProcesses(job)
-		if qerr != nil || active != 0 {
-			_ = windows.TerminateJobObject(job, 1)
-			windows.WaitForSingleObject(pi.Process, 2000)
-			active, qerr = jobActiveProcesses(job)
-		}
-		if qerr != nil || active != 0 {
-			return fmt.Errorf("%w: active=%d query=%v", ErrDescendantsActive, active, qerr)
-		}
-		windows.CloseHandle(pi.Process)
-		windows.CloseHandle(job)
-		for _, c := range closers {
-			c()
-		}
-		if err := cleanupAllowed(Lifecycle{HelperExited: true, CancelJoined: true, HandlesReleased: true, ActiveProcesses: active}); err != nil {
-			return err
-		}
-		code := 0
-		if state != nil {
-			code = state.ExitCode()
-		}
-		return exitFromWait(code, waitErr)
+		return (launchSession{
+			Cancel: waitCtx(p),
+			Wait: func() (int, error) {
+				state, waitErr := proc.Wait()
+				code := 0
+				if state != nil {
+					code = state.ExitCode()
+				}
+				return code, waitErr
+			},
+			Terminate: func() error { return windows.TerminateJobObject(job, 1) },
+			Active:    func() (int, error) { return jobActiveProcesses(job) },
+			Release: func() {
+				windows.CloseHandle(pi.Process)
+				windows.CloseHandle(job)
+				for _, c := range closers {
+					c()
+				}
+			},
+		}).WaitQuiescent()
 	}
 	p.killFn = func() error {
 		return windows.TerminateJobObject(job, 1)
@@ -255,22 +250,26 @@ func waitCtx(p *Prepared) <-chan struct{} {
 	return p.ctx.Done()
 }
 
-func abandonLaunch(thread, process, job windows.Handle) {
+func abandonLaunch(thread, process, job windows.Handle) error {
+	if process == 0 {
+		return fmt.Errorf("%w: no process to wait for", ErrDescendantsActive)
+	}
+	_ = windows.TerminateProcess(process, 1)
 	if job != 0 {
 		_ = windows.TerminateJobObject(job, 1)
-	} else if process != 0 {
-		_ = windows.TerminateProcess(process, 1)
 	}
-	if process != 0 {
-		_, _ = windows.WaitForSingleObject(process, 2000)
-		_ = windows.CloseHandle(process)
+	status, werr := windows.WaitForSingleObject(process, 2000)
+	if qerr := settleWait(status, werr); qerr != nil {
+		return qerr
 	}
+	_ = windows.CloseHandle(process)
 	if thread != 0 {
 		_ = windows.CloseHandle(thread)
 	}
 	if job != 0 {
 		_ = windows.CloseHandle(job)
 	}
+	return nil
 }
 
 func jobActiveProcesses(job windows.Handle) (int, error) {

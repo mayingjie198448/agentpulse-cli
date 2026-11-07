@@ -187,6 +187,7 @@ func ntCreate(parent windows.Handle, name string, access, disposition, options, 
 	}
 	var ios ioStatusBlock
 	var h windows.Handle
+	access = accessForSyncNT(access)
 	r, _, _ := procNtCreateFile.Call(
 		uintptr(unsafe.Pointer(&h)),
 		uintptr(access),
