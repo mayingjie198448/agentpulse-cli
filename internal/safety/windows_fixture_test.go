@@ -65,9 +65,24 @@ func TestWindowsJunctionDeleteRetainsTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	registry := filepath.Join(base, "registry")
+	if err := os.MkdirAll(registry, 0700); err != nil {
+		t.Fatal(err)
+	}
 	rec := RunRecord{
-		RunID: "0123456789abcdef0123456789abcdef",
-		Root:  kpath, Dev: id.volume, Ino: id.index, Nonce: "nonce",
+		RunID:       "0123456789abcdef0123456789abcdef",
+		Root:        kpath,
+		Dev:         id.volume,
+		Ino:         id.index,
+		Nonce:       "nonce",
+		RegistryDir: registry,
+	}
+	rec.RegistryPath = filepath.Join(registry, rec.RunID+".json")
+	if err := writeJSON(rec.RegistryPath, rec, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveManifest(registry, RunManifest{RunID: rec.RunID, Nonce: rec.Nonce, Phase: "root_ready"}); err != nil {
+		t.Fatal(err)
 	}
 	body, err := json.Marshal(rec)
 	if err != nil {
@@ -82,6 +97,16 @@ func TestWindowsJunctionDeleteRetainsTarget(t *testing.T) {
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != "keep" {
 		t.Fatalf("junction target changed: %v %q", err, got)
+	}
+	if _, err := os.Stat(rec.RegistryPath); !os.IsNotExist(err) {
+		t.Fatalf("run registry record was not removed: %v", err)
+	}
+	mpath, err := manifestPath(registry, rec.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mpath); !os.IsNotExist(err) {
+		t.Fatalf("run manifest was not removed: %v", err)
 	}
 }
 
