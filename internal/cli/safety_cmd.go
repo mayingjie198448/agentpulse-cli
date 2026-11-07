@@ -65,5 +65,17 @@ func newSafetyCmd() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(backend)
+
+	fixture := &cobra.Command{
+		Use:   "fixture",
+		Short: "Run the native confinement fixture against synthetic files only. Does not launch agy.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := safety.RunNativeFixture(cmd.Context())
+			fmt.Fprint(cmd.OutOrStdout(), report)
+			return err
+		},
+	}
+	cmd.AddCommand(fixture)
 	return cmd
 }

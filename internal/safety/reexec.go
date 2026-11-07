@@ -18,32 +18,40 @@ func MaybeHandleInternal(args []string) {
 }
 
 type reexecCfg struct {
-	runRoot     string
-	workRoot    string
-	runID       string
-	rootDev     uint64
-	rootIno     uint64
-	profileHash string
-	exeHash     string
-	sentinel    string
-	sentinelDev uint64
-	sentinelIno uint64
-	user        []string
+	runRoot       string
+	workRoot      string
+	runID         string
+	rootDev       uint64
+	rootIno       uint64
+	profileHash   string
+	exeHash       string
+	sentinel      string
+	sentinelDev   uint64
+	sentinelIno   uint64
+	profileName   string
+	packageSID    string
+	capCount      int
+	confirmHandle uint64
+	user          []string
 }
 
 func runReexec(args []string) {
 	cfg, err := parseReexec(args)
+	confirm := 3
+	if err == nil && cfg.confirmHandle != 0 {
+		confirm = int(cfg.confirmHandle)
+	}
 	if err != nil {
-		failVerify(3, "bad_helper_args")
+		failVerify(confirm, "bad_helper_args")
 	}
 	if err := verifyAndProbe(cfg); err != nil {
-		failVerify(3, err.Error())
+		failVerify(confirm, err.Error())
 	}
 	if len(cfg.user) == 0 || strings.TrimSpace(cfg.user[0]) == "" {
-		failVerify(3, "empty_user_command")
+		failVerify(confirm, "empty_user_command")
 	}
-	if err := closeExtraFDs(3); err != nil {
-		failVerify(3, "fd_cleanup_failed")
+	if err := closeExtraFDs(confirm); err != nil {
+		failVerify(confirm, "fd_cleanup_failed")
 	}
 	if err := confirmAndExec(cfg); err != nil {
 		os.Exit(127)
@@ -98,6 +106,22 @@ func parseReexec(args []string) (reexecCfg, error) {
 				return cfg, err
 			}
 			cfg.sentinelIno = n
+		case "--profile-name":
+			cfg.profileName = val
+		case "--package-sid":
+			cfg.packageSID = val
+		case "--cap-count":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.capCount = n
+		case "--confirm-handle":
+			n, err := strconv.ParseUint(val, 10, 64)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.confirmHandle = n
 		default:
 			return cfg, fmt.Errorf("unknown")
 		}

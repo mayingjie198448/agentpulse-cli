@@ -67,6 +67,11 @@ type Prepared struct {
 	started    bool
 	reaped     bool
 	pid        int
+	// startFn, when set, replaces Cmd.Start. Windows AppContainer uses it
+	// because os/exec cannot pass PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES.
+	startFn func() error
+	waitFn  func() error
+	killFn  func() error
 }
 
 // Outcome separates the user child from the controller.
@@ -159,6 +164,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		RealHome:    req.RealHome,
 		Sentinel:    req.SentinelPath,
 		ExeHash:     exeHash,
+		ExePath:     self,
 	})
 	if err != nil {
 		ev := refusedAudit(userArgv, auth, req, backend.Name(), err.Error())
@@ -194,8 +200,11 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		"--sentinel", rec.Sentinel,
 		"--sentinel-dev", strconv.FormatUint(rec.SentinelDev, 10),
 		"--sentinel-ino", strconv.FormatUint(rec.SentinelIno, 10),
-		"--",
 	}
+	if rec.ProfileName != "" {
+		args = append(args, "--profile-name", rec.ProfileName, "--package-sid", rec.PackageSID, "--cap-count", "0")
+	}
+	args = append(args, "--")
 	args = append(args, userArgv...)
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -212,7 +221,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 	if backend.Name() != "linux-landlock" {
 		detail = backend.Name() + " selected; fresh probe still required"
 	}
-	return &Prepared{
+	prepared := &Prepared{
 		Cmd:      cmd,
 		UserArgv: userArgv,
 		Danger:   explicitShape,
@@ -244,7 +253,12 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		},
 		auditFile:  auditPath,
 		retainRoot: req.RetainRoot,
-	}, nil
+	}
+	if err := configureConfinedLaunch(prepared); err != nil {
+		_, _ = deleteOwned(rec, protectedHomes(req.RealHome))
+		return nil, fmt.Errorf("%w: %v", ErrRefused, err)
+	}
+	return prepared, nil
 }
 
 func refusedAudit(argv []string, auth string, req Request, backend, detail string) AuditEvent {
@@ -278,15 +292,21 @@ func firstNonEmpty(a, b string) string {
 // confirms the fresh probe, and it does not treat a failed probe as a running
 // user command.
 func (p *Prepared) Start() error {
-	if p.Cmd == nil {
+	if p.Cmd == nil && p.startFn == nil {
 		return fmt.Errorf("%w: nothing to start", ErrRefused)
 	}
-	if err := p.Cmd.Start(); err != nil {
+	var err error
+	if p.startFn != nil {
+		err = p.startFn()
+	} else {
+		err = p.Cmd.Start()
+	}
+	if err != nil {
 		p.finishRefused(err.Error(), nil)
 		return fmt.Errorf("%w: %v", ErrRefused, err)
 	}
 	p.started = true
-	if p.Cmd.Process != nil {
+	if p.pid == 0 && p.Cmd != nil && p.Cmd.Process != nil {
 		p.pid = p.Cmd.Process.Pid
 	}
 	if p.confirmW != nil {
@@ -320,10 +340,8 @@ func (p *Prepared) readConfirm() error {
 	if p.ctx != nil {
 		select {
 		case <-p.ctx.Done():
-			if p.Cmd.Process != nil {
-				_ = p.Cmd.Process.Kill()
-			}
-			_ = p.Cmd.Wait()
+			p.killChild()
+			_ = p.waitChild()
 			p.reaped = true
 			p.finishRefused("verification canceled", helperPtr(HelperExitVerify))
 			return fmt.Errorf("verification canceled")
@@ -339,7 +357,7 @@ func (p *Prepared) readConfirm() error {
 		return nil
 	}
 	if !p.reaped {
-		_ = p.Cmd.Wait()
+		_ = p.waitChild()
 		p.reaped = true
 	}
 	if msg == "" {
@@ -359,8 +377,8 @@ func (p *Prepared) Pid() int { return p.pid }
 // confined root only when ownership still matches.
 func (p *Prepared) Wait() (Outcome, error) {
 	var waitErr error
-	if p.started && !p.reaped && p.Cmd != nil {
-		waitErr = p.Cmd.Wait()
+	if p.started && !p.reaped && (p.Cmd != nil || p.waitFn != nil) {
+		waitErr = p.waitChild()
 		p.reaped = true
 	}
 	out := Outcome{AuditPath: p.auditPath()}
@@ -427,6 +445,26 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 }
 
 func (p *Prepared) auditPath() string { return p.auditFile }
+
+func (p *Prepared) waitChild() error {
+	if p.waitFn != nil {
+		return p.waitFn()
+	}
+	if p.Cmd == nil {
+		return nil
+	}
+	return p.Cmd.Wait()
+}
+
+func (p *Prepared) killChild() {
+	if p.killFn != nil {
+		p.killFn()
+		return
+	}
+	if p.Cmd != nil && p.Cmd.Process != nil {
+		_ = p.Cmd.Process.Kill()
+	}
+}
 
 func helperPtr(v int) *int { return &v }
 

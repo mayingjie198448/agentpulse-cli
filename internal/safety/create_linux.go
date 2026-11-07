@@ -13,14 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type createOpts struct {
-	BaseDir     string
-	RegistryDir string
-	RealHome    string
-	Sentinel    string
-	ExeHash     string
-}
-
 func createRunRoot(opts createOpts) (RunRecord, error) {
 	if err := ensureExistingSentinel(opts.Sentinel); err != nil {
 		return RunRecord{}, err
