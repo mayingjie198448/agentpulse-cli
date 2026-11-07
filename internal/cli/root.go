@@ -25,6 +25,10 @@ var (
 	plainOutput bool
 )
 
+// defaultDangerouslySkipPermissions is the dual-role daemon's opt-in.
+// It stays false so this process does not add --dangerously-skip-permissions.
+const defaultDangerouslySkipPermissions = false
+
 // NewRootCmd constructs the root command for agentpulse.
 func NewRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
@@ -53,6 +57,9 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newJobsCmd())
 	rootCmd.AddCommand(newWatchCmd())
 	rootCmd.AddCommand(newVersionCmd())
+	safetyCmd := newSafetyCmd()
+	safetyCmd.Hidden = true
+	rootCmd.AddCommand(safetyCmd)
 
 	// listen/wrap 保留为隐藏兼容命令
 	listenCmd := newListenCmd()
@@ -158,7 +165,11 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		Agents:    announceAgents,
 	}
 
-	// 角色 1: 本机 Listener + 心跳守护进程
+	// 角色 1: 本机 Listener + 心跳守护进程.
+	// This revision previously forced DangerouslySkipPermissions on.
+	// Other historical SHAs left the listen/wrap BoolVar default false.
+	// The daemon does not opt in. An explicit flag still has to pass
+	// safety.Prepare; isolation failure does not start a bare child.
 	pMQTT := &listenerMQTT
 	isPlain := termutil.ShouldUsePlain(plainOutput)
 	listenerCfg := wrapper.ListenerConfig{
@@ -167,7 +178,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		HeartbeatInterval:          mqttCfg.HeartbeatCheckInterval,
 		StatusFile:                 wrapper.DefaultStatusFile,
 		MQTT:                       pMQTT,
-		DangerouslySkipPermissions: true,
+		DangerouslySkipPermissions: defaultDangerouslySkipPermissions,
 		Quiet:                      !isPlain,
 		Stdout:                     io.Discard,
 		Stderr:                     io.Discard,

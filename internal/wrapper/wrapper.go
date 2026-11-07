@@ -22,6 +22,7 @@ import (
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
 
@@ -61,6 +62,14 @@ type Config struct {
 	Stub              bool
 	Quiet             bool
 	Env               map[string]string
+	// ExplicitDanger opts this launch into skip-permissions mode.
+	// The daemon default is false. Opt-in still runs only inside verified
+	// OS write isolation; a failure does not retry without that isolation.
+	ExplicitDanger    bool
+	AuditPath         string
+	RealHome          string
+	SentinelPath      string
+	IsolationBackend  safety.Backend
 	KeepMachineOnline bool
 	StartedAt         time.Time
 	OnMQTTConnected   func()
@@ -388,16 +397,6 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 		return fmt.Errorf("command binary %q not found: %w", bin, err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, w.cfg.Args[1:]...)
-	cmd.Dir = w.cfg.Cwd
-	cmdEnv := config.FilterChildProcessEnv(os.Environ())
-	if len(w.cfg.Env) > 0 {
-		for k, v := range w.cfg.Env {
-			cmdEnv = append(cmdEnv, fmt.Sprintf("%s=%s", k, v))
-		}
-	}
-	cmd.Env = config.FilterChildProcessEnv(cmdEnv)
-
 	stdoutWriter := newLineWriter(func(line string) {
 		w.handleOutputLine(line, false)
 	}, w.cfg.MirrorStdout)
@@ -406,21 +405,42 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 		w.handleOutputLine(line, true)
 	}, w.cfg.MirrorStderr)
 
-	cmd.Stdout = stdoutWriter
-	cmd.Stderr = stderrWriter
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start process %q: %w", w.cfg.Args[0], err)
+	// Every real child, including MQTT listener jobs and wrap, starts here.
+	cmdEnv := config.FilterChildProcessEnv(os.Environ())
+	if len(w.cfg.Env) > 0 {
+		for k, v := range w.cfg.Env {
+			cmdEnv = append(cmdEnv, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+	cmdEnv = config.FilterChildProcessEnv(cmdEnv)
+	prepared, err := safety.Prepare(ctx, safety.Request{
+		Argv:           w.cfg.Args,
+		ExplicitDanger: w.cfg.ExplicitDanger,
+		Environ:        cmdEnv,
+		ExtraEnv:       w.cfg.Env,
+		Dir:            w.cfg.Cwd,
+		Stdout:         stdoutWriter,
+		Stderr:         stderrWriter,
+		AuditPath:      w.cfg.AuditPath,
+		RealHome:       w.cfg.RealHome,
+		SentinelPath:   w.cfg.SentinelPath,
+		Backend:        w.cfg.IsolationBackend,
+	})
+	if err != nil {
+		return err
+	}
+	if err := prepared.Start(); err != nil {
+		stdoutWriter.Flush()
+		stderrWriter.Flush()
+		return err
 	}
 
 	w.mu.Lock()
-	if cmd.Process != nil {
-		w.pid = cmd.Process.Pid
-	}
+	w.pid = prepared.Pid()
 	w.mu.Unlock()
 	_ = w.writeStatusFile()
 
-	err := cmd.Wait()
+	_, err = prepared.Wait()
 	stdoutWriter.Flush()
 	stderrWriter.Flush()
 	return err

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -95,29 +94,11 @@ Examples:
 			args := make([]string, len(rawArgs))
 			copy(args, rawArgs)
 
-			// If no command specified but prompt flag passed
+			// If no command specified but prompt flag passed, build the agy argv
+			// without a danger flag. ExplicitDanger is applied later, and only
+			// inside verified isolation.
 			if len(args) == 0 && promptFlag != "" {
 				args = []string{"agy", "-p", promptFlag}
-				if dangerouslySkipPermissions {
-					args = []string{"agy", "--dangerously-skip-permissions", "-p", promptFlag}
-				}
-			}
-
-			// Handle --dangerously-skip-permissions for agy commands
-			if dangerouslySkipPermissions && len(args) > 0 {
-				base := filepath.Base(args[0])
-				if base == "agy" {
-					hasPermFlag := false
-					for _, a := range args {
-						if a == "--dangerously-skip-permissions" {
-							hasPermFlag = true
-							break
-						}
-					}
-					if !hasPermFlag {
-						args = append([]string{args[0], "--dangerously-skip-permissions"}, args[1:]...)
-					}
-				}
 			}
 
 			if len(args) == 0 && !stub {
@@ -152,6 +133,7 @@ Examples:
 				Engine:            engType,
 				Title:             title,
 				Args:              args,
+				ExplicitDanger:    dangerouslySkipPermissions,
 				StatusFile:        statusFile,
 				HeartbeatInterval: heartbeatInterval,
 				MQTT:              pMQTT,
@@ -211,7 +193,7 @@ Examples:
 	wrapCmd.Flags().DurationVar(&heartbeatInterval, "heartbeat-interval", wrapper.DefaultHeartbeatInterval, "Interval between MQTT heartbeats")
 	wrapCmd.Flags().BoolVar(&stub, "stub", false, "Run in simulated stub mode (useful for testing or when engine is uninstalled)")
 	wrapCmd.Flags().StringVarP(&promptFlag, "prompt", "p", "", "Instruction/prompt for agent invocation")
-	wrapCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when wrapping agy")
+	wrapCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Opt in to agy skip-permissions. Refuses to start unless a fresh OS write isolation probe succeeds; does not fall back to a bare run.")
 	wrapCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse wrapper header/footer banners")
 	wrapCmd.Flags().BoolVar(&listen, "listen", false, "Run thin wrapper in listen mode to receive and execute remote dispatch commands")
 
