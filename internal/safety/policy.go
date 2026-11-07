@@ -67,13 +67,14 @@ func Authorize(a Authorization) error {
 // linux_landlock_fs_write is the only surface exercised by the Linux tests.
 func NativeVerification() map[string]string {
 	return map[string]string{
-		"linux_landlock_fs_write":        "exercised on linux when the landlock probe passes",
-		"darwin_sandbox_exec":            "BLOCKED",
-		"darwin_mach_securityd_keychain": "BLOCKED",
-		"windows_write_isolation":        "BLOCKED",
-		"windows_reparse_junction":       "BLOCKED",
-		"credential_agent_ipc_proxy":     "BLOCKED",
-		"network_confinement":            "BLOCKED",
+		"linux_landlock_fs_write":             "exercised on linux when the landlock probe passes",
+		"darwin_sandbox_exec":                 "BLOCKED",
+		"darwin_mach_securityd_keychain":      "BLOCKED",
+		"windows_write_isolation":             "BLOCKED",
+		"windows_reparse_junction":            "BLOCKED",
+		"windows_appcontainer_native_fixture": "BLOCKED_UNTIL_OPS_EXECUTES",
+		"credential_agent_ipc_proxy":          "BLOCKED",
+		"network_confinement":                 "BLOCKED",
 	}
 }
 

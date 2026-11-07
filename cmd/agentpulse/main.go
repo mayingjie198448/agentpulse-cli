@@ -10,5 +10,6 @@ import (
 func main() {
 	// Confined launches re-exec this binary. The helper exits before cobra.
 	safety.MaybeHandleInternal(os.Args)
+	safety.MaybeFixtureWorker(os.Args)
 	cli.Execute()
 }
