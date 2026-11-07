@@ -62,8 +62,25 @@ func applyLandlock(root string) error {
 	if errno != 0 {
 		return fmt.Errorf("landlock add rule: %w", errno)
 	}
-	// landlock_restrict_self requires no_new_privs unless CAP_SYS_ADMIN is effective.
+	// landlock_restrict_self requires no_new_privs unless CAP_SYS_ADMIN is
+	// effective. AllThreadsSyscall is required so every Go thread drops the
+	// ability to gain privileges. A single-thread prctl is not a substitute:
+	// other threads would stay unconstrained, and this function must not
+	// fall back to an unconfined run.
+	//
+	// Race instrumentation is incompatible with landlock on this Linux.
+	// `go test -race` links cgo (the thread sanitizer). syscall.AllThreadsSyscall
+	// then returns ENOTSUP before the prctl is issued — Go refuses to stop
+	// every OS thread in a cgo binary (syscall/syscall_linux.go). The kernel
+	// still supports landlock and PR_SET_NO_NEW_PRIVS; a production non-race
+	// binary applies both and is what the positive confinement tests verify.
+	// ENOTSUP stays fail-closed: return the error, do not start the user
+	// command. -race must not require landlock success, and it must not
+	// change this return into a bare exec.
 	if _, _, errno = syscall.AllThreadsSyscall(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
+		if errno == syscall.ENOTSUP {
+			return fmt.Errorf("no_new_privs: %w", errNoNewPrivsAllThreadsUnsupported)
+		}
 		return fmt.Errorf("no_new_privs: %w", errno)
 	}
 	if _, _, errno = syscall.AllThreadsSyscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(ruleset), 0, 0); errno != 0 {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -180,6 +181,7 @@ func TestExplicitDangerWritesProjectAndCannotEscape(t *testing.T) {
 		t.Fatal("non-agy worker was given an agy danger flag")
 	}
 	if err := p.Start(); err != nil {
+		skipPositiveLandlockIfRaceENOTSUP(t, err)
 		t.Fatalf("start: %v\nstderr=%s", err, stderr.String())
 	}
 	out, err := p.Wait()
@@ -279,6 +281,7 @@ func TestAgyOptInFlagIsInsideVerifiedConfinement(t *testing.T) {
 		t.Fatal("agy was exec'd directly instead of the isolate helper")
 	}
 	if err := p.Start(); err != nil {
+		skipPositiveLandlockIfRaceENOTSUP(t, err)
 		t.Fatal(err)
 	}
 	out, err := p.Wait()
@@ -318,6 +321,7 @@ func TestChildExitIsNotFlattenedIntoControllerSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := p.Start(); err != nil {
+		skipPositiveLandlockIfRaceENOTSUP(t, err)
 		t.Fatal(err)
 	}
 	out, waitErr := p.Wait()
@@ -341,6 +345,46 @@ func TestChildExitIsNotFlattenedIntoControllerSuccess(t *testing.T) {
 	}
 	if strings.Contains(text, `"result":"PASS"`) || strings.Contains(text, `"controller_result":"PASS"`) {
 		t.Fatalf("audit used a PASS marker:\n%s", text)
+	}
+}
+
+// TestRaceLandlockENOTSUPDoesNotStartChild locks the fail-closed side of
+// the race/landlock incompatibility. Positive confinement tests skip only
+// after apply reports this ENOTSUP; this test keeps asserting that the user
+// command was not started.
+func TestRaceLandlockENOTSUPDoesNotStartChild(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("landlock apply is linux-only")
+	}
+	if !builtWithRace() {
+		t.Skip("non-race builds apply landlock; positive confinement tests verify that path. -race is what makes AllThreadsSyscall return ENOTSUP")
+	}
+	fix := newFixture(t)
+	started := filepath.Join(fix.base, "child-started")
+	p, err := Prepare(context.Background(), fix.req([]string{"/bin/touch", started}, true, "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.Start()
+	if err == nil || !errors.Is(err, ErrRefused) {
+		t.Fatalf("race ENOTSUP must refuse the child, got %v", err)
+	}
+	if !strings.Contains(err.Error(), landlockNoNewPrivsENOTSUPReason) {
+		t.Fatalf("race landlock failure was not AllThreadsSyscall ENOTSUP on no_new_privs: %v", err)
+	}
+	if _, statErr := os.Stat(started); !os.IsNotExist(statErr) {
+		t.Fatal("user command started after landlock apply failed")
+	}
+	body, rerr := os.ReadFile(fix.audit)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"controller_result":"refused"`) || !strings.Contains(text, `"child_exit":null`) {
+		t.Fatalf("audit did not record fail-closed refusal:\n%s", text)
+	}
+	if strings.Contains(text, `"isolation_applied":true`) {
+		t.Fatalf("audit claimed isolation after ENOTSUP:\n%s", text)
 	}
 }
 
@@ -649,6 +693,46 @@ func (f fixture) req(argv []string, explicit bool, profileOverride, exeOverride 
 		ProfileHashOverride: profileOverride,
 		ExeHashOverride:     exeOverride,
 	}
+}
+
+// skipPositiveLandlockIfRaceENOTSUP skips a test that needs a successful
+// landlock apply when this binary is race-instrumented and the apply just
+// failed because AllThreadsSyscall(PR_SET_NO_NEW_PRIVS) returned ENOTSUP.
+//
+// Race instrumentation is incompatible with landlock on this Linux: the
+// race runtime links cgo, and Go returns ENOTSUP from AllThreadsSyscall
+// without issuing the prctl. The production non-race path is verified by
+// running these tests without -race. -race must not require landlock
+// success. A non-race ENOTSUP is a real failure and is not skipped.
+// testing.Short is not a substitute: the decision is race-aware and uses
+// the apply-time error. Fail-closed tests that expect a refusal stay in
+// place; this helper does not turn an isolation failure into a bare run.
+func skipPositiveLandlockIfRaceENOTSUP(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || !builtWithRace() {
+		return
+	}
+	if !strings.Contains(err.Error(), landlockNoNewPrivsENOTSUPReason) {
+		return
+	}
+	t.Skip("race instrumentation is incompatible with landlock on this Linux: AllThreadsSyscall(PR_SET_NO_NEW_PRIVS) returns ENOTSUP, so landlock cannot apply. The child was not started (fail-closed). The production non-race path is verified without -race; -race must not require landlock success")
+}
+
+// builtWithRace reports whether this test binary was built with -race.
+// It reads the build setting Go records for the race detector. It does not
+// use testing.Short, and it does not treat a plain cgo or ENOTSUP result as
+// a race build.
+func builtWithRace() bool {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range info.Settings {
+		if s.Key == "-race" && s.Value == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 func homeLine(status string) string {
