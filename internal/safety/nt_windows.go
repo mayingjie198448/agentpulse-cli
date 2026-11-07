@@ -3,7 +3,10 @@
 package safety
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"unicode/utf16"
 	"unsafe"
 
@@ -11,13 +14,14 @@ import (
 )
 
 const (
-	fileNamesInformation = 12
-	fileOpen             = 1
-	fileOpenReparsePoint = 0x00200000
-	fileDirectoryFile    = 0x00000001
-	objCaseInsensitive   = 0x00000040
-	statusNoMoreFiles    = 0x80000006
-	statusBufferOverflow = 0x80000005
+	fileNamesInformation    = 12
+	fileOpen                = 1
+	fileCreate              = 2
+	fileDirectoryFile       = 0x00000001
+	fileNonDirectoryFile    = 0x00000040
+	fileOpenReparsePoint    = 0x00200000
+	fileSynchronousNonAlert = 0x00000020
+	objCaseInsensitive      = 0x00000040
 )
 
 var (
@@ -74,18 +78,27 @@ func listHandleNames(h windows.Handle) ([]string, error) {
 			restart,
 		)
 		restart = 0
-		status := uint32(r)
-		if status == statusNoMoreFiles {
+		st, err := ntCallStatus(r, ios)
+		if err != nil {
+			return nil, err
+		}
+		usable, err := ntQueryResult(st, ios.Information, len(buf))
+		if errors.Is(err, errNTNoMore) {
 			return names, nil
 		}
-		if int32(r) < 0 && status != statusBufferOverflow {
-			return names, fmt.Errorf("NtQueryDirectoryFile status 0x%08X", status)
+		if err != nil {
+			return nil, err
 		}
 		offset := 0
-		for {
+		for offset+int(unsafe.Sizeof(fileNamesHeader{})) <= usable {
 			hdr := (*fileNamesHeader)(unsafe.Pointer(&buf[offset]))
-			n := int(hdr.FileNameLength) / 2
-			chars := unsafe.Slice((*uint16)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[offset]))+unsafe.Sizeof(*hdr))), n)
+			nameBytes := int(hdr.FileNameLength)
+			nameStart := offset + int(unsafe.Sizeof(fileNamesHeader{}))
+			nameEnd := nameStart + nameBytes
+			if nameBytes < 0 || nameBytes%2 != 0 || nameEnd > usable {
+				return nil, fmt.Errorf("BLOCKED: directory entry outside NT information length")
+			}
+			chars := unsafe.Slice((*uint16)(unsafe.Pointer(&buf[nameStart])), nameBytes/2)
 			name := string(utf16.Decode(chars))
 			if name != "." && name != ".." && name != "" {
 				names = append(names, name)
@@ -93,19 +106,64 @@ func listHandleNames(h windows.Handle) ([]string, error) {
 			if hdr.NextEntryOffset == 0 {
 				break
 			}
-			offset += int(hdr.NextEntryOffset)
-			if offset < 0 || offset >= len(buf) {
-				return names, fmt.Errorf("directory listing truncated")
+			next := offset + int(hdr.NextEntryOffset)
+			if hdr.NextEntryOffset < uint32(unsafe.Sizeof(fileNamesHeader{})) || next > usable {
+				return nil, fmt.Errorf("BLOCKED: directory link outside NT information length")
 			}
-		}
-		if status != statusBufferOverflow && int32(r) >= 0 {
-			// A short buffer asks for another call. A full success ends the scan
-			// only when the next call returns STATUS_NO_MORE_FILES.
+			offset = next
 		}
 	}
 }
 
 func openRelative(parent windows.Handle, name string, access uint32) (windows.Handle, error) {
+	return ntCreate(parent, name, access, fileOpen, fileOpenReparsePoint|fileSynchronousNonAlert, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)
+}
+
+func mkdirRelative(parent windows.Handle, name string) error {
+	h, err := ntCreate(parent, name, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE, fileCreate, fileDirectoryFile|fileOpenReparsePoint|fileSynchronousNonAlert, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)
+	if err != nil {
+		return err
+	}
+	return windows.CloseHandle(h)
+}
+
+func readRelative(parent windows.Handle, name string) ([]byte, error) {
+	h, err := openRelative(parent, name, windows.FILE_GENERIC_READ|windows.SYNCHRONIZE)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(h)
+	id, err := fileID(h)
+	if err != nil || id.reparse || id.dir {
+		return nil, fmt.Errorf("BLOCKED: relative file is a directory or reparse point")
+	}
+	dup, err := duplicate(h)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(dup), name)
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// ntCallStatus fails closed when the syscall return and IO_STATUS_BLOCK disagree
+// or either one is STATUS_PENDING.
+func ntCallStatus(ret uintptr, ios ioStatusBlock) (uint32, error) {
+	st := uint32(ret)
+	ioSt := uint32(ios.Status)
+	if st == statusPending || ioSt == statusPending {
+		return 0, fmt.Errorf("BLOCKED: NT I/O still pending")
+	}
+	if st != 0 && ioSt != 0 && st != ioSt {
+		return 0, fmt.Errorf("BLOCKED: NT status mismatch return=0x%08X ios=0x%08X", st, ioSt)
+	}
+	if st == 0 {
+		st = ioSt
+	}
+	return st, nil
+}
+
+func ntCreate(parent windows.Handle, name string, access, disposition, options, share uint32) (windows.Handle, error) {
 	if err := procNtCreateFile.Find(); err != nil {
 		return 0, fmt.Errorf("BLOCKED: missing ntdll!NtCreateFile (%v)", err)
 	}
@@ -136,14 +194,21 @@ func openRelative(parent windows.Handle, name string, access uint32) (windows.Ha
 		uintptr(unsafe.Pointer(&ios)),
 		0,
 		0,
-		uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE),
-		fileOpen,
-		fileOpenReparsePoint,
+		uintptr(share),
+		uintptr(disposition),
+		uintptr(options|fileSynchronousNonAlert),
 		0,
 		0,
 	)
-	if int32(r) < 0 {
-		return 0, fmt.Errorf("NtCreateFile status 0x%08X", uint32(r))
+	st, err := ntCallStatus(r, ios)
+	if err != nil {
+		return 0, err
+	}
+	if err := ntCreateStatus(st); err != nil {
+		return 0, err
+	}
+	if h == 0 {
+		return 0, fmt.Errorf("BLOCKED: NtCreateFile returned a zero handle")
 	}
 	return h, nil
 }

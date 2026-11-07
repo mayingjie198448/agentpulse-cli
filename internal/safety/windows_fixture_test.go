@@ -3,7 +3,6 @@
 package safety
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -100,21 +99,9 @@ func setMountPoint(link, target string) error {
 	if err != nil {
 		return err
 	}
-	subst = subst[:len(subst)-1]
-	printName = printName[:len(printName)-1]
-	buf := make([]byte, 16+len(subst)*2+len(printName)*2)
-	binary.LittleEndian.PutUint32(buf[0:], windows.IO_REPARSE_TAG_MOUNT_POINT)
-	binary.LittleEndian.PutUint16(buf[4:], uint16(len(buf)-8))
-	binary.LittleEndian.PutUint16(buf[8:], 0)
-	binary.LittleEndian.PutUint16(buf[10:], uint16(len(subst)*2))
-	binary.LittleEndian.PutUint16(buf[12:], uint16((len(subst)+1)*2))
-	binary.LittleEndian.PutUint16(buf[14:], uint16(len(printName)*2))
-	for i, c := range subst {
-		binary.LittleEndian.PutUint16(buf[16+i*2:], c)
-	}
-	off := 16 + len(subst)*2
-	for i, c := range printName {
-		binary.LittleEndian.PutUint16(buf[off+i*2:], c)
+	buf, err := mountPointReparse(subst, printName)
+	if err != nil {
+		return err
 	}
 	var returned uint32
 	return windows.DeviceIoControl(h, windows.FSCTL_SET_REPARSE_POINT, &buf[0], uint32(len(buf)), nil, 0, &returned, nil)

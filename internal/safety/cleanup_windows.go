@@ -27,7 +27,16 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 	}
 	h, err := openMeta(rec.Root, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|deleteAccess)
 	if err != nil {
-		out.Reason = "open failed; root retained: " + err.Error()
+		if os.IsNotExist(err) {
+			if man, merr := loadManifest(rec.RegistryDir, rec.RunID); merr == nil && man.ProfileCreated && man.Nonce == rec.Nonce && man.ProfileName == rec.ProfileName && man.ProfileName != "" {
+				return recoverProfile(rec.RegistryDir, man)
+			}
+		}
+		if os.IsNotExist(err) {
+			out.Reason = "root already gone and no matching owned profile manifest"
+		} else {
+			out.Reason = "open failed; root retained: " + err.Error()
+		}
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
 	closed := false
@@ -46,7 +55,7 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
 	kpath, err := handlePath(h)
-	if err != nil || !equalFoldPath(kpath, rec.Root) {
+	if err != nil || canonicalWinPath(kpath) != canonicalWinPath(rec.Root) {
 		out.Reason = "kernel path mismatch; root retained"
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
@@ -54,7 +63,7 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		if strings.TrimSpace(home) == "" {
 			continue
 		}
-		if equalFoldPath(home, kpath) || withinPath(kpath, home) {
+		if pathsConflate(home, kpath) || pathsConflate(kpath, home) {
 			out.Reason = "recorded root is the protected home or its parent; root retained"
 			return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 		}
@@ -97,12 +106,29 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		final.Reason = goneErr.Error()
 	}
 	if ferr != nil {
+		if man, merr := loadManifest(rec.RegistryDir, rec.RunID); merr == nil {
+			if gone {
+				man.Phase = "root_deleted"
+			} else {
+				man.Phase = "delete_failed"
+			}
+			_ = saveManifest(rec.RegistryDir, man)
+		}
 		out.Result = "BLOCKED"
 		out.Reason = final.Reason
 		return out, ferr
 	}
 	if rec.RegistryPath != "" {
-		_ = os.Remove(rec.RegistryPath)
+		if err := os.Remove(rec.RegistryPath); err != nil && !os.IsNotExist(err) {
+			out.Result = "BLOCKED"
+			out.Reason = "registry remove failed after delete: " + err.Error()
+			return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
+		}
+	}
+	if err := os.Remove(manifestPath(rec.RegistryDir, rec.RunID)); err != nil && !os.IsNotExist(err) {
+		out.Result = "BLOCKED"
+		out.Reason = "manifest remove failed after delete: " + err.Error()
+		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
 	out.Result = "deleted"
 	out.Targets = []string{rec.Root}

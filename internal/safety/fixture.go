@@ -33,9 +33,13 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
 		return b.String(), fmt.Errorf("%w: %v", ErrRefused, err)
 	}
-	base, err := os.MkdirTemp("", "agentpulse-fixture-")
+	base, own, err := createOwnedFixtureRoot()
 	if err != nil {
 		return b.String(), err
+	}
+	var ownership *CreationRecord
+	if own.Created {
+		ownership = &own
 	}
 	fmt.Fprintf(&b, "fixture_base=%s\n", base)
 	fmt.Fprintf(&b, "side_effect_temp_base=created\n")
@@ -89,14 +93,16 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		AuditPath:      audit,
 		RealHome:       fake,
 		SentinelPath:   sentinel,
-		OwnedRoot:      base,
+		Ownership:      ownership,
 		RetainRoot:     true,
 	}
 	prepared, err := Prepare(ctx, req)
 	if err != nil {
+		noteManifest(&b, req.RegistryDir, nil)
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
 		return b.String(), err
 	}
+	noteManifest(&b, req.RegistryDir, prepared.rec)
 	fmt.Fprintf(&b, "profile_hash=%s\n", prepared.audit.ProfileHash)
 	fmt.Fprintf(&b, "run_root=%s\n", prepared.Root)
 	if err := prepared.Start(); err != nil {
@@ -110,6 +116,10 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	sent, serr := os.ReadFile(sentinel)
 	fmt.Fprintf(&b, "child_status=%s\n", strings.TrimSpace(string(status)))
 	fmt.Fprintf(&b, "child_exit=%v\ncontroller_result=%s\n", out.ChildExit, out.ControllerResult)
+	if err := escapeDenials(string(escape), escapePaths(rels, fake)); err != nil {
+		fmt.Fprintf(&b, "result=FAIL\nescape=%s\nreason=%s\n", escape, err.Error())
+		return b.String(), err
+	}
 	if runtime.GOOS == "windows" && !strings.Contains(string(status), "appcontainer=1") {
 		fmt.Fprintf(&b, "result=FAIL\nappcontainer_not_inherited=true\n")
 		return b.String(), fmt.Errorf("descendant was not in the AppContainer")
@@ -150,4 +160,24 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	fmt.Fprintf(&b, "result=PASS\n")
 	fmt.Fprintf(&b, "native_windows_catalog=%s\n", NativeVerification()["windows_appcontainer_native_fixture"])
 	return b.String(), nil
+}
+
+func escapePaths(rels []string, fake string) []string {
+	out := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		out = append(out, filepath.Join(fake, rel))
+	}
+	return out
+}
+
+func noteManifest(b *strings.Builder, registry string, rec *RunRecord) {
+	fmt.Fprintf(b, "registry_dir=%s\n", registry)
+	if rec != nil {
+		fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nphase=root_ready\nmanifest=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, manifestPath(registry, rec.RunID))
+		return
+	}
+	matches, _ := filepath.Glob(filepath.Join(registry, "*.manifest.json"))
+	for _, m := range matches {
+		fmt.Fprintf(b, "manifest=%s\n", m)
+	}
 }

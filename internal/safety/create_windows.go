@@ -53,15 +53,23 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	if sentID.dir {
 		return RunRecord{}, fmt.Errorf("%w: sentinel is not an existing regular file", ErrSentinelUnusable)
 	}
-	if err := sentinelAllowed(kSent, opts.OwnedRoot); err != nil {
+	if opts.Ownership == nil {
+		opts.Ownership = &CreationRecord{}
+	}
+	if err := bindSentinel(*opts.Ownership, kSent, sentID.volume, sentID.index); err != nil {
 		return RunRecord{}, err
 	}
-	if opts.OwnedRoot != "" {
-		if _, id, err := statNoFollow(opts.OwnedRoot); err != nil || id.reparse || !id.dir {
-			return RunRecord{}, fmt.Errorf("%w: owned fixture root is not an ordinary directory", ErrSentinelUnusable)
+	if opts.Ownership.Created {
+		owned, err := openMeta(opts.Ownership.Path, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES)
+		if err != nil {
+			return RunRecord{}, fmt.Errorf("%w: creation record cannot be reopened", ErrSentinelUnusable)
 		}
-		if protectedPathComponent(opts.OwnedRoot) || !withinPath(os.TempDir(), opts.OwnedRoot) {
-			return RunRecord{}, fmt.Errorf("%w: owned fixture root is not under this run's temp directory", ErrSentinelUnusable)
+		gotID, idErr := fileID(owned)
+		gotPath, pathErr := handlePath(owned)
+		nonceBody, nonceErr := readRelative(owned, ".agentpulse-owned")
+		windows.CloseHandle(owned)
+		if idErr != nil || pathErr != nil || nonceErr != nil || gotID.reparse || !gotID.dir || gotID.volume != opts.Ownership.Volume || gotID.index != opts.Ownership.FileIndex || canonicalWinPath(gotPath) != opts.Ownership.CanonicalRoot || string(nonceBody) != opts.Ownership.Nonce {
+			return RunRecord{}, fmt.Errorf("%w: creation record does not match the open fixture directory", ErrSentinelUnusable)
 		}
 	}
 
@@ -77,15 +85,34 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	if err != nil {
 		return RunRecord{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)
 	}
+	regDir := opts.RegistryDir
+	if regDir == "" {
+		regDir = DefaultRegistryDir()
+	}
+	manifest := RunManifest{
+		RunID: runID, Nonce: nonce, ProfileName: prof.name, PackageSID: prof.sidStr,
+		Phase: "profile_created", ProfileCreated: true, SourceSHA256: opts.ExeHash,
+	}
 	failed := true
 	defer func() {
 		freeSID(prof.sid)
 		if failed {
 			if derr := deleteAppProfile(prof.name); derr != nil {
-				err = fmt.Errorf("%v; profile delete failed: %w", err, derr)
+				manifest.Phase = "delete_failed"
+				_ = os.MkdirAll(regDir, 0700)
+				_ = saveManifest(regDir, manifest)
+				err = fmt.Errorf("%v; profile delete failed: %w; manifest profile=%s sid=%s path=%s", err, derr, prof.name, prof.sidStr, manifestPath(regDir, runID))
+			} else {
+				_ = os.Remove(manifestPath(regDir, runID))
 			}
 		}
 	}()
+	if err := os.MkdirAll(regDir, 0700); err != nil {
+		return RunRecord{}, err
+	}
+	if err := saveManifest(regDir, manifest); err != nil {
+		return RunRecord{}, err
+	}
 
 	rootPath, rootID, err := statNoFollow(prof.folder)
 	if err != nil {
@@ -94,20 +121,37 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	if !rootID.dir {
 		return RunRecord{}, fmt.Errorf("%w: package folder is not a directory", ErrRefused)
 	}
-	if withinPath(rootPath, kSent) || equalFoldPath(rootPath, kSent) {
+	if withinCanonical(rootPath, kSent) || canonicalWinPath(rootPath) == canonicalWinPath(kSent) {
 		return RunRecord{}, fmt.Errorf("%w: sentinel must already exist outside the package folder", ErrSentinelUnusable)
 	}
+	manifest.Root = rootPath
+	manifest.RootDev = rootID.volume
+	manifest.RootIno = rootID.index
+	manifest.Phase = "root_observed"
+	if err := saveManifest(regDir, manifest); err != nil {
+		return RunRecord{}, err
+	}
+	rootHandle, err := openMeta(rootPath, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES)
+	if err != nil {
+		return RunRecord{}, fmt.Errorf("%w: package folder handle: %v", ErrRefused, err)
+	}
+	heldID, heldErr := fileID(rootHandle)
+	if heldErr != nil || heldID.reparse || !heldID.dir || heldID.volume != rootID.volume || heldID.index != rootID.index {
+		windows.CloseHandle(rootHandle)
+		return RunRecord{}, fmt.Errorf("%w: package folder handle is not the folder just observed", ErrRefused)
+	}
 	for _, sub := range []string{"work", "home", "tmp"} {
-		if err := os.MkdirAll(filepath.Join(rootPath, sub), 0700); err != nil {
+		if err := mkdirRelative(rootHandle, sub); err != nil {
+			windows.CloseHandle(rootHandle)
 			return RunRecord{}, err
 		}
 	}
-	copyPath, copyHash, err := copyExeNoFollow(opts.ExePath, rootPath)
+	copyPath, copyHash, err := copyExeNoFollow(opts.ExePath, rootHandle, rootPath, opts.ExeHash)
 	if err != nil {
+		windows.CloseHandle(rootHandle)
 		return RunRecord{}, err
 	}
 	exeHash := copyHash
-	_ = opts.ExeHash
 	ident := profileIdentity{
 		RunID: runID, Root: rootPath, Dev: rootID.volume, Ino: rootID.index,
 		Sentinel: kSent, SentinelDev: sentID.volume, SentinelIno: sentID.index,
@@ -126,23 +170,23 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	}
 	body, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
+		windows.CloseHandle(rootHandle)
 		return RunRecord{}, err
 	}
-	if err := os.WriteFile(filepath.Join(rootPath, markerName), append(body, '\n'), 0600); err != nil {
+	if err := writeRelativeNew(rootHandle, markerName, append(body, '\n')); err != nil {
+		windows.CloseHandle(rootHandle)
 		return RunRecord{}, err
 	}
-	regDir := opts.RegistryDir
-	if regDir == "" {
-		regDir = DefaultRegistryDir()
-	}
-	if err := os.MkdirAll(regDir, 0700); err != nil {
-		return RunRecord{}, err
+	still, stillErr := fileID(rootHandle)
+	windows.CloseHandle(rootHandle)
+	if stillErr != nil || still.volume != rootID.volume || still.index != rootID.index || still.reparse {
+		return RunRecord{}, fmt.Errorf("%w: package folder changed while creating the executable copy", ErrRefused)
 	}
 	regPath, regID, err := statNoFollow(regDir)
 	if err != nil {
 		return RunRecord{}, fmt.Errorf("%w: registry: %v", ErrRefused, err)
 	}
-	if withinPath(rootPath, regPath) || equalFoldPath(rootPath, regPath) || (regID.volume == rootID.volume && regID.index == rootID.index) {
+	if pathsConflate(rootPath, regPath) || (regID.volume == rootID.volume && regID.index == rootID.index) {
 		return RunRecord{}, fmt.Errorf("%w: registry must stay outside the package folder", ErrRefused)
 	}
 	rec.RegistryDir = regDir
@@ -151,11 +195,19 @@ func createRunRoot(opts createOpts) (rec RunRecord, err error) {
 	if err := writeJSON(rec.RegistryPath, rec, 0600); err != nil {
 		return RunRecord{}, err
 	}
+	manifest.Root = rootPath
+	manifest.RootDev = rootID.volume
+	manifest.RootIno = rootID.index
+	manifest.CopySHA256 = copyHash
+	manifest.Phase = "root_ready"
+	if err := saveManifest(regDir, manifest); err != nil {
+		return RunRecord{}, err
+	}
 	failed = false
 	return rec, nil
 }
 
-func copyExeNoFollow(src, packageRoot string) (string, string, error) {
+func copyExeNoFollow(src string, root windows.Handle, rootPath, expected string) (string, string, error) {
 	if strings.TrimSpace(src) == "" {
 		return "", "", fmt.Errorf("BLOCKED: missing executable path")
 	}
@@ -179,21 +231,52 @@ func copyExeNoFollow(src, packageRoot string) (string, string, error) {
 		return "", "", err
 	}
 	sum := sha256.Sum256(body)
-	dest := filepath.Join(packageRoot, "agentpulse-launch.exe")
-	p, err := windows.UTF16PtrFromString(dest)
-	if err != nil {
+	sourceHash := hex.EncodeToString(sum[:])
+	if err := agreeHashes(expected, sourceHash); err != nil {
 		return "", "", err
 	}
-	out, err := windows.CreateFile(p, windows.GENERIC_WRITE, 0, nil, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	out, err := ntCreate(root, "agentpulse-launch.exe", windows.GENERIC_WRITE|windows.SYNCHRONIZE, fileCreate, fileNonDirectoryFile|fileSynchronousNonAlert, 0)
 	if err != nil {
 		return "", "", fmt.Errorf("BLOCKED: cannot create this-run executable copy: %v", err)
 	}
-	defer windows.CloseHandle(out)
 	var wrote uint32
-	if err := windows.WriteFile(out, body, &wrote, nil); err != nil || int(wrote) != len(body) {
-		return "", "", fmt.Errorf("BLOCKED: short executable copy: %v", err)
+	werr := windows.WriteFile(out, body, &wrote, nil)
+	windows.CloseHandle(out)
+	if werr != nil || int(wrote) != len(body) {
+		return "", "", fmt.Errorf("BLOCKED: short executable copy: %v", werr)
 	}
-	return dest, hex.EncodeToString(sum[:]), nil
+	back, err := readRelative(root, "agentpulse-launch.exe")
+	if err != nil {
+		return "", "", fmt.Errorf("BLOCKED: cannot read back the executable copy: %v", err)
+	}
+	again := sha256.Sum256(back)
+	copyHash := hex.EncodeToString(again[:])
+	if err := agreeHashes(sourceHash, copyHash); err != nil {
+		return "", "", err
+	}
+	return copyDest(rootPath), copyHash, nil
+}
+
+func writeRelativeNew(parent windows.Handle, name string, body []byte) error {
+	h, err := ntCreate(parent, name, windows.GENERIC_WRITE|windows.SYNCHRONIZE, fileCreate, fileNonDirectoryFile|fileSynchronousNonAlert, 0)
+	if err != nil {
+		return err
+	}
+	var wrote uint32
+	werr := windows.WriteFile(h, body, &wrote, nil)
+	windows.CloseHandle(h)
+	if werr != nil || int(wrote) != len(body) {
+		return fmt.Errorf("BLOCKED: short relative write: %v", werr)
+	}
+	return nil
+}
+
+func copyDest(rootPath string) string {
+	dest := rootPath
+	if !strings.HasSuffix(dest, `\`) {
+		dest += `\`
+	}
+	return dest + "agentpulse-launch.exe"
 }
 
 func equalFoldPath(a, b string) bool {

@@ -24,11 +24,8 @@ import (
 //
 // Write root: the per-run package folder returned by GetAppContainerFolderPath.
 // Windows creates that folder and its DACL for the new AppContainer SID. This
-// package does not rewrite the user profile, Documents, Desktop, or .ssh DACLs.
-// The only optional DACL edit is a file-only RX ACE on the single executable
-// about to be launched, and only when that file already lives under os.TempDir
-// or the fixture base. The ACE is revoked after the run. If the image is
-// elsewhere and the container cannot read it, launch fails closed.
+// package does not edit any DACL. The launched image is a copy created inside
+// that new folder. If the copy cannot be started, launch fails closed.
 //
 // Not claimed: credential-broker IPC (DPAPI, wincred, ssh-agent), a complete
 // network proof, or junction behavior beyond the reparse-point checks below.

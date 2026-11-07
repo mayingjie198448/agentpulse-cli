@@ -25,6 +25,11 @@ type CleanupOptions struct {
 func CleanupRun(runID string, opts CleanupOptions) (CleanupOutcome, error) {
 	rec, err := loadRegistry(opts.RegistryDir, runID)
 	if err != nil {
+		if man, merr := loadManifest(opts.RegistryDir, runID); merr == nil {
+			out, rerr := recoverProfile(opts.RegistryDir, man)
+			_ = AppendAudit(opts.AuditPath, cleanupAudit(RunRecord{RunID: man.RunID, Root: man.Root, ProfileName: man.ProfileName, Home: ""}, out, opts.RealHome))
+			return out, rerr
+		}
 		out := CleanupOutcome{Result: "BLOCKED", Reason: err.Error()}
 		_ = AppendAudit(opts.AuditPath, cleanupAudit(rec, out, opts.RealHome))
 		return out, err

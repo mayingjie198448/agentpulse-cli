@@ -16,8 +16,8 @@ func verifyAndProbe(cfg reexecCfg) error {
 	if err != nil || self == "" || self != cfg.exeHash {
 		return fmt.Errorf("exe_mismatch")
 	}
-	rootPath, rootID, err := statNoFollow(cfg.runRoot)
-	if err != nil || rootID.reparse || !rootID.dir || rootID.volume != cfg.rootDev || rootID.index != cfg.rootIno || !equalFoldPath(rootPath, cfg.runRoot) {
+	rootPath, rootID, err := statObserve(cfg.runRoot)
+	if err != nil || rootID.reparse || !rootID.dir || rootID.volume != cfg.rootDev || rootID.index != cfg.rootIno || canonicalWinPath(rootPath) != canonicalWinPath(cfg.runRoot) {
 		return fmt.Errorf("root_identity")
 	}
 	if !inAppContainer() {
@@ -27,20 +27,22 @@ func verifyAndProbe(cfg reexecCfg) error {
 		return err
 	}
 	sentPath, sentID, sentErr := statObserve(cfg.sentinel)
-	var before []byte
-	switch {
-	case os.IsNotExist(sentErr):
+	observedOK := sentErr == nil
+	if os.IsNotExist(sentErr) {
 		return fmt.Errorf("sentinel_enoent")
-	case os.IsPermission(sentErr):
-		// The container may not even read metadata. The write probes below
-		// are the denial evidence. Do not grant read access to collect it.
-	case sentErr != nil:
+	}
+	if sentErr != nil && !os.IsPermission(sentErr) {
 		return fmt.Errorf("sentinel_identity")
-	default:
-		if sentID.dir || sentID.reparse || sentID.volume != cfg.sentinelDev || sentID.index != cfg.sentinelIno || !equalFoldPath(sentPath, cfg.sentinel) {
-			return fmt.Errorf("sentinel_identity")
-		}
-		if withinPath(rootPath, sentPath) || equalFoldPath(rootPath, sentPath) {
+	}
+	bound, err := hashSentinelBinding(observedOK,
+		FileBinding{Path: sentPath, Volume: sentID.volume, Index: sentID.index},
+		FileBinding{Path: cfg.sentinel, Volume: cfg.sentinelDev, Index: cfg.sentinelIno})
+	if err != nil {
+		return err
+	}
+	var before []byte
+	if observedOK {
+		if sentID.dir || sentID.reparse || withinCanonical(rootPath, sentPath) || canonicalWinPath(rootPath) == canonicalWinPath(sentPath) {
 			return fmt.Errorf("sentinel_identity")
 		}
 		before, err = os.ReadFile(cfg.sentinel)
@@ -52,8 +54,8 @@ func verifyAndProbe(cfg reexecCfg) error {
 		}
 	}
 	got := profileHash(profileIdentity{
-		RunID: cfg.runID, Root: rootPath, Dev: rootID.volume, Ino: rootID.index,
-		Sentinel: sentPath, SentinelDev: sentID.volume, SentinelIno: sentID.index,
+		RunID: cfg.runID, Root: cfg.runRoot, Dev: rootID.volume, Ino: rootID.index,
+		Sentinel: bound.Path, SentinelDev: bound.Volume, SentinelIno: bound.Index,
 		ProfileName: cfg.profileName, PackageSID: cfg.packageSID, CapabilityCount: cfg.capCount,
 	})
 	if got != cfg.profileHash {

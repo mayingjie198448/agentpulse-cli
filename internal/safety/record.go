@@ -53,9 +53,8 @@ type createOpts struct {
 	Sentinel    string
 	ExeHash     string
 	ExePath     string
-	// OwnedRoot is a directory this run created, named agentpulse-fixture-*.
-	// Protected sentinel names are allowed only inside that directory.
-	OwnedRoot string
+	// Ownership is set only by mintCreation after this process creates the directory.
+	Ownership *CreationRecord
 }
 
 type profileIdentity struct {

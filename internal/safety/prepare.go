@@ -44,9 +44,9 @@ type Request struct {
 	// RetainRoot keeps a verified run root so a test can read project files
 	// before CleanupRun. Production leaves this false.
 	RetainRoot bool
-	// OwnedRoot is the fixture directory this call created. Protected
-	// sentinel names are refused outside it.
-	OwnedRoot string
+	// Ownership is the creation record for a fixture directory. A path string
+	// or a name prefix is not accepted in its place.
+	Ownership *CreationRecord
 }
 
 // Prepared is a command that has not been started.
@@ -168,7 +168,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		Sentinel:    req.SentinelPath,
 		ExeHash:     exeHash,
 		ExePath:     self,
-		OwnedRoot:   req.OwnedRoot,
+		Ownership:   req.Ownership,
 	})
 	if err != nil {
 		ev := refusedAudit(userArgv, auth, req, backend.Name(), err.Error())
@@ -190,7 +190,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 	if auditPath == "" {
 		auditPath = DefaultAuditPath()
 	}
-	if withinPath(rec.Root, auditPath) {
+	if pathsConflate(rec.Root, auditPath) {
 		_, _ = deleteOwned(rec, protectedHomes(req.RealHome))
 		return nil, fmt.Errorf("%w: audit path is inside the run root", ErrRefused)
 	}
@@ -248,7 +248,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 			RealHome:         firstNonEmpty(req.RealHome, RealHome()),
 			TestHome:         rec.Home,
 			RunRoot:          rec.Root,
-			ExeSHA256:        exeHash,
+			ExeSHA256:        claimedExe,
 			ProfileHash:      rec.ProfileHash,
 			IsolationBackend: backend.Name(),
 			IsolationDetail:  detail,
@@ -412,6 +412,14 @@ func (p *Prepared) Wait() (Outcome, error) {
 	p.audit.ControllerResult = "isolated"
 	p.audit.IsolationApplied = true
 	p.audit.FSWrite = "verified"
+	if errors.Is(waitErr, ErrDescendantsActive) {
+		p.audit.ControllerResult = "BLOCKED"
+		p.audit.CleanupResult = "BLOCKED"
+		p.audit.CleanupReason = waitErr.Error()
+		_ = AppendAudit(p.auditPath(), p.audit)
+		out.ControllerResult = p.audit.ControllerResult
+		return out, waitErr
+	}
 	if p.rec != nil && !p.retainRoot {
 		cout, cerr := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
 		out.Cleanup = cout

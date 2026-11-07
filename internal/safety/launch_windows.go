@@ -88,6 +88,14 @@ func startAppContainer(p *Prepared) error {
 		return err
 	}
 	closers := []func(){closeIn, closeOut, closeErr}
+	started := false
+	defer func() {
+		if !started {
+			for _, c := range closers {
+				c()
+			}
+		}
+	}()
 
 	var listSize uintptr
 	_, _, _ = procInitializeProcThreadAttributeList.Call(0, 2, 0, uintptr(unsafe.Pointer(&listSize)))
@@ -131,9 +139,6 @@ func startAppContainer(p *Prepared) error {
 		0, 0,
 	)
 	if r == 0 {
-		for _, c := range closers {
-			c()
-		}
 		return fmt.Errorf("BLOCKED: UpdateProcThreadAttribute HANDLE_LIST: %v", callErr)
 	}
 
@@ -168,9 +173,6 @@ func startAppContainer(p *Prepared) error {
 		env, dir, &si.StartupInfo, &pi,
 	)
 	if err != nil {
-		for _, c := range closers {
-			c()
-		}
 		if err == windows.ERROR_ACCESS_DENIED {
 			return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: %v", err)
 		}
@@ -178,72 +180,61 @@ func startAppContainer(p *Prepared) error {
 	}
 	proc, err := os.FindProcess(int(pi.ProcessId))
 	if err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c()
-		}
+		abandonLaunch(pi.Thread, pi.Process, 0)
 		return err
 	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c()
-		}
+		abandonLaunch(pi.Thread, pi.Process, 0)
 		return fmt.Errorf("BLOCKED: CreateJobObject: %v", err)
 	}
 	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		_ = windows.CloseHandle(job)
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c()
-		}
+		abandonLaunch(pi.Thread, pi.Process, job)
 		return fmt.Errorf("BLOCKED: job lifecycle limit: %v", err)
 	}
 	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
-		_ = windows.CloseHandle(job)
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c()
-		}
+		abandonLaunch(pi.Thread, pi.Process, job)
 		return fmt.Errorf("BLOCKED: AssignProcessToJobObject: %v", err)
 	}
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
-		_ = windows.CloseHandle(pi.Thread)
-		_ = windows.TerminateJobObject(job, 1)
-		_ = windows.CloseHandle(job)
-		_ = windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c()
-		}
+		abandonLaunch(pi.Thread, pi.Process, job)
 		return fmt.Errorf("BLOCKED: ResumeThread: %v", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
 	p.pid = int(pi.ProcessId)
 	stop := make(chan struct{})
-	if p.ctx != nil {
-		go func() {
-			select {
-			case <-p.ctx.Done():
-				_ = windows.TerminateJobObject(job, 1)
-			case <-stop:
-			}
-		}()
-	}
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		select {
+		case <-stop:
+		case <-waitCtx(p):
+			_ = windows.TerminateJobObject(job, 1)
+		}
+	}()
 	p.waitFn = func() error {
-		defer close(stop)
-		defer windows.CloseHandle(job)
-		defer windows.CloseHandle(pi.Process)
+		close(stop)
+		<-joined
+		state, waitErr := proc.Wait()
+		active, qerr := jobActiveProcesses(job)
+		if qerr != nil || active != 0 {
+			_ = windows.TerminateJobObject(job, 1)
+			windows.WaitForSingleObject(pi.Process, 2000)
+			active, qerr = jobActiveProcesses(job)
+		}
+		if qerr != nil || active != 0 {
+			return fmt.Errorf("%w: active=%d query=%v", ErrDescendantsActive, active, qerr)
+		}
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(job)
 		for _, c := range closers {
 			c()
 		}
-		state, waitErr := proc.Wait()
+		if err := cleanupAllowed(Lifecycle{HelperExited: true, CancelJoined: true, HandlesReleased: true, ActiveProcesses: active}); err != nil {
+			return err
+		}
 		code := 0
 		if state != nil {
 			code = state.ExitCode()
@@ -253,7 +244,53 @@ func startAppContainer(p *Prepared) error {
 	p.killFn = func() error {
 		return windows.TerminateJobObject(job, 1)
 	}
+	started = true
 	return nil
+}
+
+func waitCtx(p *Prepared) <-chan struct{} {
+	if p.ctx == nil {
+		return nil
+	}
+	return p.ctx.Done()
+}
+
+func abandonLaunch(thread, process, job windows.Handle) {
+	if job != 0 {
+		_ = windows.TerminateJobObject(job, 1)
+	} else if process != 0 {
+		_ = windows.TerminateProcess(process, 1)
+	}
+	if process != 0 {
+		_, _ = windows.WaitForSingleObject(process, 2000)
+		_ = windows.CloseHandle(process)
+	}
+	if thread != 0 {
+		_ = windows.CloseHandle(thread)
+	}
+	if job != 0 {
+		_ = windows.CloseHandle(job)
+	}
+}
+
+func jobActiveProcesses(job windows.Handle) (int, error) {
+	var info jobBasicAccounting
+	err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil)
+	if err != nil {
+		return -1, err
+	}
+	return int(info.ActiveProcesses), nil
+}
+
+type jobBasicAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
 }
 
 func inheritReader(r io.Reader) (windows.Handle, func(), error) {
