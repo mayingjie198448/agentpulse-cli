@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -19,25 +20,36 @@ func verifyAndProbe(cfg reexecCfg) error {
 	if err != nil || rootID.reparse || !rootID.dir || rootID.volume != cfg.rootDev || rootID.index != cfg.rootIno || !equalFoldPath(rootPath, cfg.runRoot) {
 		return fmt.Errorf("root_identity")
 	}
-	sentPath, sentID, err := statNoFollow(cfg.sentinel)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("sentinel_enoent")
+	if !inAppContainer() {
+		return fmt.Errorf("not_appcontainer")
+	}
+	if err := tokenPackageMatches(cfg.packageSID); err != nil {
+		return err
+	}
+	sentPath, sentID, sentErr := statObserve(cfg.sentinel)
+	var before []byte
+	switch {
+	case os.IsNotExist(sentErr):
+		return fmt.Errorf("sentinel_enoent")
+	case os.IsPermission(sentErr):
+		// The container may not even read metadata. The write probes below
+		// are the denial evidence. Do not grant read access to collect it.
+	case sentErr != nil:
+		return fmt.Errorf("sentinel_identity")
+	default:
+		if sentID.dir || sentID.reparse || sentID.volume != cfg.sentinelDev || sentID.index != cfg.sentinelIno || !equalFoldPath(sentPath, cfg.sentinel) {
+			return fmt.Errorf("sentinel_identity")
 		}
-		return fmt.Errorf("sentinel_identity")
-	}
-	if sentID.dir || sentID.reparse || sentID.volume != cfg.sentinelDev || sentID.index != cfg.sentinelIno || !equalFoldPath(sentPath, cfg.sentinel) {
-		return fmt.Errorf("sentinel_identity")
-	}
-	if withinPath(rootPath, sentPath) || equalFoldPath(rootPath, sentPath) {
-		return fmt.Errorf("sentinel_identity")
-	}
-	before, err := os.ReadFile(cfg.sentinel)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("sentinel_enoent")
+		if withinPath(rootPath, sentPath) || equalFoldPath(rootPath, sentPath) {
+			return fmt.Errorf("sentinel_identity")
 		}
-		return fmt.Errorf("sentinel_identity")
+		before, err = os.ReadFile(cfg.sentinel)
+		if err != nil && !os.IsPermission(err) {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("sentinel_enoent")
+			}
+			return fmt.Errorf("sentinel_identity")
+		}
 	}
 	got := profileHash(profileIdentity{
 		RunID: cfg.runID, Root: rootPath, Dev: rootID.volume, Ino: rootID.index,
@@ -57,33 +69,26 @@ func verifyAndProbe(cfg reexecCfg) error {
 }
 
 func probeSentinelWindows(path string, before []byte) error {
-	err := os.WriteFile(path, []byte("hacked-by-probe\n"), 0600)
-	if err == nil {
-		return fmt.Errorf("sentinel_not_denied")
+	writeErr := os.WriteFile(path, []byte("hacked-by-probe\n"), 0600)
+	if err := requireAccessDenied(writeErr); err != nil {
+		return err
 	}
-	if os.IsNotExist(err) {
-		return fmt.Errorf("sentinel_enoent")
+	removeErr := os.Remove(path)
+	if err := requireAccessDenied(removeErr); err != nil {
+		return err
 	}
-	if !os.IsPermission(err) {
-		return fmt.Errorf("sentinel_not_denied")
+	createErr := os.WriteFile(path+".child-created", []byte("x"), 0600)
+	if err := requireAccessDenied(createErr); err != nil {
+		return err
 	}
-	if err := os.Remove(path); err == nil || os.IsNotExist(err) {
-		return fmt.Errorf("sentinel_not_denied")
-	}
-	if !os.IsPermission(err) {
-		return fmt.Errorf("sentinel_not_denied")
-	}
-	if err := os.WriteFile(path+".child-created", []byte("x"), 0600); err == nil {
-		return fmt.Errorf("sentinel_not_denied")
-	}
-	if os.IsNotExist(err) {
-		return fmt.Errorf("sentinel_enoent")
-	}
-	if !os.IsPermission(err) {
-		return fmt.Errorf("sentinel_not_denied")
+	if before == nil {
+		return nil
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsPermission(err) {
+			return nil
+		}
 		if os.IsNotExist(err) {
 			return fmt.Errorf("sentinel_enoent")
 		}
@@ -91,6 +96,50 @@ func probeSentinelWindows(path string, before []byte) error {
 	}
 	if string(after) != string(before) {
 		return fmt.Errorf("sentinel_changed")
+	}
+	return nil
+}
+
+func statObserve(path string) (string, winFileID, error) {
+	if err := pathShapeError(path); err != nil {
+		return "", winFileID{}, err
+	}
+	h, err := openMeta(path, windows.FILE_READ_ATTRIBUTES)
+	if err != nil {
+		return "", winFileID{}, err
+	}
+	defer windows.CloseHandle(h)
+	id, err := fileID(h)
+	if err != nil {
+		return "", winFileID{}, err
+	}
+	if id.reparse {
+		return "", id, fmt.Errorf("%w: reparse point", ErrCleanupBlocked)
+	}
+	kpath, err := handlePath(h)
+	return kpath, id, err
+}
+
+func tokenPackageMatches(want string) error {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
+		return fmt.Errorf("token_query_failed")
+	}
+	defer token.Close()
+	var n uint32
+	// TokenAppContainerSid = 31. A failure here is not treated as a match.
+	err := windows.GetTokenInformation(token, 31, nil, 0, &n)
+	if err != nil && n == 0 {
+		return fmt.Errorf("token_query_failed")
+	}
+	buf := make([]byte, n)
+	if err := windows.GetTokenInformation(token, 31, &buf[0], uint32(len(buf)), &n); err != nil {
+		return fmt.Errorf("token_query_failed")
+	}
+	sid := *(**windows.SID)(unsafe.Pointer(&buf[0]))
+	got, err := sidString(sid)
+	if err != nil || got == "" || got != want {
+		return fmt.Errorf("package_sid_mismatch")
 	}
 	return nil
 }

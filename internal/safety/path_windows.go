@@ -4,7 +4,6 @@ package safety
 
 import (
 	"fmt"
-	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -84,15 +83,4 @@ func statNoFollow(path string) (string, winFileID, error) {
 		return "", id, err
 	}
 	return kpath, id, nil
-}
-
-func protectedComponent(path string) bool {
-	for _, part := range splitPath(path) {
-		switch strings.ToLower(part) {
-		case ".ssh", ".config", "documents", "desktop", "downloads", "onedrive",
-			"cloudstorage", "keychains", "cookies", "dpapi":
-			return true
-		}
-	}
-	return false
 }

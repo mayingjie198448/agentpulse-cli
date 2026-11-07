@@ -53,6 +53,9 @@ type createOpts struct {
 	Sentinel    string
 	ExeHash     string
 	ExePath     string
+	// OwnedRoot is a directory this run created, named agentpulse-fixture-*.
+	// Protected sentinel names are allowed only inside that directory.
+	OwnedRoot string
 }
 
 type profileIdentity struct {

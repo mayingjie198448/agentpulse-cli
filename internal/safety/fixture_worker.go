@@ -24,7 +24,7 @@ func MaybeFixtureWorker(args []string) {
 func FixtureWorker(args []string) int {
 	exitCode := 0
 	projectRel := filepath.Join("project", "result.txt")
-	var escape string
+	var escapes []string
 	for i := 0; i < len(args); i++ {
 		if i+1 >= len(args) {
 			return 2
@@ -35,7 +35,9 @@ func FixtureWorker(args []string) int {
 			projectRel = args[i]
 		case "--escape":
 			i++
-			escape = args[i]
+			escapes = append(escapes, args[i])
+		case "--mqtt-password":
+			i++
 		case "--exit":
 			i++
 			n, err := strconv.Atoi(args[i])
@@ -72,11 +74,14 @@ func FixtureWorker(args []string) int {
 	if err := os.WriteFile("status.txt", []byte(status.String()), 0600); err != nil {
 		return 52
 	}
-	if escape != "" {
-		writeErr := os.WriteFile(escape, []byte("hacked"), 0600)
-		removeErr := os.Remove(escape)
-		msg := fmt.Sprintf("write=%s\nremove=%s\n", errnoClass(writeErr), errnoClass(removeErr))
-		if err := os.WriteFile("escape.txt", []byte(msg), 0600); err != nil {
+	if len(escapes) > 0 {
+		var msg strings.Builder
+		for _, escape := range escapes {
+			writeErr := os.WriteFile(escape, []byte("hacked"), 0600)
+			removeErr := os.Remove(escape)
+			fmt.Fprintf(&msg, "path=%s\nwrite=%s\nremove=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr))
+		}
+		if err := os.WriteFile("escape.txt", []byte(msg.String()), 0600); err != nil {
 			return 53
 		}
 	}

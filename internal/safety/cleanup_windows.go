@@ -5,8 +5,8 @@ package safety
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -21,7 +21,7 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		out.Reason = err.Error()
 		return out, err
 	}
-	if protectedComponent(rec.Root) {
+	if protectedPathComponent(rec.Root) {
 		out.Reason = "recorded root names a protected user directory; root retained"
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
@@ -30,7 +30,12 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		out.Reason = "open failed; root retained: " + err.Error()
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
-	defer windows.CloseHandle(h)
+	closed := false
+	defer func() {
+		if !closed {
+			windows.CloseHandle(h)
+		}
+	}()
 	id, err := fileID(h)
 	if err != nil {
 		out.Reason = "file identity unreadable; root retained"
@@ -59,12 +64,12 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 			return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 		}
 	}
-	marker, err := readMarkerFile(filepath.Join(kpath, markerName))
+	marker, err := readMarkerHandle(h)
 	if err != nil || marker.RunID != rec.RunID || marker.Nonce != rec.Nonce || marker.Dev != rec.Dev || marker.Ino != rec.Ino {
 		out.Reason = "marker missing or mismatched; root retained"
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
-	if err := deleteChildren(kpath, 0); err != nil {
+	if err := deleteChildrenHandle(h, 0); err != nil {
 		out.Reason = "delete aborted; root retained: " + err.Error()
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
@@ -78,13 +83,23 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		out.Reason = "disposition delete failed; root retained: " + err.Error()
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
-	if rec.ProfileName != "" {
-		if err := deleteAppProfile(rec.ProfileName); err != nil {
-			out.Reason = "directory disposition requested; profile delete: " + err.Error()
-		}
+	windows.CloseHandle(h)
+	closed = true
+	gone, goneErr := rootIsGone(kpath, rec.Dev, rec.Ino)
+	var profileErr error
+	if rec.ProfileName != "" && gone {
+		profileErr = deleteAppProfile(rec.ProfileName)
 	}
-	if rec.ExePath != "" && rec.PackageSID != "" {
-		_ = revokeExeACE(rec.ExePath, rec.PackageSID)
+	final, ferr := finalizeDelete(gone && goneErr == nil, profileErr)
+	if goneErr != nil && ferr == nil {
+		ferr = goneErr
+		final.Result = "BLOCKED"
+		final.Reason = goneErr.Error()
+	}
+	if ferr != nil {
+		out.Result = "BLOCKED"
+		out.Reason = final.Reason
+		return out, ferr
 	}
 	if rec.RegistryPath != "" {
 		_ = os.Remove(rec.RegistryPath)
@@ -94,12 +109,37 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 	return out, nil
 }
 
-func readMarkerFile(path string) (RunRecord, error) {
+func rootIsGone(path string, volume, index uint64) (bool, error) {
 	_, id, err := statNoFollow(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if id.volume == volume && id.index == index {
+		return false, nil
+	}
+	return false, fmt.Errorf("path was replaced; replacement retained")
+}
+
+func readMarkerHandle(dir windows.Handle) (RunRecord, error) {
+	h, err := openRelative(dir, markerName, windows.FILE_GENERIC_READ|deleteAccess)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	defer windows.CloseHandle(h)
+	id, err := fileID(h)
 	if err != nil || id.reparse || id.dir {
 		return RunRecord{}, fmt.Errorf("marker is not a regular file")
 	}
-	b, err := os.ReadFile(path)
+	dup, err := duplicate(h)
+	if err != nil {
+		return RunRecord{}, err
+	}
+	f := os.NewFile(uintptr(dup), "marker")
+	defer f.Close()
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -110,64 +150,64 @@ func readMarkerFile(path string) (RunRecord, error) {
 	return rec, nil
 }
 
-func deleteChildren(dir string, depth int) error {
+func deleteChildrenHandle(dir windows.Handle, depth int) error {
 	if depth > 64 {
 		return fmt.Errorf("directory depth exceeded")
 	}
-	pattern := dir + `\*`
-	p, err := windows.UTF16PtrFromString(pattern)
+	names, err := listHandleNames(dir)
 	if err != nil {
 		return err
 	}
-	var data windows.Win32finddata
-	find, err := windows.FindFirstFile(p, &data)
-	if err != nil {
-		return err
-	}
-	defer windows.FindClose(find)
-	for {
-		name := windows.UTF16ToString(data.FileName[:])
-		if name != "." && name != ".." && name != "" {
-			child := dir + `\` + name
-			reparse := data.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0
-			isDir := data.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
-			if reparse {
-				if err := dispositionPath(child); err != nil {
-					return err
-				}
-			} else if isDir {
-				if err := deleteChildren(child, depth+1); err != nil {
-					return err
-				}
-				if err := dispositionPath(child); err != nil {
-					return err
-				}
-			} else if err := dispositionPath(child); err != nil {
+	for _, name := range names {
+		child, err := openRelative(dir, name, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|deleteAccess)
+		if err != nil {
+			return err
+		}
+		id, err := fileID(child)
+		if err != nil {
+			windows.CloseHandle(child)
+			return err
+		}
+		if id.reparse {
+			err = dispositionHandle(child)
+			windows.CloseHandle(child)
+			if err != nil {
 				return err
 			}
+			continue
 		}
-		if err := windows.FindNextFile(find, &data); err != nil {
-			if err == windows.ERROR_NO_MORE_FILES {
-				return nil
+		if id.dir {
+			err = deleteChildrenHandle(child, depth+1)
+			if err == nil {
+				id2, ferr := fileID(child)
+				if ferr != nil || id2.reparse || id2.volume != id.volume || id2.index != id.index {
+					err = fmt.Errorf("child directory changed during delete")
+				} else {
+					err = dispositionHandle(child)
+				}
 			}
+			windows.CloseHandle(child)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		err = dispositionHandle(child)
+		windows.CloseHandle(child)
+		if err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
-func dispositionPath(path string) error {
-	h, err := openMeta(path, deleteAccess|windows.FILE_READ_ATTRIBUTES)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(h)
-	id, err := fileID(h)
-	if err != nil {
-		return err
-	}
-	if id.reparse {
-		// The handle names the reparse node itself, not its target.
-	}
+func dispositionHandle(h windows.Handle) error {
 	flag := byte(1)
 	return windows.SetFileInformationByHandle(h, windows.FileDispositionInfo, &flag, 1)
+}
+
+func duplicate(h windows.Handle) (windows.Handle, error) {
+	var out windows.Handle
+	err := windows.DuplicateHandle(windows.CurrentProcess(), h, windows.CurrentProcess(), &out, 0, false, windows.DUPLICATE_SAME_ACCESS)
+	return out, err
 }

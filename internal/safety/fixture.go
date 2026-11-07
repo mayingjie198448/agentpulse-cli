@@ -37,6 +37,19 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	if err != nil {
 		return b.String(), err
 	}
+	fmt.Fprintf(&b, "fixture_base=%s\n", base)
+	fmt.Fprintf(&b, "side_effect_temp_base=created\n")
+	fmt.Fprintf(&b, "side_effect_profile=created_only_if_prepare_reaches_appcontainer\n")
+	fmt.Fprintf(&b, "side_effect_exe_acl=none\n")
+	prevPass, hadPass := os.LookupEnv("MQTT_PASSWORD")
+	_ = os.Setenv("MQTT_PASSWORD", "s3cr3t-mqtt-password")
+	defer func() {
+		if hadPass {
+			_ = os.Setenv("MQTT_PASSWORD", prevPass)
+		} else {
+			_ = os.Unsetenv("MQTT_PASSWORD")
+		}
+	}()
 	fake := filepath.Join(base, "fake-home")
 	rels := []string{
 		filepath.Join(".ssh", "id_ed25519"),
@@ -64,19 +77,21 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	}
 	hash, _ := exeSHA256()
 	fmt.Fprintf(&b, "exe_sha256=%s\n", hash)
+	argv := []string{exe, FixtureWorkerArg, "--mqtt-password", "s3cr3t-mqtt-password", "--exit", "0"}
+	for _, rel := range rels {
+		argv = append(argv, "--escape", filepath.Join(fake, rel))
+	}
 	req := Request{
-		Argv:           []string{exe, FixtureWorkerArg, "--escape", sentinel, "--exit", "0", "--mqtt-password", "s3cr3t-mqtt-password"},
+		Argv:           argv,
 		ExplicitDanger: true,
 		BaseDir:        filepath.Join(base, "runs"),
 		RegistryDir:    filepath.Join(base, "registry"),
 		AuditPath:      audit,
 		RealHome:       fake,
 		SentinelPath:   sentinel,
+		OwnedRoot:      base,
 		RetainRoot:     true,
 	}
-	// The worker does not understand --mqtt-password. Keep the secret out of
-	// its argv; the audit redact test covers argv. The env var is the leak check.
-	req.Argv = []string{exe, FixtureWorkerArg, "--escape", sentinel, "--exit", "0"}
 	prepared, err := Prepare(ctx, req)
 	if err != nil {
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
@@ -99,6 +114,10 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		fmt.Fprintf(&b, "result=FAIL\nappcontainer_not_inherited=true\n")
 		return b.String(), fmt.Errorf("descendant was not in the AppContainer")
 	}
+	if !strings.Contains(string(status), "mqtt_password_set=false") || !strings.Contains(string(escape), "remove=eperm") || strings.Count(string(escape), "write=eperm") < len(rels) {
+		fmt.Fprintf(&b, "result=FAIL\nstatus=%s\nescape=%s\n", status, escape)
+		return b.String(), fmt.Errorf("fixture did not record per-path denial or stripped secret")
+	}
 	if waitErr != nil || rerr != nil || string(project) != "wrote-ok\n" || serr != nil || string(sent) != "sentinel-v1\n" || !strings.Contains(string(escape), "write=eperm") {
 		fmt.Fprintf(&b, "result=FAIL\nwait=%v\nproject=%q\nescape=%s\nsentinel=%q\n", waitErr, project, escape, sent)
 		return b.String(), fmt.Errorf("fixture failed: wait=%v project=%v sentinel=%v", waitErr, rerr, serr)
@@ -112,7 +131,7 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	}
 	cout, cerr := CleanupRun(prepared.RunID, CleanupOptions{RegistryDir: req.RegistryDir, AuditPath: audit, RealHome: fake})
 	auditBody, _ := os.ReadFile(audit)
-	if strings.Contains(string(auditBody), "s3cr3t-mqtt-password") {
+	if strings.Contains(string(auditBody), "s3cr3t-mqtt-password") || !strings.Contains(string(auditBody), "[REDACTED]") {
 		fmt.Fprintf(&b, "result=FAIL\naudit_leaked_secret=true\n")
 		return b.String(), fmt.Errorf("audit leaked a secret")
 	}

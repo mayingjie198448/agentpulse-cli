@@ -44,6 +44,9 @@ type Request struct {
 	// RetainRoot keeps a verified run root so a test can read project files
 	// before CleanupRun. Production leaves this false.
 	RetainRoot bool
+	// OwnedRoot is the fixture directory this call created. Protected
+	// sentinel names are refused outside it.
+	OwnedRoot string
 }
 
 // Prepared is a command that has not been started.
@@ -165,6 +168,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		Sentinel:    req.SentinelPath,
 		ExeHash:     exeHash,
 		ExePath:     self,
+		OwnedRoot:   req.OwnedRoot,
 	})
 	if err != nil {
 		ev := refusedAudit(userArgv, auth, req, backend.Name(), err.Error())
@@ -176,6 +180,9 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		claimedProfile = req.ProfileHashOverride
 	}
 	claimedExe := exeHash
+	if rec.ExeSHA256 != "" {
+		claimedExe = rec.ExeSHA256
+	}
 	if req.ExeHashOverride != "" {
 		claimedExe = req.ExeHashOverride
 	}
@@ -432,10 +439,13 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 	p.audit.ExitCode = ExitRefused
 	p.audit.ChildExit = nil
 	if p.rec != nil {
-		cout, _ := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
+		cout, cerr := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
 		p.audit.CleanupResult = cout.Result
 		p.audit.CleanupReason = cout.Reason
 		p.audit.CleanupTargets = cout.Targets
+		if cerr != nil && p.audit.CleanupReason == "" {
+			p.audit.CleanupReason = cerr.Error()
+		}
 		if cout.Result != "deleted" {
 			p.audit.CleanupResult = "BLOCKED"
 		}
@@ -475,6 +485,10 @@ func exitCodeOf(err error) (int, bool) {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		return ee.ExitCode(), true
+	}
+	var coded interface{ ExitCode() int }
+	if errors.As(err, &coded) {
+		return coded.ExitCode(), true
 	}
 	return 0, false
 }

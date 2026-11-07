@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"unsafe"
@@ -31,8 +30,21 @@ func configureConfinedLaunch(p *Prepared) error {
 		p.Cmd.Args = insertBeforeSeparator(p.Cmd.Args, []string{"--confirm-handle", fmt.Sprintf("%d", p.confirmW.Fd())})
 	}
 	p.Cmd.ExtraFiles = nil
+	if p.rec.ExePath != "" {
+		original := p.Cmd.Path
+		p.Cmd.Path = p.rec.ExePath
+		if len(p.Cmd.Args) > 0 {
+			p.Cmd.Args[0] = p.rec.ExePath
+		}
+		for i, a := range p.Cmd.Args {
+			if a == "--" && i+1 < len(p.Cmd.Args) && strings.EqualFold(p.Cmd.Args[i+1], original) {
+				p.Cmd.Args[i+1] = p.rec.ExePath
+				break
+			}
+		}
+	}
 	p.audit.IsolationBackend = "windows-appcontainer"
-	p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; no internetClient capability; no home DACL rewrite; credential broker IPC BLOCKED; cross-compile is not a native pass"
+	p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; this-run executable copy only; no DACL edits; no internetClient capability; credential broker IPC BLOCKED; cross-compile is not a native pass"
 	p.audit.Network = "no_internetClient_capability"
 	p.startFn = func() error { return startAppContainer(p) }
 	return nil
@@ -60,13 +72,6 @@ func startAppContainer(p *Prepared) error {
 		return err
 	}
 	defer freeSID(sid)
-	revoke, err := grantExeIfAllowed(p.Cmd.Path, p.rec.Root, sid)
-	if err != nil {
-		return err
-	}
-	if revoke != nil {
-		defer revoke()
-	}
 	stdin, closeIn, err := inheritReader(p.Cmd.Stdin)
 	if err != nil {
 		return err
@@ -159,7 +164,7 @@ func startAppContainer(p *Prepared) error {
 	var pi windows.ProcessInformation
 	err = windows.CreateProcess(
 		app, cmdLine, nil, nil, true,
-		extendedStartupInfoPresent|createUnicodeEnvironment,
+		extendedStartupInfoPresent|createUnicodeEnvironment|windows.CREATE_SUSPENDED,
 		env, dir, &si.StartupInfo, &pi,
 	)
 	if err != nil {
@@ -171,7 +176,6 @@ func startAppContainer(p *Prepared) error {
 		}
 		return fmt.Errorf("BLOCKED: CreateProcess AppContainer: %v", err)
 	}
-	_ = windows.CloseHandle(pi.Thread)
 	proc, err := os.FindProcess(int(pi.ProcessId))
 	if err != nil {
 		_ = windows.TerminateProcess(pi.Process, 1)
@@ -181,79 +185,73 @@ func startAppContainer(p *Prepared) error {
 		}
 		return err
 	}
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Process)
+		for _, c := range closers {
+			c()
+		}
+		return fmt.Errorf("BLOCKED: CreateJobObject: %v", err)
+	}
+	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		_ = windows.CloseHandle(job)
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Process)
+		for _, c := range closers {
+			c()
+		}
+		return fmt.Errorf("BLOCKED: job lifecycle limit: %v", err)
+	}
+	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
+		_ = windows.CloseHandle(job)
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Process)
+		for _, c := range closers {
+			c()
+		}
+		return fmt.Errorf("BLOCKED: AssignProcessToJobObject: %v", err)
+	}
+	if _, err := windows.ResumeThread(pi.Thread); err != nil {
+		_ = windows.CloseHandle(pi.Thread)
+		_ = windows.TerminateJobObject(job, 1)
+		_ = windows.CloseHandle(job)
+		_ = windows.CloseHandle(pi.Process)
+		for _, c := range closers {
+			c()
+		}
+		return fmt.Errorf("BLOCKED: ResumeThread: %v", err)
+	}
+	_ = windows.CloseHandle(pi.Thread)
 	p.pid = int(pi.ProcessId)
+	stop := make(chan struct{})
+	if p.ctx != nil {
+		go func() {
+			select {
+			case <-p.ctx.Done():
+				_ = windows.TerminateJobObject(job, 1)
+			case <-stop:
+			}
+		}()
+	}
 	p.waitFn = func() error {
+		defer close(stop)
+		defer windows.CloseHandle(job)
 		defer windows.CloseHandle(pi.Process)
 		for _, c := range closers {
 			c()
 		}
-		_, err := proc.Wait()
-		return err
+		state, waitErr := proc.Wait()
+		code := 0
+		if state != nil {
+			code = state.ExitCode()
+		}
+		return exitFromWait(code, waitErr)
 	}
 	p.killFn = func() error {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		return nil
-	}
-	return nil
-}
-
-func grantExeIfAllowed(exe, packageRoot string, sid *windows.SID) (func(), error) {
-	if exe == "" || sid == nil {
-		return nil, nil
-	}
-	clean := filepath.Clean(exe)
-	temp := filepath.Clean(os.TempDir())
-	allowed := strings.EqualFold(clean, temp) || withinPath(temp, clean) || withinPath(packageRoot, clean)
-	if !allowed || protectedComponent(clean) {
-		return nil, nil
-	}
-	info, err := os.Stat(clean)
-	if err != nil || info.IsDir() {
-		return nil, fmt.Errorf("BLOCKED: executable ACE target is not a file")
-	}
-	if err := addFileACE(clean, sid, windows.FILE_GENERIC_READ|windows.FILE_GENERIC_EXECUTE, windows.GRANT_ACCESS, windows.NO_INHERITANCE); err != nil {
-		return nil, fmt.Errorf("BLOCKED: cannot grant the AppContainer SID read/execute on the fixture executable only: %v", err)
-	}
-	return func() {
-		_ = addFileACE(clean, sid, 0, windows.REVOKE_ACCESS, windows.NO_INHERITANCE)
-	}, nil
-}
-
-func addFileACE(path string, sid *windows.SID, mask windows.ACCESS_MASK, mode windows.ACCESS_MODE, inherit uint32) error {
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		return err
-	}
-	dacl, _, err := sd.DACL()
-	if err != nil {
-		return err
-	}
-	if dacl == nil {
-		return fmt.Errorf("NULL DACL; refusing to replace it")
-	}
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
-	pinner.Pin(sid)
-	access := []windows.EXPLICIT_ACCESS{{
-		AccessPermissions: mask,
-		AccessMode:        mode,
-		Inheritance:       inherit,
-		Trustee: windows.TRUSTEE{
-			TrusteeForm:  windows.TRUSTEE_IS_SID,
-			TrusteeType:  windows.TRUSTEE_IS_USER,
-			TrusteeValue: windows.TrusteeValueFromSID(sid),
-		},
-	}}
-	acl, err := windows.ACLFromEntries(access, dacl)
-	if err != nil {
-		return err
-	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
-}
-
-func revokeExeACE(path, sidStr string) error {
-	if path == "" || sidStr == "" {
-		return nil
+		return windows.TerminateJobObject(job, 1)
 	}
 	return nil
 }
@@ -267,7 +265,7 @@ func inheritReader(r io.Reader) (windows.Handle, func(), error) {
 		return windows.Handle(f.Fd()), func() { f.Close() }, markInherit(windows.Handle(f.Fd()))
 	}
 	if f, ok := r.(*os.File); ok {
-		return windows.Handle(f.Fd()), func() {}, markInherit(windows.Handle(f.Fd()))
+		return duplicateInheritable(windows.Handle(f.Fd()))
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -289,7 +287,7 @@ func inheritWriter(w io.Writer) (windows.Handle, func(), error) {
 		return windows.Handle(f.Fd()), func() { f.Close() }, markInherit(windows.Handle(f.Fd()))
 	}
 	if f, ok := w.(*os.File); ok {
-		return windows.Handle(f.Fd()), func() {}, markInherit(windows.Handle(f.Fd()))
+		return duplicateInheritable(windows.Handle(f.Fd()))
 	}
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -304,6 +302,15 @@ func inheritWriter(w io.Writer) (windows.Handle, func(), error) {
 
 func markInherit(h windows.Handle) error {
 	return windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT)
+}
+
+func duplicateInheritable(src windows.Handle) (windows.Handle, func(), error) {
+	var dup windows.Handle
+	err := windows.DuplicateHandle(windows.CurrentProcess(), src, windows.CurrentProcess(), &dup, 0, true, windows.DUPLICATE_SAME_ACCESS)
+	if err != nil {
+		return 0, func() {}, err
+	}
+	return dup, func() { windows.CloseHandle(dup) }, nil
 }
 
 func envBlock(env []string) (*uint16, []uint16, error) {

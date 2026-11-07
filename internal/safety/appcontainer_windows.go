@@ -124,29 +124,31 @@ func createAppProfile(runID string) (appProfile, error) {
 		0, 0,
 		uintptr(unsafe.Pointer(&sid)),
 	)
-	if uint32(r) == hresultAlreadyExists || sid == nil && r != 0 {
-		if derr := deriveSID(namePtr, &sid); derr != nil && r != 0 && uint32(r) != hresultAlreadyExists {
-			return appProfile{}, hrErr("CreateAppContainerProfile", r)
+	// Any non-zero HRESULT, including ERROR_ALREADY_EXISTS, is not this run's
+	// profile. Do not derive a SID and do not delete the name.
+	if err := acceptCreatedProfile(uint32(r)); err != nil {
+		return appProfile{}, err
+	}
+	if sid == nil {
+		if derr := deleteAppProfile(name); derr != nil {
+			return appProfile{}, fmt.Errorf("BLOCKED: CreateAppContainerProfile returned no SID; delete failed: %v", derr)
 		}
-		if sid == nil {
-			if r != 0 && uint32(r) != hresultAlreadyExists {
-				return appProfile{}, hrErr("CreateAppContainerProfile", r)
-			}
-			return appProfile{}, fmt.Errorf("BLOCKED: CreateAppContainerProfile did not return a SID")
-		}
-	} else if r != 0 {
-		return appProfile{}, hrErr("CreateAppContainerProfile", r)
+		return appProfile{}, fmt.Errorf("BLOCKED: CreateAppContainerProfile returned no SID")
 	}
 	sidStr, err := sidString(sid)
 	if err != nil {
-		windows.LocalFree(windows.Handle(unsafe.Pointer(sid)))
-		_ = deleteAppProfile(name)
+		freeSID(sid)
+		if derr := deleteAppProfile(name); derr != nil {
+			return appProfile{}, fmt.Errorf("%v; profile delete failed: %w", err, derr)
+		}
 		return appProfile{}, err
 	}
 	folder, err := packageFolder(sidStr)
 	if err != nil {
-		windows.LocalFree(windows.Handle(unsafe.Pointer(sid)))
-		_ = deleteAppProfile(name)
+		freeSID(sid)
+		if derr := deleteAppProfile(name); derr != nil {
+			return appProfile{}, fmt.Errorf("%v; profile delete failed: %w", err, derr)
+		}
 		return appProfile{}, err
 	}
 	return appProfile{name: name, sid: sid, sidStr: sidStr, folder: folder}, nil
