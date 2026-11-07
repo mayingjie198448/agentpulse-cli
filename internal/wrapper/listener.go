@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
 
@@ -30,6 +30,10 @@ type ListenerConfig struct {
 	MQTTClient                 paho.Client
 	Stub                       bool
 	DangerouslySkipPermissions bool
+	AuditPath                  string
+	RealHome                   string
+	SentinelPath               string
+	IsolationBackend           safety.Backend
 	Quiet                      bool
 	Stdout                     io.Writer
 	Stderr                     io.Writer
@@ -489,18 +493,10 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 			args[0] = resolved
 		}
 	}
-	if l.cfg.DangerouslySkipPermissions && len(args) > 0 && filepath.Base(args[0]) == "agy" {
-		hasPerm := false
-		for _, a := range args {
-			if a == "--dangerously-skip-permissions" {
-				hasPerm = true
-				break
-			}
-		}
-		if !hasPerm {
-			args = append([]string{args[0], "--dangerously-skip-permissions"}, args[1:]...)
-		}
-	}
+	// Danger flags are not injected on this MQTT path. wrapper.Run reaches
+	// safety.Prepare, which is the shared gate for listener, wrap, and helpers.
+	// An explicit opt-in (this listener's flag, or a flag already on argv)
+	// starts only after a fresh isolation probe. There is no bare retry.
 
 	jobCtx, jobCancel := context.WithCancel(ctx)
 	defer jobCancel()
@@ -550,6 +546,11 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		MirrorStdout:      l.cfg.Stdout,
 		MirrorStderr:      l.cfg.Stderr,
 		Stub:              l.cfg.Stub,
+		ExplicitDanger:    l.cfg.DangerouslySkipPermissions,
+		AuditPath:         l.cfg.AuditPath,
+		RealHome:          l.cfg.RealHome,
+		SentinelPath:      l.cfg.SentinelPath,
+		IsolationBackend:  l.cfg.IsolationBackend,
 		Quiet:             l.cfg.Quiet,
 		KeepMachineOnline: true,
 		StartedAt:         now,
