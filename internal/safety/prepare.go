@@ -298,6 +298,15 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// composeStartError wraps a start failure with ErrRefused while preserving
+// underlying causes and diagnostics.
+func composeStartError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrRefused, err)
+}
+
 // Start starts the process. For a confined command it waits until the helper
 // confirms the fresh probe, and it does not treat a failed probe as a running
 // user command.
@@ -314,7 +323,7 @@ func (p *Prepared) Start() error {
 	if err != nil {
 		p.keepRoot(err)
 		p.finishRefused(err.Error(), nil)
-		return fmt.Errorf("%w: %v", ErrRefused, err)
+		return composeStartError(err)
 	}
 	p.started = true
 	if p.pid == 0 && p.Cmd != nil && p.Cmd.Process != nil {

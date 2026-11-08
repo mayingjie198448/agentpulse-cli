@@ -875,3 +875,342 @@ func TestWindowsLaunchCriticalEnvContract(t *testing.T) {
 	})
 }
 
+func TestWindowsLaunchLifetimeContract(t *testing.T) {
+	t.Run("FullTeardownOrder", func(t *testing.T) {
+		sid := new(windows.SID)
+		caps := &securityCapabilities{AppContainerSid: sid, CapabilityCount: 0}
+		handles := []windows.Handle{windows.Handle(10), windows.Handle(20)}
+		list := make([]byte, 64)
+
+		var order []string
+		var releasedSID *windows.SID
+
+		lifetime := &launchLifetime{
+			list:    list,
+			caps:    caps,
+			handles: handles,
+			sid:     sid,
+			deleteList: func() error {
+				order = append(order, "delete_list")
+				return nil
+			},
+			unpin: func() {
+				order = append(order, "unpin")
+			},
+			releaseSID: func(s *windows.SID) error {
+				order = append(order, "release_sid")
+				releasedSID = s
+				return nil
+			},
+		}
+
+		if err := lifetime.Teardown(); err != nil {
+			t.Fatalf("unexpected error during teardown: %v", err)
+		}
+
+		wantOrder := []string{"delete_list", "unpin", "release_sid"}
+		if !slices.Equal(order, wantOrder) {
+			t.Fatalf("teardown order mismatch: got %v, want %v", order, wantOrder)
+		}
+		if releasedSID != sid {
+			t.Fatalf("released SID pointer mismatch")
+		}
+	})
+
+	t.Run("TeardownOnPartialInit", func(t *testing.T) {
+		sid := new(windows.SID)
+		var order []string
+		lifetime := &launchLifetime{
+			sid: sid,
+			releaseSID: func(s *windows.SID) error {
+				order = append(order, "release_sid")
+				return nil
+			},
+		}
+		if err := lifetime.Teardown(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !slices.Equal(order, []string{"release_sid"}) {
+			t.Fatalf("expected only release_sid, got %v", order)
+		}
+
+		order = nil
+		lifetime = &launchLifetime{
+			list: make([]byte, 32),
+			sid:  sid,
+			deleteList: func() error {
+				order = append(order, "delete_list")
+				return nil
+			},
+			releaseSID: func(s *windows.SID) error {
+				order = append(order, "release_sid")
+				return nil
+			},
+		}
+		if err := lifetime.Teardown(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !slices.Equal(order, []string{"delete_list", "release_sid"}) {
+			t.Fatalf("expected delete_list then release_sid, got %v", order)
+		}
+	})
+
+	t.Run("TeardownDeleteErrorStillUnpinsAndReleases", func(t *testing.T) {
+		sid := new(windows.SID)
+		var order []string
+		delErr := errors.New("delete attribute list failed")
+
+		lifetime := &launchLifetime{
+			list: make([]byte, 32),
+			sid:  sid,
+			deleteList: func() error {
+				order = append(order, "delete_list")
+				return delErr
+			},
+			unpin: func() {
+				order = append(order, "unpin")
+			},
+			releaseSID: func(s *windows.SID) error {
+				order = append(order, "release_sid")
+				return nil
+			},
+		}
+
+		err := lifetime.Teardown()
+		if !errors.Is(err, delErr) {
+			t.Fatalf("expected delete error, got: %v", err)
+		}
+		wantOrder := []string{"delete_list", "unpin", "release_sid"}
+		if !slices.Equal(order, wantOrder) {
+			t.Fatalf("teardown did not continue on delete error: got %v, want %v", order, wantOrder)
+		}
+	})
+
+	t.Run("TeardownIdempotent", func(t *testing.T) {
+		sid := new(windows.SID)
+		callCount := 0
+		lifetime := &launchLifetime{
+			sid: sid,
+			releaseSID: func(s *windows.SID) error {
+				callCount++
+				return nil
+			},
+		}
+		if err := lifetime.Teardown(); err != nil {
+			t.Fatalf("first teardown failed: %v", err)
+		}
+		if err := lifetime.Teardown(); err != nil {
+			t.Fatalf("second teardown failed: %v", err)
+		}
+		if callCount != 1 {
+			t.Fatalf("expected exactly 1 release call, got %d", callCount)
+		}
+	})
+}
+
+func TestPreparedStartErrorContract(t *testing.T) {
+	t.Run("PreservesErrRefusedAndUnderlyingErrno", func(t *testing.T) {
+		underlyingErrno := windows.Errno(203)
+		innerErr := fmt.Errorf("BLOCKED: CreateProcess AppContainer: (errno %d) %w", underlyingErrno, underlyingErrno)
+
+		got := composeStartError(innerErr)
+		if got == nil {
+			t.Fatal("expected non-nil error")
+		}
+		if !errors.Is(got, ErrRefused) {
+			t.Fatalf("error does not wrap ErrRefused: %v", got)
+		}
+		if !errors.Is(got, underlyingErrno) {
+			t.Fatalf("error does not wrap underlying errno 203: %v", got)
+		}
+		var extracted windows.Errno
+		if !errors.As(got, &extracted) {
+			t.Fatalf("errors.As failed to extract windows.Errno from %v", got)
+		}
+		if extracted != underlyingErrno {
+			t.Fatalf("extracted errno mismatch: got %d, want %d", extracted, underlyingErrno)
+		}
+		if !strings.Contains(got.Error(), "refusing to start child") || !strings.Contains(got.Error(), "(errno 203)") {
+			t.Fatalf("missing expected diagnostic in error message: %q", got.Error())
+		}
+	})
+
+	t.Run("PreservesWrappedWin32Error", func(t *testing.T) {
+		underlying := windows.ERROR_ACCESS_DENIED
+		innerErr := formatCreateProcessError(underlying)
+
+		got := composeStartError(innerErr)
+		if got == nil {
+			t.Fatal("expected non-nil error")
+		}
+		if !errors.Is(got, ErrRefused) {
+			t.Fatalf("error does not wrap ErrRefused: %v", got)
+		}
+		if !errors.Is(got, underlying) {
+			t.Fatalf("error does not wrap ERROR_ACCESS_DENIED: %v", got)
+		}
+		var extracted windows.Errno
+		if !errors.As(got, &extracted) || extracted != underlying {
+			t.Fatalf("failed to extract errno via errors.As: %v", extracted)
+		}
+	})
+
+	t.Run("NilErrorReturnsNil", func(t *testing.T) {
+		if got := composeStartError(nil); got != nil {
+			t.Fatalf("expected nil error for nil input, got: %v", got)
+		}
+	})
+
+	t.Run("PreservesPlainError", func(t *testing.T) {
+		plain := errors.New("custom launch failure")
+		got := composeStartError(plain)
+		if !errors.Is(got, ErrRefused) {
+			t.Fatalf("error does not wrap ErrRefused: %v", got)
+		}
+		if !errors.Is(got, plain) {
+			t.Fatalf("error does not wrap plain error: %v", got)
+		}
+		if !strings.Contains(got.Error(), "custom launch failure") {
+			t.Fatalf("diagnostic message lost: %v", got)
+		}
+	})
+}
+
+func TestWindowsConfirmInheritanceContract(t *testing.T) {
+	t.Run("SuccessInheritanceSemanticsAndContinuation", func(t *testing.T) {
+		type setterCall struct {
+			handle windows.Handle
+			mask   uint32
+			flags  uint32
+		}
+		var calls []setterCall
+		fakeSetter := func(h windows.Handle, mask, flags uint32) error {
+			calls = append(calls, setterCall{handle: h, mask: mask, flags: flags})
+			return nil
+		}
+
+		continuationCalled := false
+		continuation := func() error {
+			continuationCalled = true
+			return nil
+		}
+
+		wHandle := windows.Handle(101)
+		rHandle := windows.Handle(202)
+
+		err := configureConfirmInheritance(wHandle, true, rHandle, true, fakeSetter, continuation)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !continuationCalled {
+			t.Fatal("expected continuation to be called on success")
+		}
+		if len(calls) != 2 {
+			t.Fatalf("expected 2 setter calls, got %d", len(calls))
+		}
+		if calls[0] != (setterCall{handle: 101, mask: windows.HANDLE_FLAG_INHERIT, flags: windows.HANDLE_FLAG_INHERIT}) {
+			t.Fatalf("write handle call mismatch: %+v", calls[0])
+		}
+		if calls[1] != (setterCall{handle: 202, mask: windows.HANDLE_FLAG_INHERIT, flags: 0}) {
+			t.Fatalf("read handle call mismatch: %+v", calls[1])
+		}
+	})
+
+	t.Run("FailClosedOnWriteSetterFailure", func(t *testing.T) {
+		fakeErr := windows.ERROR_INVALID_HANDLE
+		setterCalled := 0
+		fakeSetter := func(h windows.Handle, mask, flags uint32) error {
+			setterCalled++
+			return fakeErr
+		}
+
+		continuationCalled := false
+		continuation := func() error {
+			continuationCalled = true
+			return nil
+		}
+
+		err := configureConfirmInheritance(windows.Handle(101), true, windows.Handle(202), true, fakeSetter, continuation)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if continuationCalled {
+			t.Fatal("continuation MUST NOT be called after setter failure")
+		}
+		if setterCalled != 1 {
+			t.Fatalf("setter should have stopped after first failure, got %d calls", setterCalled)
+		}
+		if !errors.Is(err, fakeErr) {
+			t.Fatalf("error does not wrap native cause: %v", err)
+		}
+		var errno windows.Errno
+		if !errors.As(err, &errno) || errno != 6 {
+			t.Fatalf("errors.As failed to extract errno 6: %v", errno)
+		}
+		if !strings.Contains(err.Error(), "(errno 6)") {
+			t.Fatalf("error message missing numeric diagnostic: %q", err.Error())
+		}
+	})
+
+	t.Run("FailClosedOnReadSetterFailure", func(t *testing.T) {
+		fakeErr := windows.ERROR_ACCESS_DENIED
+		setterCalled := 0
+		fakeSetter := func(h windows.Handle, mask, flags uint32) error {
+			setterCalled++
+			if setterCalled == 2 {
+				return fakeErr
+			}
+			return nil
+		}
+
+		continuationCalled := false
+		continuation := func() error {
+			continuationCalled = true
+			return nil
+		}
+
+		err := configureConfirmInheritance(windows.Handle(101), true, windows.Handle(202), true, fakeSetter, continuation)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if continuationCalled {
+			t.Fatal("continuation MUST NOT be called after read setter failure")
+		}
+		if setterCalled != 2 {
+			t.Fatalf("expected 2 setter calls, got %d", setterCalled)
+		}
+		if !errors.Is(err, fakeErr) {
+			t.Fatalf("error does not wrap native cause: %v", err)
+		}
+		var errno windows.Errno
+		if !errors.As(err, &errno) || errno != 5 {
+			t.Fatalf("errors.As failed to extract errno 5: %v", errno)
+		}
+	})
+
+	t.Run("OptionalHandles", func(t *testing.T) {
+		continuationCalled := false
+		err := configureConfirmInheritance(0, false, 0, false, nil, func() error {
+			continuationCalled = true
+			return nil
+		})
+		if err != nil || !continuationCalled {
+			t.Fatalf("neither handle present failed: err=%v, called=%v", err, continuationCalled)
+		}
+
+		calls := 0
+		fakeSetter := func(h windows.Handle, mask, flags uint32) error {
+			calls++
+			return nil
+		}
+		continuationCalled = false
+		err = configureConfirmInheritance(windows.Handle(101), true, 0, false, fakeSetter, func() error {
+			continuationCalled = true
+			return nil
+		})
+		if err != nil || !continuationCalled || calls != 1 {
+			t.Fatalf("only write handle failed: err=%v, called=%v, calls=%d", err, continuationCalled, calls)
+		}
+	})
+}
+

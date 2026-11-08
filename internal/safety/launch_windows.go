@@ -20,6 +20,83 @@ var (
 	procCompareStringOrdinal = modKernel32.NewProc("CompareStringOrdinal")
 )
 
+type handleInheritSetter func(handle windows.Handle, mask, flags uint32) error
+
+func configureConfirmInheritance(
+	wHandle windows.Handle,
+	hasW bool,
+	rHandle windows.Handle,
+	hasR bool,
+	setter handleInheritSetter,
+	continuation func() error,
+) error {
+	if setter == nil {
+		setter = windows.SetHandleInformation
+	}
+	if hasW {
+		if err := setter(wHandle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+			var errno windows.Errno
+			if errors.As(err, &errno) {
+				return fmt.Errorf("BLOCKED: SetHandleInformation confirm pipe write handle: (errno %d) %w", errno, err)
+			}
+			return fmt.Errorf("BLOCKED: SetHandleInformation confirm pipe write handle: %w", err)
+		}
+	}
+	if hasR {
+		if err := setter(rHandle, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
+			var errno windows.Errno
+			if errors.As(err, &errno) {
+				return fmt.Errorf("BLOCKED: SetHandleInformation confirm pipe read handle: (errno %d) %w", errno, err)
+			}
+			return fmt.Errorf("BLOCKED: SetHandleInformation confirm pipe read handle: %w", err)
+		}
+	}
+	if continuation != nil {
+		return continuation()
+	}
+	return nil
+}
+
+type launchLifetime struct {
+	list       []byte
+	caps       *securityCapabilities
+	handles    []windows.Handle
+	sid        *windows.SID
+	deleteList func() error
+	unpin      func()
+	releaseSID func(*windows.SID) error
+}
+
+func (l *launchLifetime) Teardown() error {
+	if l == nil {
+		return nil
+	}
+	var firstErr error
+	if l.deleteList != nil {
+		if err := l.deleteList(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		l.deleteList = nil
+	}
+	runtime.KeepAlive(l.list)
+	runtime.KeepAlive(l.caps)
+	runtime.KeepAlive(l.handles)
+	runtime.KeepAlive(l.sid)
+
+	if l.unpin != nil {
+		l.unpin()
+		l.unpin = nil
+	}
+	if l.releaseSID != nil && l.sid != nil {
+		if err := l.releaseSID(l.sid); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		l.sid = nil
+		l.releaseSID = nil
+	}
+	return firstErr
+}
+
 func configureConfinedLaunch(p *Prepared) error {
 	if p == nil || !p.Confined || p.Cmd == nil || p.rec == nil {
 		return nil
@@ -27,37 +104,45 @@ func configureConfinedLaunch(p *Prepared) error {
 	if p.rec.ProfileName == "" || p.rec.PackageSID == "" {
 		return fmt.Errorf("BLOCKED: AppContainer profile was not created for this run")
 	}
-	if p.confirmW != nil {
-		_ = windows.SetHandleInformation(windows.Handle(p.confirmW.Fd()), windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT)
+
+	var wHandle windows.Handle
+	hasW := p.confirmW != nil
+	if hasW {
+		wHandle = windows.Handle(p.confirmW.Fd())
 	}
-	if p.confirmR != nil {
-		_ = windows.SetHandleInformation(windows.Handle(p.confirmR.Fd()), windows.HANDLE_FLAG_INHERIT, 0)
+	var rHandle windows.Handle
+	hasR := p.confirmR != nil
+	if hasR {
+		rHandle = windows.Handle(p.confirmR.Fd())
 	}
-	if p.confirmW != nil {
-		p.Cmd.Args = insertBeforeSeparator(p.Cmd.Args, []string{"--confirm-handle", fmt.Sprintf("%d", p.confirmW.Fd())})
-	}
-	p.Cmd.ExtraFiles = nil
-	if p.rec.ExePath != "" {
-		original := p.Cmd.Path
-		p.Cmd.Path = p.rec.ExePath
-		if len(p.Cmd.Args) > 0 {
-			p.Cmd.Args[0] = p.rec.ExePath
+
+	return configureConfirmInheritance(wHandle, hasW, rHandle, hasR, windows.SetHandleInformation, func() error {
+		if hasW {
+			p.Cmd.Args = insertBeforeSeparator(p.Cmd.Args, []string{"--confirm-handle", fmt.Sprintf("%d", p.confirmW.Fd())})
 		}
-		for i, a := range p.Cmd.Args {
-			if a == "--" && i+1 < len(p.Cmd.Args) && strings.EqualFold(p.Cmd.Args[i+1], original) {
-				p.Cmd.Args[i+1] = p.rec.ExePath
-				break
+		p.Cmd.ExtraFiles = nil
+		if p.rec.ExePath != "" {
+			original := p.Cmd.Path
+			p.Cmd.Path = p.rec.ExePath
+			if len(p.Cmd.Args) > 0 {
+				p.Cmd.Args[0] = p.rec.ExePath
+			}
+			for i, a := range p.Cmd.Args {
+				if a == "--" && i+1 < len(p.Cmd.Args) && strings.EqualFold(p.Cmd.Args[i+1], original) {
+					p.Cmd.Args[i+1] = p.rec.ExePath
+					break
+				}
 			}
 		}
-	}
-	p.audit.IsolationBackend = "windows-appcontainer"
-	p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; this-run executable copy only; no DACL edits; no internetClient capability; credential broker IPC BLOCKED; cross-compile is not a native pass"
-	p.audit.Network = "no_internetClient_capability"
-	if p.Cmd != nil {
-		p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
-	}
-	p.startFn = func() error { return startAppContainer(p) }
-	return nil
+		p.audit.IsolationBackend = "windows-appcontainer"
+		p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; this-run executable copy only; no DACL edits; no internetClient capability; credential broker IPC BLOCKED; cross-compile is not a native pass"
+		p.audit.Network = "no_internetClient_capability"
+		if p.Cmd != nil {
+			p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
+		}
+		p.startFn = func() error { return startAppContainer(p) }
+		return nil
+	})
 }
 
 func insertBeforeSeparator(args, extra []string) []string {
@@ -81,7 +166,11 @@ func startAppContainer(p *Prepared) error {
 	if err := deriveSID(namePtr, &sid); err != nil {
 		return err
 	}
-	defer freeSID(sid)
+	lifetime := &launchLifetime{
+		sid:        sid,
+		releaseSID: sidFreeReleaser,
+	}
+	defer lifetime.Teardown()
 	stdin, closeIn, err := inheritReader(p.Cmd.Stdin)
 	if err != nil {
 		return err
@@ -117,13 +206,21 @@ func startAppContainer(p *Prepared) error {
 	if r == 0 {
 		return fmt.Errorf("BLOCKED: InitializeProcThreadAttributeList: %v", callErr)
 	}
-	defer procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])))
+	lifetime.list = list
+	lifetime.deleteList = func() error {
+		r, _, err := procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])))
+		if r == 0 {
+			return err
+		}
+		return nil
+	}
 
 	caps := securityCapabilities{AppContainerSid: sid, CapabilityCount: 0}
 	var pinner runtime.Pinner
 	pinner.Pin(sid)
 	pinner.Pin(&caps)
-	defer pinner.Unpin()
+	lifetime.caps = &caps
+	lifetime.unpin = pinner.Unpin
 	r, _, callErr = procUpdateProcThreadAttribute.Call(
 		uintptr(unsafe.Pointer(&list[0])),
 		0,
@@ -140,6 +237,7 @@ func startAppContainer(p *Prepared) error {
 		handles = append(handles, windows.Handle(p.confirmW.Fd()))
 	}
 	pinner.Pin(&handles[0])
+	lifetime.handles = handles
 	r, _, callErr = procUpdateProcThreadAttribute.Call(
 		uintptr(unsafe.Pointer(&list[0])),
 		0,
