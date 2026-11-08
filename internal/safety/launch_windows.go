@@ -140,25 +140,8 @@ func configureConfinedLaunch(p *Prepared) error {
 		p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; this-run executable copy only; no DACL edits; no internetClient capability; credential broker IPC BLOCKED; cross-compile is not a native pass"
 		p.audit.Network = "no_internetClient_capability"
 		if p.Cmd != nil {
-			p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
-			if p.rec != nil && p.rec.Root != "" {
-				hadLocalApp := hasKeyFold(p.Cmd.Env, "LOCALAPPDATA")
-				replenished, err := replenishChildLocalAppData(p.Cmd.Env, p.rec)
-				if err != nil {
-					return err
-				}
-				p.Cmd.Env = replenished
-				p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
-					p.Cmd.Env,
-					p.rec.Root,
-					hadLocalApp,
-				)
-			} else if p.rec != nil && hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
-				p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
-					p.Cmd.Env,
-					p.rec.Root,
-					true,
-				)
+			if err := applyChildLocalAppData(p); err != nil {
+				return err
 			}
 		}
 		p.startFn = func() error { return startAppContainer(p) }
@@ -276,26 +259,11 @@ func startAppContainer(p *Prepared) error {
 	if err != nil {
 		return err
 	}
-	p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
-	if !hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
-		replenished, err := replenishChildLocalAppData(p.Cmd.Env, p.rec)
-		if err != nil {
-			return err
-		}
-		p.Cmd.Env = replenished
-		if p.rec != nil {
-			p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
-				p.Cmd.Env,
-				p.rec.Root,
-				false,
-			)
-		}
-	} else if p.rec != nil && p.rec.Root != "" {
-		p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
-			p.Cmd.Env,
-			p.rec.Root,
-			true,
-		)
+	if !hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") && (p.rec == nil || strings.TrimSpace(p.rec.Root) == "") {
+		return fmt.Errorf("%w: missing AppContainer ownership root for LOCALAPPDATA", ErrRefused)
+	}
+	if err := applyChildLocalAppData(p); err != nil {
+		return err
 	}
 	env, envKeep, err := envBlock(p.Cmd.Env)
 	if err != nil {
@@ -328,6 +296,14 @@ func startAppContainer(p *Prepared) error {
 		defaultFixedKeyLookup,
 	)
 	p.audit.WindowsLaunchMetadata = meta
+
+	if p.rec != nil && p.rec.Root != "" {
+		p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+			p.Cmd.Env,
+			p.rec.Root,
+			!p.ChildLocalAppDataFromOwnedRoot,
+		)
+	}
 
 	err = windows.CreateProcess(
 		app, cmdLine, nil, nil, true,
@@ -810,6 +786,46 @@ func addCriticalEnvWithLookup(env []string, lookup func() string) []string {
 		systemRoot = lookup()
 	}
 	return append(slices.Clone(env), "SYSTEMROOT="+systemRoot)
+}
+
+// applyChildLocalAppData ensures the child environment has critical variables
+// and LOCALAPPDATA replenished from the owned AppContainer root if missing,
+// observing provenance against the child environment and ownership record while
+// preserving default-injected provenance across prepare/start passes and retaining
+// explicit child entries (including explicit matching-owned-root, empty, and aliases).
+func applyChildLocalAppData(p *Prepared) error {
+	if p == nil || p.Cmd == nil {
+		return nil
+	}
+	p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
+	if p.rec != nil && p.rec.Root != "" {
+		if !hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
+			replenished, err := replenishChildLocalAppData(p.Cmd.Env, p.rec)
+			if err != nil {
+				return err
+			}
+			p.Cmd.Env = replenished
+			p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+				p.Cmd.Env,
+				p.rec.Root,
+				false,
+			)
+		} else {
+			wasExplicit := !p.ChildLocalAppDataFromOwnedRoot
+			p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+				p.Cmd.Env,
+				p.rec.Root,
+				wasExplicit,
+			)
+		}
+	} else if p.rec != nil && hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
+		p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+			p.Cmd.Env,
+			p.rec.Root,
+			true,
+		)
+	}
+	return nil
 }
 
 // replenishChildLocalAppData replenishes missing LOCALAPPDATA environment variable

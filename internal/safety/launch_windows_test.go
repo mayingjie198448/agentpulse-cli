@@ -2006,6 +2006,118 @@ func TestWindowsLocalAppDataContract(t *testing.T) {
 			t.Fatalf("expected ChildLocalAppDataFromOwnedRoot == false for explicit path even if matching")
 		}
 	})
+
+	t.Run("PreserveProvenanceAcrossPrepareAndStartRecheck", func(t *testing.T) {
+		rec := &RunRecord{
+			Root:        `C:\AC\OwnedRoot`,
+			Home:        `C:\AC\OwnedRoot\home`,
+			ProfileName: "test-profile-contract",
+			PackageSID:  "S-1-15-2-12345-67890",
+		}
+
+		// 1. Default-injected LOCALAPPDATA: must remain FromOwnedRoot=true across passes
+		pDefault := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{"PATH=C:\\bin"}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pDefault); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if !pDefault.ChildLocalAppDataIsOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataIsOwnedRoot == true after prepare")
+		}
+		if !pDefault.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataFromOwnedRoot == true after prepare")
+		}
+
+		// Second pass: start recheck pass
+		if err := applyChildLocalAppData(pDefault); err != nil {
+			t.Fatalf("applyChildLocalAppData error: %v", err)
+		}
+		if !pDefault.ChildLocalAppDataIsOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataIsOwnedRoot == true after start recheck")
+		}
+		if !pDefault.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("regression: default provenance overwritten to false after start recheck")
+		}
+
+		// 2. Explicit matching owned root: must remain FromOwnedRoot=false across passes
+		pMatching := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{`LOCALAPPDATA=C:\AC\OwnedRoot`}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pMatching); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if !pMatching.ChildLocalAppDataIsOwnedRoot || pMatching.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected matching provenance after prepare: is=%t from=%t", pMatching.ChildLocalAppDataIsOwnedRoot, pMatching.ChildLocalAppDataFromOwnedRoot)
+		}
+		if err := applyChildLocalAppData(pMatching); err != nil {
+			t.Fatalf("applyChildLocalAppData error: %v", err)
+		}
+		if !pMatching.ChildLocalAppDataIsOwnedRoot || pMatching.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected matching provenance after start recheck: is=%t from=%t", pMatching.ChildLocalAppDataIsOwnedRoot, pMatching.ChildLocalAppDataFromOwnedRoot)
+		}
+
+		// 3. Explicit non-matching: must remain isOwnedRoot=false, fromOwnedRoot=false
+		pOther := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{`LOCALAPPDATA=C:\other\dir`}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pOther); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if pOther.ChildLocalAppDataIsOwnedRoot || pOther.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected other provenance after prepare: is=%t from=%t", pOther.ChildLocalAppDataIsOwnedRoot, pOther.ChildLocalAppDataFromOwnedRoot)
+		}
+		if err := applyChildLocalAppData(pOther); err != nil {
+			t.Fatalf("applyChildLocalAppData error: %v", err)
+		}
+		if pOther.ChildLocalAppDataIsOwnedRoot || pOther.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected other provenance after start recheck: is=%t from=%t", pOther.ChildLocalAppDataIsOwnedRoot, pOther.ChildLocalAppDataFromOwnedRoot)
+		}
+
+		// 4. Explicit empty: must remain isOwnedRoot=false, fromOwnedRoot=false
+		pEmpty := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{"LOCALAPPDATA="}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pEmpty); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if pEmpty.ChildLocalAppDataIsOwnedRoot || pEmpty.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected empty provenance after prepare: is=%t from=%t", pEmpty.ChildLocalAppDataIsOwnedRoot, pEmpty.ChildLocalAppDataFromOwnedRoot)
+		}
+		if err := applyChildLocalAppData(pEmpty); err != nil {
+			t.Fatalf("applyChildLocalAppData error: %v", err)
+		}
+		if pEmpty.ChildLocalAppDataIsOwnedRoot || pEmpty.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected empty provenance after start recheck: is=%t from=%t", pEmpty.ChildLocalAppDataIsOwnedRoot, pEmpty.ChildLocalAppDataFromOwnedRoot)
+		}
+
+		// 5. Case alias: must remain isOwnedRoot=false, fromOwnedRoot=false
+		pAlias := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{`localappdata=C:\other\alias`}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pAlias); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if pAlias.ChildLocalAppDataIsOwnedRoot || pAlias.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected alias provenance after prepare: is=%t from=%t", pAlias.ChildLocalAppDataIsOwnedRoot, pAlias.ChildLocalAppDataFromOwnedRoot)
+		}
+		if err := applyChildLocalAppData(pAlias); err != nil {
+			t.Fatalf("applyChildLocalAppData error: %v", err)
+		}
+		if pAlias.ChildLocalAppDataIsOwnedRoot || pAlias.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("unexpected alias provenance after start recheck: is=%t from=%t", pAlias.ChildLocalAppDataIsOwnedRoot, pAlias.ChildLocalAppDataFromOwnedRoot)
+		}
+	})
 }
 
 
