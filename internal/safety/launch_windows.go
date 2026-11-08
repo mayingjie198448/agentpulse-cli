@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -140,6 +141,25 @@ func configureConfinedLaunch(p *Prepared) error {
 		p.audit.Network = "no_internetClient_capability"
 		if p.Cmd != nil {
 			p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
+			if p.rec != nil && p.rec.Root != "" {
+				hadLocalApp := hasKeyFold(p.Cmd.Env, "LOCALAPPDATA")
+				replenished, err := replenishChildLocalAppData(p.Cmd.Env, p.rec)
+				if err != nil {
+					return err
+				}
+				p.Cmd.Env = replenished
+				p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+					p.Cmd.Env,
+					p.rec.Root,
+					hadLocalApp,
+				)
+			} else if p.rec != nil && hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
+				p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+					p.Cmd.Env,
+					p.rec.Root,
+					true,
+				)
+			}
 		}
 		p.startFn = func() error { return startAppContainer(p) }
 		return nil
@@ -257,6 +277,26 @@ func startAppContainer(p *Prepared) error {
 		return err
 	}
 	p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
+	if !hasKeyFold(p.Cmd.Env, "LOCALAPPDATA") {
+		replenished, err := replenishChildLocalAppData(p.Cmd.Env, p.rec)
+		if err != nil {
+			return err
+		}
+		p.Cmd.Env = replenished
+		if p.rec != nil {
+			p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+				p.Cmd.Env,
+				p.rec.Root,
+				false,
+			)
+		}
+	} else if p.rec != nil && p.rec.Root != "" {
+		p.ChildLocalAppDataIsOwnedRoot, p.ChildLocalAppDataFromOwnedRoot = observeLocalAppDataProvenance(
+			p.Cmd.Env,
+			p.rec.Root,
+			true,
+		)
+	}
 	env, envKeep, err := envBlock(p.Cmd.Env)
 	if err != nil {
 		return err
@@ -770,6 +810,50 @@ func addCriticalEnvWithLookup(env []string, lookup func() string) []string {
 		systemRoot = lookup()
 	}
 	return append(slices.Clone(env), "SYSTEMROOT="+systemRoot)
+}
+
+// replenishChildLocalAppData replenishes missing LOCALAPPDATA environment variable
+// in the child environment sourced strictly from the AppContainer AC root
+// (rec.Root) in the ownership RunRecord.
+// If LOCALAPPDATA is already present (checked case-insensitively), existing
+// child values and case aliases are preserved.
+// If LOCALAPPDATA is missing and the ownership root is missing or unusable,
+// it fails closed without host fallback or guessing.
+func replenishChildLocalAppData(env []string, rec *RunRecord) ([]string, error) {
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+			return env, nil
+		}
+	}
+	if rec == nil || strings.TrimSpace(rec.Root) == "" {
+		return nil, fmt.Errorf("%w: missing AppContainer ownership root for LOCALAPPDATA", ErrRefused)
+	}
+	return append(slices.Clone(env), "LOCALAPPDATA="+rec.Root), nil
+}
+
+func hasKeyFold(env []string, target string) bool {
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if ok && strings.EqualFold(k, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func observeLocalAppDataProvenance(childEnv []string, ownedRoot string, wasExplicit bool) (isOwnedRoot bool, fromOwnedRoot bool) {
+	if strings.TrimSpace(ownedRoot) == "" {
+		return false, false
+	}
+	for _, kv := range childEnv {
+		k, v, ok := strings.Cut(kv, "=")
+		if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+			isOwned := strings.EqualFold(filepath.Clean(v), filepath.Clean(ownedRoot))
+			return isOwned, !wasExplicit && isOwned
+		}
+	}
+	return false, false
 }
 
 func extractEnvName(entry string) string {

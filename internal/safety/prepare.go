@@ -60,6 +60,9 @@ type Prepared struct {
 	Root     string
 	RunID    string
 
+	ChildLocalAppDataIsOwnedRoot   bool
+	ChildLocalAppDataFromOwnedRoot bool
+
 	ctx        context.Context
 	confirmR   *os.File
 	confirmW   *os.File

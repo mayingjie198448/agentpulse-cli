@@ -1746,4 +1746,266 @@ func TestWindowsLaunchMetadataContract(t *testing.T) {
 	})
 }
 
+func TestWindowsLocalAppDataContract(t *testing.T) {
+	t.Run("OwnedACRootSource", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\AppContainer\Owned\Root`}
+		input := []string{"PATH=C:\\bin"}
+		got, err := replenishChildLocalAppData(input, rec)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		found := false
+		var foundVal string
+		for _, kv := range got {
+			k, v, ok := strings.Cut(kv, "=")
+			if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+				found = true
+				foundVal = v
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected LOCALAPPDATA in child environment, got: %v", got)
+		}
+		if foundVal != rec.Root {
+			t.Fatalf("LOCALAPPDATA value mismatch: got %q, want %q", foundVal, rec.Root)
+		}
+	})
+
+	t.Run("NoHostLookup", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Synthetic\Package\AC`}
+		got, err := replenishChildLocalAppData([]string{"PATH=C:\\bin"}, rec)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, kv := range got {
+			k, v, ok := strings.Cut(kv, "=")
+			if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+				if v != rec.Root {
+					t.Fatalf("LOCALAPPDATA took value from non-record source: got %q, want %q", v, rec.Root)
+				}
+			}
+		}
+	})
+
+	t.Run("ExactOneKeyAddition", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Owned\ACRoot`}
+		input := []string{"VAR1=A", "VAR2=B"}
+		got, err := replenishChildLocalAppData(input, rec)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected exactly 3 entries, got %d: %v", len(got), got)
+		}
+		want := []string{"VAR1=A", "VAR2=B", "LOCALAPPDATA=C:\\Owned\\ACRoot"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("output mismatch: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("NilEmptyNonemptyChild", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Owned\ACRoot`}
+		for _, tc := range []struct {
+			name  string
+			child []string
+			want  []string
+		}{
+			{"NilChild", nil, []string{"LOCALAPPDATA=C:\\Owned\\ACRoot"}},
+			{"EmptyChild", []string{}, []string{"LOCALAPPDATA=C:\\Owned\\ACRoot"}},
+			{"NonEmptyChild", []string{"PATH=C:\\bin"}, []string{"PATH=C:\\bin", "LOCALAPPDATA=C:\\Owned\\ACRoot"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := replenishChildLocalAppData(tc.child, rec)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("InputAndSpareCapacityImmutability", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Owned\ACRoot`}
+		backing := make([]string, 2, 8)
+		backing[0] = "KEY1=V1"
+		backing[1] = "KEY2=V2"
+		input := backing[:2]
+
+		origBacking := make([]string, 8)
+		copy(origBacking, backing[:8])
+
+		got, err := replenishChildLocalAppData(input, rec)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(input) != 2 {
+			t.Fatalf("input slice length mutated: got %d, want 2", len(input))
+		}
+		if !slices.Equal(backing[:8], origBacking) {
+			t.Fatalf("input backing array mutated: got %v, want %v", backing[:8], origBacking)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 entries in output, got %d", len(got))
+		}
+	})
+
+	t.Run("CaseAliasesPreservedWithoutDuplication", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Owned\ACRoot`}
+		aliases := []string{
+			"LOCALAPPDATA=C:\\Upper",
+			"localappdata=C:\\Lower",
+			"LocalAppData=C:\\Mixed",
+			"lOcAlApPdAtA=C:\\Weird",
+		}
+		for _, alias := range aliases {
+			input := []string{"PATH=C:\\bin", alias}
+			got, err := replenishChildLocalAppData(input, rec)
+			if err != nil {
+				t.Fatalf("unexpected error for alias %q: %v", alias, err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("expected 2 entries for alias %q, got %d: %v", alias, len(got), got)
+			}
+			found := 0
+			for _, kv := range got {
+				k, _, ok := strings.Cut(kv, "=")
+				if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+					found++
+					if kv != alias {
+						t.Fatalf("alias entry modified: got %q, want %q", kv, alias)
+					}
+				}
+			}
+			if found != 1 {
+				t.Fatalf("expected exactly 1 LOCALAPPDATA entry, got %d", found)
+			}
+		}
+	})
+
+	t.Run("ExplicitEmptyAndNonEmptyRetention", func(t *testing.T) {
+		rec := &RunRecord{Root: `C:\Owned\ACRoot`}
+		cases := []string{"LOCALAPPDATA=", "localappdata=", "LocalAppData=", "LOCALAPPDATA=C:\\Explicit"}
+		for _, explicit := range cases {
+			input := []string{"VAR=1", explicit}
+			got, err := replenishChildLocalAppData(input, rec)
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", explicit, err)
+			}
+			if len(got) != 2 {
+				t.Fatalf("expected 2 entries, got %d: %v", len(got), got)
+			}
+			found := false
+			for _, kv := range got {
+				if kv == explicit {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("explicit entry %q was overwritten: %v", explicit, got)
+			}
+		}
+	})
+
+	t.Run("MissingRootFailclosed", func(t *testing.T) {
+		child := []string{"PATH=C:\\bin"}
+		for _, badRec := range []*RunRecord{nil, {}, {Root: ""}, {Root: "   "}} {
+			got, err := replenishChildLocalAppData(child, badRec)
+			if err == nil {
+				t.Fatalf("expected error for bad record %+v, got nil (result: %v)", badRec, got)
+			}
+			if !errors.Is(err, ErrRefused) {
+				t.Fatalf("expected error wrapping ErrRefused, got: %v", err)
+			}
+		}
+		explicit := []string{"LOCALAPPDATA=C:\\explicit"}
+		got, err := replenishChildLocalAppData(explicit, nil)
+		if err != nil {
+			t.Fatalf("unexpected error when explicit child already present: %v", err)
+		}
+		if len(got) != 1 || got[0] != "LOCALAPPDATA=C:\\explicit" {
+			t.Fatalf("explicit child mutated: %v", got)
+		}
+	})
+
+	t.Run("IntegrationUsesRecordRootNotRequestOrHome", func(t *testing.T) {
+		rec := &RunRecord{
+			Root:        `C:\AC\ControlledPackageFolder`,
+			Home:        `C:\AC\ControlledPackageFolder\home`,
+			ProfileName: "test-profile-contract",
+			PackageSID:  "S-1-15-2-12345-67890",
+		}
+		p := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{"PATH=C:\\bin"}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(p); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		found := false
+		var foundVal string
+		for _, kv := range p.Cmd.Env {
+			k, v, ok := strings.Cut(kv, "=")
+			if ok && strings.EqualFold(k, "LOCALAPPDATA") {
+				found = true
+				foundVal = v
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("LOCALAPPDATA not found in p.Cmd.Env: %v", p.Cmd.Env)
+		}
+		if foundVal != rec.Root {
+			t.Fatalf("LOCALAPPDATA integrated value mismatch: got %q, want rec.Root %q (must not be rec.Home %q)", foundVal, rec.Root, rec.Home)
+		}
+		if !p.ChildLocalAppDataIsOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataIsOwnedRoot == true")
+		}
+		if !p.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataFromOwnedRoot == true")
+		}
+	})
+
+	t.Run("ProvenanceDistinguishesExplicitFromDefault", func(t *testing.T) {
+		rec := &RunRecord{
+			Root:        `C:\AC\OwnedRoot`,
+			Home:        `C:\AC\OwnedRoot\home`,
+			ProfileName: "test-profile-contract",
+			PackageSID:  "S-1-15-2-12345-67890",
+		}
+		pExplicit := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{"LOCALAPPDATA=C:\\other\\appdata"}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pExplicit); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if pExplicit.ChildLocalAppDataIsOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataIsOwnedRoot == false for non-matching explicit path")
+		}
+		if pExplicit.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataFromOwnedRoot == false for explicit path")
+		}
+
+		pMatching := &Prepared{
+			Cmd:      &exec.Cmd{Env: []string{`LOCALAPPDATA=C:\AC\OwnedRoot`}},
+			Confined: true,
+			rec:      rec,
+		}
+		if err := configureConfinedLaunch(pMatching); err != nil {
+			t.Fatalf("configureConfinedLaunch error: %v", err)
+		}
+		if !pMatching.ChildLocalAppDataIsOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataIsOwnedRoot == true for matching path")
+		}
+		if pMatching.ChildLocalAppDataFromOwnedRoot {
+			t.Fatalf("expected ChildLocalAppDataFromOwnedRoot == false for explicit path even if matching")
+		}
+	})
+}
+
 

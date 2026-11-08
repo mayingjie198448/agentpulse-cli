@@ -105,6 +105,8 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	noteManifest(&b, req.RegistryDir, prepared.rec)
 	fmt.Fprintf(&b, "profile_hash=%s\n", prepared.audit.ProfileHash)
 	fmt.Fprintf(&b, "run_root=%s\n", prepared.Root)
+	fmt.Fprintf(&b, "child_localappdata_is_owned_root=%t\n", prepared.ChildLocalAppDataIsOwnedRoot)
+	fmt.Fprintf(&b, "child_localappdata_from_owned_root=%t\n", prepared.ChildLocalAppDataFromOwnedRoot)
 	if err := prepared.Start(); err != nil {
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
 		return b.String(), err
