@@ -3,6 +3,7 @@
 package safety
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -208,10 +209,7 @@ func startAppContainer(p *Prepared) error {
 	}
 	lifetime.list = list
 	lifetime.deleteList = func() error {
-		r, _, err := procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])))
-		if r == 0 {
-			return err
-		}
+		procDeleteProcThreadAttributeList.Call(uintptr(unsafe.Pointer(&list[0])))
 		return nil
 	}
 
@@ -276,13 +274,28 @@ func startAppContainer(p *Prepared) error {
 	si.StartupInfo.StdErr = stderr
 	si.AttributeList = &list[0]
 	var pi windows.ProcessInformation
+
+	creationFlags := uint32(extendedStartupInfoPresent | createUnicodeEnvironment | windows.CREATE_SUSPENDED)
+	meta := captureWindowsLaunchMetadata(
+		creationFlags,
+		&si,
+		&caps,
+		handles,
+		env,
+		envKeep,
+		p.Cmd.Path,
+		p.Cmd.Dir,
+		defaultFixedKeyLookup,
+	)
+	p.audit.WindowsLaunchMetadata = meta
+
 	err = windows.CreateProcess(
 		app, cmdLine, nil, nil, true,
-		extendedStartupInfoPresent|createUnicodeEnvironment|windows.CREATE_SUSPENDED,
+		creationFlags,
 		env, dir, &si.StartupInfo, &pi,
 	)
 	if err != nil {
-		return formatCreateProcessError(err)
+		return formatCreateProcessError(err, meta)
 	}
 	proc, err := os.FindProcess(int(pi.ProcessId))
 	if err != nil {
@@ -349,24 +362,274 @@ func startAppContainer(p *Prepared) error {
 	return nil
 }
 
-func formatCreateProcessError(err error) error {
+type fixedKeyLookup func(key string) (string, bool)
+
+func defaultFixedKeyLookup(key string) (string, bool) {
+	return os.LookupEnv(key)
+}
+
+func classifyWindowsPath(p string) WindowsPathCategory {
+	if p == "" {
+		return PathCategoryEmpty
+	}
+	norm := strings.ReplaceAll(p, "/", `\`)
+	if strings.HasPrefix(norm, `\\?\`) || strings.HasPrefix(norm, `\??\`) || strings.HasPrefix(norm, `\\.\`) {
+		return PathCategoryNTDevice
+	}
+	if strings.HasPrefix(norm, `\\`) {
+		return PathCategoryUNC
+	}
+	if strings.HasPrefix(norm, `\`) {
+		return PathCategoryRootRelative
+	}
+	if len(norm) >= 2 && isDriveLetter(norm[0]) && norm[1] == ':' {
+		if len(norm) >= 3 && norm[2] == '\\' {
+			return PathCategoryDriveAbsolute
+		}
+		return PathCategoryDriveRelative
+	}
+	return PathCategoryRelative
+}
+
+func isDriveLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func queryFixedKey(lookup fixedKeyLookup, key string) (present bool, nonempty bool) {
+	if lookup == nil {
+		lookup = defaultFixedKeyLookup
+	}
+	var keysToTry []string
+	if strings.EqualFold(key, "SYSTEMROOT") {
+		keysToTry = []string{"SYSTEMROOT", "SystemRoot", "systemroot"}
+	} else if strings.EqualFold(key, "LOCALAPPDATA") {
+		keysToTry = []string{"LOCALAPPDATA", "LocalAppData", "localappdata"}
+	} else {
+		keysToTry = []string{key}
+	}
+	for _, k := range keysToTry {
+		if val, ok := lookup(k); ok {
+			return true, len(val) > 0
+		}
+	}
+	return false, false
+}
+
+func equalFoldU16(u []uint16, ascii string) bool {
+	if len(u) != len(ascii) {
+		return false
+	}
+	for i := 0; i < len(u); i++ {
+		c := u[i]
+		a := uint16(ascii[i])
+		if c == a {
+			continue
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if a >= 'a' && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if c != a {
+			return false
+		}
+	}
+	return true
+}
+
+func extractKeyFromU16(e []uint16) []uint16 {
+	for j, c := range e {
+		if c == '=' {
+			if j == 0 && len(e) >= 4 && e[2] == ':' && e[3] == '=' {
+				return e[:3]
+			}
+			return e[:j]
+		}
+	}
+	return e
+}
+
+func inspectEnvBlock(envPtr *uint16, block []uint16) (
+	provided bool,
+	unitCount int,
+	doubleNul bool,
+	structValid bool,
+	sorted bool,
+	sysRootPresent bool,
+	sysRootNonEmpty bool,
+	localAppPresent bool,
+	localAppNonEmpty bool,
+) {
+	provided = (envPtr != nil)
+	unitCount = len(block)
+	if len(block) < 2 {
+		return provided, unitCount, false, false, false, false, false, false, false
+	}
+	if block[len(block)-1] != 0 || block[len(block)-2] != 0 {
+		return provided, unitCount, false, false, false, false, false, false, false
+	}
+	doubleNul = true
+
+	// Empty block: 2 NULs
+	if len(block) == 2 && block[0] == 0 && block[1] == 0 {
+		return provided, unitCount, true, true, true, false, false, false, false
+	}
+
+	var rawEntries [][]uint16
+	start := 0
+	structValid = true
+	for i := 0; i < len(block)-1; i++ {
+		if block[i] == 0 {
+			if i == start {
+				break
+			}
+			rawEntries = append(rawEntries, block[start:i])
+			start = i + 1
+		}
+	}
+	if start != len(block)-1 {
+		structValid = false
+	}
+
+	for _, e := range rawEntries {
+		eq := -1
+		for j, c := range e {
+			if c == '=' {
+				eq = j
+				break
+			}
+		}
+		if eq <= 0 {
+			if len(e) >= 4 && e[0] == '=' && e[2] == ':' && e[3] == '=' {
+				eq = 3
+			} else {
+				structValid = false
+				continue
+			}
+		}
+		k := e[:eq]
+		v := e[eq+1:]
+		if equalFoldU16(k, "SYSTEMROOT") {
+			sysRootPresent = true
+			if len(v) > 0 {
+				sysRootNonEmpty = true
+			}
+		}
+		if equalFoldU16(k, "LOCALAPPDATA") {
+			localAppPresent = true
+			if len(v) > 0 {
+				localAppNonEmpty = true
+			}
+		}
+	}
+
+	sorted = structValid && len(rawEntries) > 0
+	if structValid && len(rawEntries) > 1 {
+		for i := 0; i < len(rawEntries)-1; i++ {
+			k1 := extractKeyFromU16(rawEntries[i])
+			k2 := extractKeyFromU16(rawEntries[i+1])
+			c, err := compareEnvNames(k1, k2)
+			if err != nil || c > 0 {
+				sorted = false
+				break
+			}
+		}
+	}
+
+	return provided, unitCount, doubleNul, structValid, sorted, sysRootPresent, sysRootNonEmpty, localAppPresent, localAppNonEmpty
+}
+
+func captureWindowsLaunchMetadata(
+	creationFlags uint32,
+	si *startupInfoEx,
+	caps *securityCapabilities,
+	handles []windows.Handle,
+	envPtr *uint16,
+	block []uint16,
+	appPath, dirPath string,
+	parentLookup fixedKeyLookup,
+) *WindowsLaunchMetadata {
+	meta := &WindowsLaunchMetadata{
+		CreationFlags: creationFlags,
+	}
+
+	if si != nil {
+		meta.StartupInfoCb = si.StartupInfo.Cb
+		meta.StartupInfoExSize = uint32(unsafe.Sizeof(*si))
+	}
+	if caps != nil {
+		meta.SecurityCapabilitiesSize = uint32(unsafe.Sizeof(*caps))
+		meta.CapabilityCount = caps.CapabilityCount
+		meta.CapabilityReserved = caps.Reserved
+		meta.SIDPresent = (caps.AppContainerSid != nil)
+		meta.SecurityCapabilitiesAttrSize = uint32(unsafe.Sizeof(*caps))
+	}
+	if len(handles) > 0 {
+		meta.HandleListAttrSize = uint32(uintptr(len(handles)) * unsafe.Sizeof(handles[0]))
+		meta.HandleListCount = len(handles)
+	}
+	if caps != nil && len(handles) > 0 {
+		meta.PopulatedAttributeCount = 2
+	} else if caps != nil || len(handles) > 0 {
+		meta.PopulatedAttributeCount = 1
+	}
+
+	pProvided, uCount, dNul, sValid, sorted, cSRPres, cSRNonEmpty, cLAPres, cLANonEmpty := inspectEnvBlock(envPtr, block)
+	meta.EnvPointerProvided = pProvided
+	meta.EnvUTF16UnitCount = uCount
+	meta.EnvDoubleNULValid = dNul
+	meta.EnvStructureValid = sValid
+	meta.EnvSorted = sorted
+	meta.ChildSystemRootAnyPresent = cSRPres
+	meta.ChildSystemRootAnyNonEmpty = cSRNonEmpty
+	meta.ChildLocalAppDataAnyPresent = cLAPres
+	meta.ChildLocalAppDataAnyNonEmpty = cLANonEmpty
+
+	pSRPres, pSRNonEmpty := queryFixedKey(parentLookup, "SYSTEMROOT")
+	pLAPres, pLANonEmpty := queryFixedKey(parentLookup, "LOCALAPPDATA")
+	meta.ParentSystemRootPresent = pSRPres
+	meta.ParentSystemRootNonEmpty = pSRNonEmpty
+	meta.ParentLocalAppDataPresent = pLAPres
+	meta.ParentLocalAppDataNonEmpty = pLANonEmpty
+
+	meta.AppPathCategory = classifyWindowsPath(appPath)
+	if appPath != "" {
+		meta.AppPathUTF16Length = len(utf16.Encode([]rune(appPath)))
+	}
+	meta.CurrentDirCategory = classifyWindowsPath(dirPath)
+	if dirPath != "" {
+		meta.CurrentDirUTF16Length = len(utf16.Encode([]rune(dirPath)))
+	}
+
+	return meta
+}
+
+func formatCreateProcessError(err error, meta ...*WindowsLaunchMetadata) error {
 	if err == nil {
 		return nil
 	}
 	var errno windows.Errno
 	hasErrno := errors.As(err, &errno)
 
+	var metaSuffix string
+	if len(meta) > 0 && meta[0] != nil {
+		if raw, mErr := json.Marshal(meta[0]); mErr == nil {
+			metaSuffix = fmt.Sprintf("; launch_metadata=%s", string(raw))
+		}
+	}
+
 	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		if hasErrno {
-			return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: (errno %d) %w", errno, err)
+			return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: (errno %d) %w%s", errno, err, metaSuffix)
 		}
-		return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: %w", err)
+		return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: %w%s", err, metaSuffix)
 	}
 
 	if hasErrno {
-		return fmt.Errorf("BLOCKED: CreateProcess AppContainer: (errno %d) %w", errno, err)
+		return fmt.Errorf("BLOCKED: CreateProcess AppContainer: (errno %d) %w%s", errno, err, metaSuffix)
 	}
-	return fmt.Errorf("BLOCKED: CreateProcess AppContainer: %w", err)
+	return fmt.Errorf("BLOCKED: CreateProcess AppContainer: %w%s", err, metaSuffix)
 }
 
 func waitCtx(p *Prepared) <-chan struct{} {

@@ -3,6 +3,7 @@
 package safety
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf16"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -1213,4 +1215,535 @@ func TestWindowsConfirmInheritanceContract(t *testing.T) {
 		}
 	})
 }
+
+func TestWindowsLaunchMetadataContract(t *testing.T) {
+	// Approved closed set of exactly 28 metadata JSON keys
+	approvedKeys := map[string]string{
+		"creation_flags":                  "number",
+		"startup_info_cb":                 "number",
+		"startup_info_ex_size":            "number",
+		"security_capabilities_size":      "number",
+		"populated_attribute_count":       "number",
+		"security_capabilities_attr_size": "number",
+		"handle_list_attr_size":           "number",
+		"handle_list_count":               "number",
+		"capability_count":                "number",
+		"capability_reserved":             "number",
+		"sid_present":                     "boolean",
+		"env_pointer_provided":            "boolean",
+		"env_utf16_unit_count":            "number",
+		"env_double_nul_valid":            "boolean",
+		"env_structure_valid":             "boolean",
+		"env_sorted":                      "boolean",
+		"parent_systemroot_present":       "boolean",
+		"parent_systemroot_nonempty":      "boolean",
+		"parent_localappdata_present":     "boolean",
+		"parent_localappdata_nonempty":    "boolean",
+		"child_systemroot_any_present":    "boolean",
+		"child_systemroot_any_nonempty":   "boolean",
+		"child_localappdata_any_present":  "boolean",
+		"child_localappdata_any_nonempty": "boolean",
+		"app_path_category":               "string",
+		"app_path_utf16_length":           "number",
+		"current_dir_category":            "string",
+		"current_dir_utf16_length":        "number",
+	}
+
+	t.Run("ClosedKeyAllowlistAndValueTypes", func(t *testing.T) {
+		meta := &WindowsLaunchMetadata{
+			CreationFlags:                0x08000404,
+			StartupInfoCb:                112,
+			StartupInfoExSize:            112,
+			SecurityCapabilitiesSize:     32,
+			PopulatedAttributeCount:      2,
+			SecurityCapabilitiesAttrSize: 32,
+			HandleListAttrSize:           24,
+			HandleListCount:              3,
+			CapabilityCount:              0,
+			CapabilityReserved:           0,
+			SIDPresent:                   true,
+			EnvPointerProvided:           true,
+			EnvUTF16UnitCount:            64,
+			EnvDoubleNULValid:            true,
+			EnvStructureValid:            true,
+			EnvSorted:                    true,
+			ParentSystemRootPresent:      true,
+			ParentSystemRootNonEmpty:     true,
+			ParentLocalAppDataPresent:    true,
+			ParentLocalAppDataNonEmpty:   true,
+			ChildSystemRootAnyPresent:    true,
+			ChildSystemRootAnyNonEmpty:   true,
+			ChildLocalAppDataAnyPresent:  false,
+			ChildLocalAppDataAnyNonEmpty: false,
+			AppPathCategory:              PathCategoryDriveAbsolute,
+			AppPathUTF16Length:           28,
+			CurrentDirCategory:           PathCategoryEmpty,
+			CurrentDirUTF16Length:        0,
+		}
+
+		raw, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("json.Unmarshal failed: %v", err)
+		}
+
+		if len(m) != len(approvedKeys) {
+			t.Fatalf("key count mismatch: got %d keys, want %d approved keys", len(m), len(approvedKeys))
+		}
+
+		for k, val := range m {
+			expectedType, ok := approvedKeys[k]
+			if !ok {
+				t.Fatalf("unapproved key present in metadata: %s", k)
+			}
+			switch expectedType {
+			case "number":
+				if _, ok := val.(float64); !ok {
+					t.Fatalf("field %s expected number, got %T", k, val)
+				}
+			case "boolean":
+				if _, ok := val.(bool); !ok {
+					t.Fatalf("field %s expected boolean, got %T", k, val)
+				}
+			case "string":
+				s, ok := val.(string)
+				if !ok {
+					t.Fatalf("field %s expected string, got %T", k, val)
+				}
+				switch WindowsPathCategory(s) {
+				case PathCategoryEmpty, PathCategoryRelative, PathCategoryDriveAbsolute,
+					PathCategoryDriveRelative, PathCategoryRootRelative, PathCategoryUNC,
+					PathCategoryNTDevice, PathCategoryUnknown:
+				default:
+					t.Fatalf("field %s contains unapproved category enum: %s", k, s)
+				}
+			}
+		}
+	})
+
+	t.Run("ActualFlagsSizesCountsReflected", func(t *testing.T) {
+		si := &startupInfoEx{}
+		si.StartupInfo.Cb = uint32(unsafe.Sizeof(*si))
+		caps := &securityCapabilities{
+			AppContainerSid: new(windows.SID),
+			CapabilityCount: 5,
+			Reserved:        9,
+		}
+		handles := []windows.Handle{10, 20, 30, 40}
+		rawEnv := []uint16{'A', '=', '1', 0, 0}
+		lookup := func(key string) (string, bool) {
+			if strings.EqualFold(key, "SYSTEMROOT") {
+				return "C:\\Windows", true
+			}
+			return "", false
+		}
+
+		meta := captureWindowsLaunchMetadata(
+			0x08000404,
+			si,
+			caps,
+			handles,
+			&rawEnv[0],
+			rawEnv,
+			"C:\\bin\\app.exe",
+			"",
+			lookup,
+		)
+
+		if meta.CreationFlags != 0x08000404 {
+			t.Fatalf("CreationFlags mismatch: got 0x%x, want 0x08000404", meta.CreationFlags)
+		}
+		if meta.StartupInfoCb != uint32(unsafe.Sizeof(*si)) {
+			t.Fatalf("StartupInfoCb mismatch: got %d, want %d", meta.StartupInfoCb, unsafe.Sizeof(*si))
+		}
+		if meta.StartupInfoExSize != uint32(unsafe.Sizeof(*si)) {
+			t.Fatalf("StartupInfoExSize mismatch: got %d, want %d", meta.StartupInfoExSize, unsafe.Sizeof(*si))
+		}
+		if meta.SecurityCapabilitiesSize != uint32(unsafe.Sizeof(*caps)) {
+			t.Fatalf("SecurityCapabilitiesSize mismatch: got %d, want %d", meta.SecurityCapabilitiesSize, unsafe.Sizeof(*caps))
+		}
+		if meta.PopulatedAttributeCount != 2 {
+			t.Fatalf("PopulatedAttributeCount mismatch: got %d, want 2", meta.PopulatedAttributeCount)
+		}
+		if meta.SecurityCapabilitiesAttrSize != uint32(unsafe.Sizeof(*caps)) {
+			t.Fatalf("SecurityCapabilitiesAttrSize mismatch: got %d, want %d", meta.SecurityCapabilitiesAttrSize, unsafe.Sizeof(*caps))
+		}
+		expectedHandleAttrSize := uint32(uintptr(len(handles)) * unsafe.Sizeof(handles[0]))
+		if meta.HandleListAttrSize != expectedHandleAttrSize {
+			t.Fatalf("HandleListAttrSize mismatch: got %d, want %d", meta.HandleListAttrSize, expectedHandleAttrSize)
+		}
+		if meta.HandleListCount != 4 {
+			t.Fatalf("HandleListCount mismatch: got %d, want 4", meta.HandleListCount)
+		}
+		if meta.CapabilityCount != 5 {
+			t.Fatalf("CapabilityCount mismatch: got %d, want 5", meta.CapabilityCount)
+		}
+		if meta.CapabilityReserved != 9 {
+			t.Fatalf("CapabilityReserved mismatch: got %d, want 9", meta.CapabilityReserved)
+		}
+		if !meta.SIDPresent {
+			t.Fatalf("SIDPresent expected true, got false")
+		}
+	})
+
+	t.Run("ParentChildSeparated", func(t *testing.T) {
+		// Parent has SYSTEMROOT and LOCALAPPDATA; Child has neither
+		parentLookup := func(k string) (string, bool) {
+			if strings.EqualFold(k, "SYSTEMROOT") {
+				return "C:\\Windows", true
+			}
+			if strings.EqualFold(k, "LOCALAPPDATA") {
+				return "C:\\Users\\user\\AppData\\Local", true
+			}
+			return "", false
+		}
+
+		childEntries := []string{"CUSTOM_VAR=value"}
+		_, childBlock, err := envBlock(childEntries)
+		if err != nil {
+			t.Fatalf("envBlock failed: %v", err)
+		}
+
+		meta := captureWindowsLaunchMetadata(
+			0, nil, nil, nil, &childBlock[0], childBlock, "app.exe", "", parentLookup,
+		)
+
+		if !meta.ParentSystemRootPresent || !meta.ParentSystemRootNonEmpty {
+			t.Fatalf("parent SYSTEMROOT presence/nonempty failed")
+		}
+		if !meta.ParentLocalAppDataPresent || !meta.ParentLocalAppDataNonEmpty {
+			t.Fatalf("parent LOCALAPPDATA presence/nonempty failed")
+		}
+		if meta.ChildSystemRootAnyPresent || meta.ChildSystemRootAnyNonEmpty {
+			t.Fatalf("child SYSTEMROOT unexpectedly marked present/nonempty")
+		}
+		if meta.ChildLocalAppDataAnyPresent || meta.ChildLocalAppDataAnyNonEmpty {
+			t.Fatalf("child LOCALAPPDATA unexpectedly marked present/nonempty")
+		}
+
+		// Reverse: Parent has neither; Child has both
+		emptyParent := func(k string) (string, bool) { return "", false }
+		childWithBoth := []string{"LOCALAPPDATA=C:\\ChildAppData", "SYSTEMROOT=C:\\ChildWindows"}
+		_, childBlockBoth, err := envBlock(childWithBoth)
+		if err != nil {
+			t.Fatalf("envBlock failed: %v", err)
+		}
+
+		meta2 := captureWindowsLaunchMetadata(
+			0, nil, nil, nil, &childBlockBoth[0], childBlockBoth, "app.exe", "", emptyParent,
+		)
+
+		if meta2.ParentSystemRootPresent || meta2.ParentSystemRootNonEmpty {
+			t.Fatalf("parent SYSTEMROOT unexpectedly marked present")
+		}
+		if meta2.ParentLocalAppDataPresent || meta2.ParentLocalAppDataNonEmpty {
+			t.Fatalf("parent LOCALAPPDATA unexpectedly marked present")
+		}
+		if !meta2.ChildSystemRootAnyPresent || !meta2.ChildSystemRootAnyNonEmpty {
+			t.Fatalf("child SYSTEMROOT expected present and nonempty")
+		}
+		if !meta2.ChildLocalAppDataAnyPresent || !meta2.ChildLocalAppDataAnyNonEmpty {
+			t.Fatalf("child LOCALAPPDATA expected present and nonempty")
+		}
+	})
+
+	t.Run("FixedKeyPresenceAndNonEmptyVariants", func(t *testing.T) {
+		// Missing, empty, and non-empty for parent and child
+		variants := []struct {
+			name        string
+			parentVal   string
+			parentFound bool
+			childVal    string
+			childFound  bool
+			wantPPres   bool
+			wantPNonEmp bool
+			wantCPres   bool
+			wantCNonEmp bool
+		}{
+			{"BothMissing", "", false, "", false, false, false, false, false},
+			{"ParentEmptyChildMissing", "", true, "", false, true, false, false, false},
+			{"ParentNonEmptyChildMissing", "C:\\Sys", true, "", false, true, true, false, false},
+			{"ParentMissingChildEmpty", "", false, "SYSTEMROOT=", true, false, false, true, false},
+			{"ParentMissingChildNonEmpty", "", false, "SYSTEMROOT=C:\\Sys", true, false, false, true, true},
+			{"BothEmpty", "", true, "SYSTEMROOT=", true, true, false, true, false},
+			{"BothNonEmpty", "C:\\ParentSys", true, "SYSTEMROOT=C:\\ChildSys", true, true, true, true, true},
+		}
+
+		for _, v := range variants {
+			t.Run(v.name, func(t *testing.T) {
+				pLookup := func(k string) (string, bool) {
+					if strings.EqualFold(k, "SYSTEMROOT") {
+						return v.parentVal, v.parentFound
+					}
+					return "", false
+				}
+				var cBlock []uint16
+				if v.childFound {
+					_, b, err := envBlock([]string{v.childVal})
+					if err != nil {
+						t.Fatalf("envBlock failed: %v", err)
+					}
+					cBlock = b
+				} else {
+					_, b, err := envBlock([]string{"OTHER=1"})
+					if err != nil {
+						t.Fatalf("envBlock failed: %v", err)
+					}
+					cBlock = b
+				}
+
+				meta := captureWindowsLaunchMetadata(
+					0, nil, nil, nil, &cBlock[0], cBlock, "app.exe", "", pLookup,
+				)
+
+				if meta.ParentSystemRootPresent != v.wantPPres {
+					t.Fatalf("ParentSystemRootPresent mismatch: got %v, want %v", meta.ParentSystemRootPresent, v.wantPPres)
+				}
+				if meta.ParentSystemRootNonEmpty != v.wantPNonEmp {
+					t.Fatalf("ParentSystemRootNonEmpty mismatch: got %v, want %v", meta.ParentSystemRootNonEmpty, v.wantPNonEmp)
+				}
+				if meta.ChildSystemRootAnyPresent != v.wantCPres {
+					t.Fatalf("ChildSystemRootAnyPresent mismatch: got %v, want %v", meta.ChildSystemRootAnyPresent, v.wantCPres)
+				}
+				if meta.ChildSystemRootAnyNonEmpty != v.wantCNonEmp {
+					t.Fatalf("ChildSystemRootAnyNonEmpty mismatch: got %v, want %v", meta.ChildSystemRootAnyNonEmpty, v.wantCNonEmp)
+				}
+			})
+		}
+	})
+
+	t.Run("FixedKeyCaseAliasesAndDuplicateSemantics", func(t *testing.T) {
+		// Case aliases: systemroot, SystemRoot, sYsTeMrOoT
+		// Duplicate semantics: any-present / any-nonempty
+		childWithDup := []string{
+			"systemroot=",                // empty
+			"SystemRoot=C:\\WinNonEmpty", // nonempty
+			"LOCALAPPDATA=",              // empty
+			"localappdata=",              // empty
+		}
+		_, b, err := envBlock(childWithDup)
+		if err != nil {
+			t.Fatalf("envBlock failed: %v", err)
+		}
+
+		meta := captureWindowsLaunchMetadata(
+			0, nil, nil, nil, &b[0], b, "app.exe", "", nil,
+		)
+
+		if !meta.ChildSystemRootAnyPresent {
+			t.Fatalf("ChildSystemRootAnyPresent expected true")
+		}
+		if !meta.ChildSystemRootAnyNonEmpty {
+			t.Fatalf("ChildSystemRootAnyNonEmpty expected true due to any-nonempty duplicate rule")
+		}
+		if !meta.ChildLocalAppDataAnyPresent {
+			t.Fatalf("ChildLocalAppDataAnyPresent expected true")
+		}
+		if meta.ChildLocalAppDataAnyNonEmpty {
+			t.Fatalf("ChildLocalAppDataAnyNonEmpty expected false when all matching duplicates are empty")
+		}
+	})
+
+	t.Run("DoubleNULAndMalformedBuffer", func(t *testing.T) {
+		// 1. Valid double NUL
+		validBlock := []uint16{'F', 'O', 'O', '=', '1', 0, 0}
+		m1 := captureWindowsLaunchMetadata(0, nil, nil, nil, &validBlock[0], validBlock, "app.exe", "", nil)
+		if !m1.EnvDoubleNULValid || !m1.EnvStructureValid {
+			t.Fatalf("valid block marked invalid: doubleNul=%v, struct=%v", m1.EnvDoubleNULValid, m1.EnvStructureValid)
+		}
+
+		// 2. Missing double NUL (single NUL at end)
+		singleNUL := []uint16{'F', 'O', 'O', '=', '1', 0}
+		m2 := captureWindowsLaunchMetadata(0, nil, nil, nil, &singleNUL[0], singleNUL, "app.exe", "", nil)
+		if m2.EnvDoubleNULValid || m2.EnvStructureValid {
+			t.Fatalf("single NUL unexpectedly marked valid")
+		}
+
+		// 3. No NUL at end
+		noNUL := []uint16{'F', 'O', 'O', '=', '1'}
+		m3 := captureWindowsLaunchMetadata(0, nil, nil, nil, &noNUL[0], noNUL, "app.exe", "", nil)
+		if m3.EnvDoubleNULValid || m3.EnvStructureValid {
+			t.Fatalf("no NUL unexpectedly marked valid")
+		}
+
+		// 4. Malformed entry without '='
+		noEquals := []uint16{'N', 'O', 'E', 'Q', 'U', 'A', 'L', 'S', 0, 0}
+		m4 := captureWindowsLaunchMetadata(0, nil, nil, nil, &noEquals[0], noEquals, "app.exe", "", nil)
+		if !m4.EnvDoubleNULValid {
+			t.Fatalf("expected double NUL to be recognized even if entry malformed")
+		}
+		if m4.EnvStructureValid {
+			t.Fatalf("malformed entry without '=' marked structure valid")
+		}
+
+		// 5. Nil block
+		m5 := captureWindowsLaunchMetadata(0, nil, nil, nil, nil, nil, "app.exe", "", nil)
+		if m5.EnvPointerProvided || m5.EnvUTF16UnitCount != 0 || m5.EnvDoubleNULValid || m5.EnvStructureValid {
+			t.Fatalf("nil block marked present or valid")
+		}
+	})
+
+	t.Run("SortAndStructureChecks", func(t *testing.T) {
+		// Sorted entries: ALPHA < BETA < GAMMA
+		_, sortedBlock, err := envBlock([]string{"ALPHA=1", "BETA=2", "GAMMA=3"})
+		if err != nil {
+			t.Fatalf("envBlock failed: %v", err)
+		}
+		mSorted := captureWindowsLaunchMetadata(0, nil, nil, nil, &sortedBlock[0], sortedBlock, "app.exe", "", nil)
+		if !mSorted.EnvSorted || !mSorted.EnvStructureValid {
+			t.Fatalf("sorted block marked unsorted or invalid: sorted=%v, struct=%v", mSorted.EnvSorted, mSorted.EnvStructureValid)
+		}
+
+		// Unsorted entries: BETA then ALPHA
+		unsortedBlock := []uint16{
+			'B', 'E', 'T', 'A', '=', '2', 0,
+			'A', 'L', 'P', 'H', 'A', '=', '1', 0,
+			0,
+		}
+		mUnsorted := captureWindowsLaunchMetadata(0, nil, nil, nil, &unsortedBlock[0], unsortedBlock, "app.exe", "", nil)
+		if mUnsorted.EnvSorted {
+			t.Fatalf("unsorted block unexpectedly marked sorted")
+		}
+		if !mUnsorted.EnvStructureValid {
+			t.Fatalf("unsorted block unexpectedly marked structure invalid")
+		}
+	})
+
+	t.Run("PathCategoryAndUTF16Length", func(t *testing.T) {
+		cases := []struct {
+			path     string
+			wantCat  WindowsPathCategory
+			wantULen int
+		}{
+			{"", PathCategoryEmpty, 0},
+			{"app.exe", PathCategoryRelative, 7},
+			{".\\sub\\app.exe", PathCategoryRelative, 13},
+			{"C:\\Windows\\System32\\cmd.exe", PathCategoryDriveAbsolute, 27},
+			{"c:/windows/system32/cmd.exe", PathCategoryDriveAbsolute, 27},
+			{"C:relative.exe", PathCategoryDriveRelative, 14},
+			{"\\Windows\\cmd.exe", PathCategoryRootRelative, 16},
+			{"\\\\server\\share\\tool.exe", PathCategoryUNC, 23},
+			{"\\\\?\\C:\\tools\\app.exe", PathCategoryNTDevice, 20},
+			{"\\??\\C:\\tools\\app.exe", PathCategoryNTDevice, 20},
+			{"\\\\.\\COM1", PathCategoryNTDevice, 8},
+		}
+
+		for _, tc := range cases {
+			t.Run(string(tc.wantCat)+"_"+tc.path, func(t *testing.T) {
+				meta := captureWindowsLaunchMetadata(0, nil, nil, nil, nil, nil, tc.path, tc.path, nil)
+				if meta.AppPathCategory != tc.wantCat {
+					t.Fatalf("AppPathCategory mismatch: got %q, want %q", meta.AppPathCategory, tc.wantCat)
+				}
+				if meta.AppPathUTF16Length != tc.wantULen {
+					t.Fatalf("AppPathUTF16Length mismatch: got %d, want %d", meta.AppPathUTF16Length, tc.wantULen)
+				}
+				if meta.CurrentDirCategory != tc.wantCat {
+					t.Fatalf("CurrentDirCategory mismatch: got %q, want %q", meta.CurrentDirCategory, tc.wantCat)
+				}
+				if meta.CurrentDirUTF16Length != tc.wantULen {
+					t.Fatalf("CurrentDirUTF16Length mismatch: got %d, want %d", meta.CurrentDirUTF16Length, tc.wantULen)
+				}
+			})
+		}
+	})
+
+	t.Run("InputImmutability", func(t *testing.T) {
+		handles := []windows.Handle{windows.Handle(100), windows.Handle(200)}
+		handlesCopy := slices.Clone(handles)
+
+		block := []uint16{'K', 'E', 'Y', '=', 'V', 'A', 'L', 0, 0}
+		blockCopy := slices.Clone(block)
+
+		si := &startupInfoEx{}
+		si.StartupInfo.Cb = 112
+		siCopy := *si
+
+		caps := &securityCapabilities{CapabilityCount: 2, Reserved: 4}
+		capsCopy := *caps
+
+		_ = captureWindowsLaunchMetadata(0x08000404, si, caps, handles, &block[0], block, "C:\\test\\app.exe", "C:\\test", nil)
+
+		if !slices.Equal(handles, handlesCopy) {
+			t.Fatalf("handles slice mutated by metadata capture")
+		}
+		if !slices.Equal(block, blockCopy) {
+			t.Fatalf("environment block mutated by metadata capture")
+		}
+		if *si != siCopy {
+			t.Fatalf("startupInfoEx mutated by metadata capture")
+		}
+		if *caps != capsCopy {
+			t.Fatalf("securityCapabilities mutated by metadata capture")
+		}
+	})
+
+	t.Run("NoSecretLeakageInJSON", func(t *testing.T) {
+		// Provide inputs with synthetic secret tokens, passwords, accounts, and full paths
+		secretToken := "s3cr3t_token_val_12345"
+		secretPassword := "pass_phrase_hidden_67890"
+		secretAccount := "secret_admin_user_9999"
+		secretPath := "C:\\SensitiveCorpDirectory\\TopSecret\\app.exe"
+		secretDir := "D:\\ClassifiedWorkDir\\ProjectX"
+
+		envEntries := []string{
+			"SECRET_TOKEN=" + secretToken,
+			"SECRET_PASSWORD=" + secretPassword,
+			"ACCOUNT=" + secretAccount,
+			"SYSTEMROOT=C:\\Windows",
+		}
+		_, b, err := envBlock(envEntries)
+		if err != nil {
+			t.Fatalf("envBlock failed: %v", err)
+		}
+
+		parentLookup := func(k string) (string, bool) {
+			if strings.EqualFold(k, "SYSTEMROOT") {
+				return "C:\\Windows", true
+			}
+			return "", false
+		}
+
+		meta := captureWindowsLaunchMetadata(
+			0x08000000,
+			nil,
+			nil,
+			nil,
+			&b[0],
+			b,
+			secretPath,
+			secretDir,
+			parentLookup,
+		)
+
+		rawJSON, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+
+		jsonStr := string(rawJSON)
+
+		// Assert that none of the secrets appear in serialized metadata
+		// Rule: Failure message MUST NOT echo the secret tokens or entire JSON
+		if strings.Contains(jsonStr, secretToken) {
+			t.Fatalf("security check failed: secret token leaked in metadata JSON")
+		}
+		if strings.Contains(jsonStr, secretPassword) {
+			t.Fatalf("security check failed: secret password leaked in metadata JSON")
+		}
+		if strings.Contains(jsonStr, secretAccount) {
+			t.Fatalf("security check failed: secret account name leaked in metadata JSON")
+		}
+		if strings.Contains(jsonStr, "SensitiveCorpDirectory") {
+			t.Fatalf("security check failed: secret application path leaked in metadata JSON")
+		}
+		if strings.Contains(jsonStr, "ClassifiedWorkDir") {
+			t.Fatalf("security check failed: secret current directory leaked in metadata JSON")
+		}
+	})
+}
+
 
