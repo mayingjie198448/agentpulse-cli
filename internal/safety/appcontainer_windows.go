@@ -202,12 +202,7 @@ func stringsTrim(s string) string { return strings.TrimSpace(s) }
 
 type sidReleaseFunc func(*windows.SID) error
 
-func localFreeSIDAdapter(sid *windows.SID) error {
-	_, err := windows.LocalFree(windows.Handle(unsafe.Pointer(sid)))
-	return err
-}
-
-var sidFreeReleaser sidReleaseFunc = localFreeSIDAdapter
+var sidFreeReleaser sidReleaseFunc = windows.FreeSid
 
 func freeSIDWith(sid *windows.SID, releaser sidReleaseFunc) error {
 	if sid == nil || releaser == nil {
