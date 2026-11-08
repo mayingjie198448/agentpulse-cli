@@ -200,8 +200,22 @@ func deleteAppProfile(name string) error {
 
 func stringsTrim(s string) string { return strings.TrimSpace(s) }
 
-func freeSID(sid *windows.SID) {
-	if sid != nil {
-		windows.LocalFree(windows.Handle(unsafe.Pointer(sid)))
+type sidReleaseFunc func(*windows.SID) error
+
+func localFreeSIDAdapter(sid *windows.SID) error {
+	_, err := windows.LocalFree(windows.Handle(unsafe.Pointer(sid)))
+	return err
+}
+
+var sidFreeReleaser sidReleaseFunc = localFreeSIDAdapter
+
+func freeSIDWith(sid *windows.SID, releaser sidReleaseFunc) error {
+	if sid == nil || releaser == nil {
+		return nil
 	}
+	return releaser(sid)
+}
+
+func freeSID(sid *windows.SID) {
+	_ = freeSIDWith(sid, sidFreeReleaser)
 }
