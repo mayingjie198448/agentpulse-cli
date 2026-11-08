@@ -3,14 +3,21 @@
 package safety
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+)
+
+var (
+	procCompareStringOrdinal = modKernel32.NewProc("CompareStringOrdinal")
 )
 
 func configureConfinedLaunch(p *Prepared) error {
@@ -46,6 +53,9 @@ func configureConfinedLaunch(p *Prepared) error {
 	p.audit.IsolationBackend = "windows-appcontainer"
 	p.audit.IsolationDetail = "LowBox AppContainer capability_count=0; write root is the per-run package folder; this-run executable copy only; no DACL edits; no internetClient capability; credential broker IPC BLOCKED; cross-compile is not a native pass"
 	p.audit.Network = "no_internetClient_capability"
+	if p.Cmd != nil {
+		p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
+	}
 	p.startFn = func() error { return startAppContainer(p) }
 	return nil
 }
@@ -150,6 +160,7 @@ func startAppContainer(p *Prepared) error {
 	if err != nil {
 		return err
 	}
+	p.Cmd.Env = addCriticalEnv(p.Cmd.Env)
 	env, envKeep, err := envBlock(p.Cmd.Env)
 	if err != nil {
 		return err
@@ -173,10 +184,7 @@ func startAppContainer(p *Prepared) error {
 		env, dir, &si.StartupInfo, &pi,
 	)
 	if err != nil {
-		if err == windows.ERROR_ACCESS_DENIED {
-			return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: %v", err)
-		}
-		return fmt.Errorf("BLOCKED: CreateProcess AppContainer: %v", err)
+		return formatCreateProcessError(err)
 	}
 	proc, err := os.FindProcess(int(pi.ProcessId))
 	if err != nil {
@@ -241,6 +249,26 @@ func startAppContainer(p *Prepared) error {
 	}
 	started = true
 	return nil
+}
+
+func formatCreateProcessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var errno windows.Errno
+	hasErrno := errors.As(err, &errno)
+
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		if hasErrno {
+			return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: (errno %d) %w", errno, err)
+		}
+		return fmt.Errorf("BLOCKED: AppContainer cannot start the executable (access denied). Refusing to rewrite ACLs outside the fixture temp or package folder. Missing capability: executable image readable by this AppContainer SID. Win32: %w", err)
+	}
+
+	if hasErrno {
+		return fmt.Errorf("BLOCKED: CreateProcess AppContainer: (errno %d) %w", errno, err)
+	}
+	return fmt.Errorf("BLOCKED: CreateProcess AppContainer: %w", err)
 }
 
 func waitCtx(p *Prepared) <-chan struct{} {
@@ -349,17 +377,125 @@ func duplicateInheritable(src windows.Handle) (windows.Handle, func(), error) {
 	return dup, func() { windows.CloseHandle(dup) }, nil
 }
 
+var systemRootLookup = defaultSystemRootLookup
+
+func defaultSystemRootLookup() string {
+	if v := os.Getenv("SystemRoot"); v != "" {
+		return v
+	}
+	return os.Getenv("SYSTEMROOT")
+}
+
+// addCriticalEnv adds critical environment variables required on Windows
+// (specifically SYSTEMROOT), following Go's os/exec addCriticalEnv convention.
+// If SYSTEMROOT is already present (checked case-insensitively), it is retained.
+// Other parent environment variables are not inherited.
+func addCriticalEnv(env []string) []string {
+	return addCriticalEnvWithLookup(env, systemRootLookup)
+}
+
+func addCriticalEnvWithLookup(env []string, lookup func() string) []string {
+	for _, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(k, "SYSTEMROOT") {
+			return env
+		}
+	}
+	var systemRoot string
+	if lookup != nil {
+		systemRoot = lookup()
+	}
+	return append(slices.Clone(env), "SYSTEMROOT="+systemRoot)
+}
+
+func extractEnvName(entry string) string {
+	for i := 0; i < len(entry); i++ {
+		if entry[i] == '=' {
+			if i == 0 {
+				continue
+			}
+			return entry[:i]
+		}
+	}
+	return entry
+}
+
+func compareEnvNames(u1, u2 []uint16) (int, error) {
+	if len(u1) == 0 && len(u2) == 0 {
+		return 0, nil
+	}
+	if len(u1) == 0 {
+		return -1, nil
+	}
+	if len(u2) == 0 {
+		return 1, nil
+	}
+	r, _, callErr := procCompareStringOrdinal.Call(
+		uintptr(unsafe.Pointer(&u1[0])),
+		uintptr(len(u1)),
+		uintptr(unsafe.Pointer(&u2[0])),
+		uintptr(len(u2)),
+		1, // bIgnoreCase = TRUE (OS uppercase table, exactly 1)
+	)
+	switch r {
+	case 1: // CSTR_LESS_THAN
+		return -1, nil
+	case 2: // CSTR_EQUAL
+		return 0, nil
+	case 3: // CSTR_GREATER_THAN
+		return 1, nil
+	case 0:
+		return 0, fmt.Errorf("CompareStringOrdinal failed: %w", callErr)
+	default:
+		return 0, fmt.Errorf("CompareStringOrdinal returned unexpected code %d", r)
+	}
+}
+
 func envBlock(env []string) (*uint16, []uint16, error) {
 	if len(env) == 0 {
 		return nil, nil, nil
 	}
-	var block []uint16
-	for _, kv := range env {
+
+	type envEntry struct {
+		name []uint16
+		u16  []uint16
+	}
+
+	entries := make([]envEntry, len(env))
+	for i, kv := range env {
 		u, err := windows.UTF16FromString(kv)
 		if err != nil {
 			return nil, nil, err
 		}
-		block = append(block, u...)
+		name := extractEnvName(kv)
+		entries[i] = envEntry{
+			name: utf16.Encode([]rune(name)),
+			u16:  u,
+		}
+	}
+
+	var sortErr error
+	slices.SortStableFunc(entries, func(a, b envEntry) int {
+		if sortErr != nil {
+			return 0
+		}
+		c, err := compareEnvNames(a.name, b.name)
+		if err != nil {
+			sortErr = err
+			return 0
+		}
+		return c
+	})
+	if sortErr != nil {
+		return nil, nil, sortErr
+	}
+
+	var block []uint16
+	for _, e := range entries {
+		block = append(block, e.u16...)
 	}
 	block = append(block, 0)
 	return &block[0], block, nil
