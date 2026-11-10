@@ -24,6 +24,12 @@ const (
 
 type tickMsg time.Time
 
+type refreshDoneMsg struct {
+	machines []model.Machine
+	jobs     []model.Job
+	err      error
+}
+
 // Model is the Bubble Tea application state for `agentpulse watch`.
 type Model struct {
 	store   store.Store
@@ -52,6 +58,7 @@ type Model struct {
 	confirmDelete    bool
 	deleteTargetID   string
 	deleteError      string
+	refreshError     string
 }
 
 // BrokerConnected returns true if the MQTT broker is currently connected.
@@ -165,13 +172,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = false
 				m.deleteTargetID = ""
 				return m, nil
-				m.deleteTargetID = ""
-				return m, nil
 			}
 		}
 
 		if m.deleteError != "" && msg.String() != "d" {
 			m.deleteError = ""
+		}
+		if m.refreshError != "" && msg.String() != "r" && msg.String() != "R" {
+			m.refreshError = ""
 		}
 
 		switch msg.String() {
@@ -211,6 +219,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logs[curJob.ID] = []model.LogEntry{}
 				m.updateViewportContent()
 			}
+
+		case "r", "R":
+			return m, m.triggerRefresh()
 
 		case "d":
 			if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) {
@@ -368,6 +379,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.brokerConnected = m.store.IsConnected()
 		}
 		cmds = append(cmds, clockTick())
+
+	case refreshDoneMsg:
+		if msg.err != nil {
+			m.refreshError = fmt.Sprintf("刷新失败: %v", msg.err)
+			return m, nil
+		}
+		m.refreshError = ""
+		m.machines = msg.machines
+		m.jobs = msg.jobs
+
+		// Clean up logs for jobs that no longer exist
+		activeJobIDs := make(map[string]bool, len(m.jobs))
+		for _, j := range m.jobs {
+			activeJobIDs[j.ID] = true
+		}
+		for jid := range m.logs {
+			if !activeJobIDs[jid] {
+				delete(m.logs, jid)
+			}
+		}
+
+		if len(m.jobs) == 0 {
+			m.selectedJobIdx = 0
+			m.jobsScrollOffset = 0
+		} else if m.selectedJobIdx >= len(m.jobs) {
+			m.selectedJobIdx = len(m.jobs) - 1
+		}
+
+		m.ensureLogsLoadedForSelectedJob()
+		m.updateViewportContent()
 	}
 
 	if m.activePane == PaneLogs {
@@ -377,6 +418,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) triggerRefresh() tea.Cmd {
+	st := m.store
+	ctx := m.ctx
+	return func() tea.Msg {
+		if st == nil {
+			return refreshDoneMsg{err: fmt.Errorf("未连接存储引擎")}
+		}
+		refreshErr := st.Refresh(ctx)
+		if refreshErr != nil {
+			return refreshDoneMsg{err: refreshErr}
+		}
+		machs, err := st.ListMachines(ctx)
+		if err != nil {
+			return refreshDoneMsg{err: err}
+		}
+		jobs, err := st.ListJobs(ctx)
+		if err != nil {
+			return refreshDoneMsg{err: err}
+		}
+		return refreshDoneMsg{
+			machines: machs,
+			jobs:     jobs,
+		}
+	}
 }
 
 func (m *Model) removeJobFromModel(jobID string) {
@@ -726,7 +793,17 @@ func (m *Model) renderMachinesBox(width, maxHeight int) string {
 			}
 
 			nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorLightText)
-			name := nameStyle.Render(fmt.Sprintf("%-10s", mach.Name))
+			primaryID := mach.ID
+			if primaryID == "" {
+				primaryID = mach.Name
+			}
+			var name string
+			if mach.Name != "" && mach.Name != primaryID {
+				hostStyle := lipgloss.NewStyle().Foreground(ColorDimText)
+				name = fmt.Sprintf("%s %s", nameStyle.Render(primaryID), hostStyle.Render("("+mach.Name+")"))
+			} else {
+				name = nameStyle.Render(fmt.Sprintf("%-10s", primaryID))
+			}
 			heartbeat := lipgloss.NewStyle().Foreground(ColorDimText).Render(fmt.Sprintf("%-8s", mach.HeartbeatAgo()))
 			jobCount := lipgloss.NewStyle().Foreground(ColorHighlight).Render(fmt.Sprintf("[%d jobs]", mach.JobCount))
 
@@ -1047,6 +1124,7 @@ func (m *Model) renderFooter() string {
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("tab"), FooterDescStyle.Render("切换面板")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("j/k"), FooterDescStyle.Render("选择任务")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("d"), FooterDescStyle.Render("删除任务")),
+		fmt.Sprintf("%s %s", FooterKeyStyle.Render("r"), FooterDescStyle.Render("刷新")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("enter"), FooterDescStyle.Render("追踪/聚焦")),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("space"), FooterDescStyle.Render(pauseText)),
 		fmt.Sprintf("%s %s", FooterKeyStyle.Render("a"), FooterDescStyle.Render("自动滚动")),
@@ -1058,7 +1136,10 @@ func (m *Model) renderFooter() string {
 		sep = " • "
 	}
 	bar := strings.Join(keys, sep)
-	if m.deleteError != "" {
+	if m.refreshError != "" {
+		errStr := lipgloss.NewStyle().Bold(true).Foreground(ColorRed).Render("✖ " + m.refreshError)
+		bar = errStr + "  |  " + bar
+	} else if m.deleteError != "" {
 		errStr := lipgloss.NewStyle().Bold(true).Foreground(ColorRed).Render("✖ " + m.deleteError)
 		bar = errStr + "  |  " + bar
 	}

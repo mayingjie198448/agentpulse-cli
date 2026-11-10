@@ -3,15 +3,27 @@ package cli_test
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/spf13/cobra"
 )
+
+func TestMain(m *testing.M) {
+	tmpHome, err := os.MkdirTemp("", "agentpulse-cli-test-home-*")
+	if err == nil {
+		_ = os.Setenv("HOME", tmpHome)
+		_ = os.Setenv("XDG_CONFIG_HOME", tmpHome)
+		defer os.RemoveAll(tmpHome)
+	}
+	os.Exit(m.Run())
+}
 
 func TestRootCommands(t *testing.T) {
 	tests := []struct {
@@ -1272,5 +1284,77 @@ func TestJobsDeleteCommand_StructureAndHelp(t *testing.T) {
 		if !strings.Contains(helpOut, expected) {
 			t.Errorf("expected help output to contain %q, got:\n%s", expected, helpOut)
 		}
+	}
+}
+
+func TestAutostartCommand_CLI(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"autostart", "status"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("failed to execute autostart status: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "AgentPulse 开机自启常驻状态") {
+		t.Errorf("expected autostart header, got:\n%s", out)
+	}
+	if !strings.Contains(out, "LaunchAgent") {
+		t.Errorf("expected LaunchAgent mention, got:\n%s", out)
+	}
+
+	// Test config autostart status
+	buf.Reset()
+	cmd = cli.NewRootCmd()
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"config", "autostart", "status"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("failed to execute config autostart status: %v", err)
+	}
+	if !strings.Contains(buf.String(), "AgentPulse 开机自启常驻状态") {
+		t.Errorf("expected config autostart status output, got:\n%s", buf.String())
+	}
+}
+
+func TestDoctorCommand_AutostartDisplay(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	cfg := &config.Config{
+		Version:   1,
+		MachineID: "doctor-box",
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, cfg); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"doctor", "--config", confPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("doctor failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "开机自启 (LaunchAgent)") {
+		t.Errorf("expected doctor output to show autostart status, got:\n%s", out)
 	}
 }
