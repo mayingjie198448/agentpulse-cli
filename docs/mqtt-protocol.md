@@ -298,6 +298,20 @@ flowchart TD
 }
 ```
 
+#### 4.4.1 并发调度、工作区 (cwd / worktree) 隔离与资源风险说明
+
+为了兼顾高吞吐与执行安全性，AgentPulse 支持通过 `config.yaml` 的 `max_concurrent_jobs` 或 CLI 参数 `--max-concurrent-jobs` 配置单机并发作业数：
+
+1. **默认串行安全（Default Serial Execution）**：
+   - `max_concurrent_jobs` 默认为 `1`。当机器当前已有作业处于 `running` 状态时，新派发的任务将在调度队列中保持 `queued` 状态排队等待，保证单机作业严格按序执行。
+2. **工作区目录 (cwd / worktree) 隔离要求**：
+   - 当 `max_concurrent_jobs > 1` 时，多个 Agent 进程可能在同一台物理机器上并发运行。
+   - **禁止共用相同 Git 仓库工作区**：若两个或多个并发任务指定了相同的 `cwd`，Agent 在执行代码分析、修改、测试与 git 提交时必然发生严重冲突（例如 `.git/index.lock` 争用、未提交代码覆盖、构建产物互相干扰等）。
+   - **推荐隔离机制**：调度发起方应确保并发任务的 `cwd` 指向不同物理路径，推荐结合 `git worktree add <path> <branch>` 为每个并发任务派生独立的瞬态工作树，任务结束后再合并清理。
+3. **计算与外部 API 资源风险**：
+   - **主机资源**：每个并发 Agent 进程（如 Node.js / Go / Python 进程与 LSP 语言服务器）均会消耗可观的 CPU 与内存（约 500MB~2GB/进程），需根据物理主机规格合理设置并发度，避免 OOM。
+   - **模型配额限制**：多任务并发对云端大模型 API 发起请求时易触发并发速率限制（Rate Limit / 429 Too Many Requests），需确保 API Token 配额充足。
+
 ---
 
 ### 4.5 完成/失败告警与邮件通知 (Completion & Failure Notification)

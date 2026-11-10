@@ -176,6 +176,10 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 	// safety.Prepare; isolation failure does not start a bare child.
 	pMQTT := &listenerMQTT
 	isPlain := termutil.ShouldUsePlain(plainOutput)
+	maxConcurrent := 1
+	if fileCfg != nil && fileCfg.MaxConcurrentJobs > 0 {
+		maxConcurrent = fileCfg.MaxConcurrentJobs
+	}
 	listenerCfg := wrapper.ListenerConfig{
 		MachineID:                  machineID,
 		MachineName:                host,
@@ -187,6 +191,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		Agents:                     agentsToProbe,
 		Stdout:                     io.Discard,
 		Stderr:                     io.Discard,
+		MaxConcurrentJobs:          maxConcurrent,
 		OnMQTTConnected: func() {
 			opts := paho.NewClientOptions()
 			_ = mqtt.ApplyClientOptions(opts, announceMQTT)

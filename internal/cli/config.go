@@ -120,10 +120,12 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		cfg.Version = existingCfg.Version
 		cfg.Rev = existingCfg.Rev + 1
 		cfg.MachineID = existingCfg.MachineID
+		cfg.MaxConcurrentJobs = existingCfg.MaxConcurrentJobs
 		cfg.Broker = existingCfg.Broker
 		cfg.Agents = existingCfg.Agents
 		cfg.Autostart = existingCfg.Autostart
 	} else {
+		cfg.MaxConcurrentJobs = 1
 		cfg.Broker = config.BrokerConfig{
 			URL: "tls://broker.example:8883",
 			TLS: true,
@@ -368,6 +370,8 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 			mark = fmt.Sprintf("✓ 可用 (%s)", p.Detail)
 		} else if strings.Contains(p.Detail, "禁用") {
 			mark = "[-] 已禁用"
+		} else if p.Detail != "" {
+			mark = fmt.Sprintf("✗ %s", p.Detail)
 		}
 		aliases := strings.Join(p.Alias, ", ")
 		fmt.Fprintf(out, "  • %-10s [别名: %-14s] : %s\n", p.ID, aliases, mark)

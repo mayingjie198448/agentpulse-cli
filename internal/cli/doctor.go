@@ -59,10 +59,14 @@ func newDoctorCmd() *cobra.Command {
 				if err == nil {
 					permStr = fmt.Sprintf("权限: %#o", info.Mode().Perm())
 				}
+				concurrencyStr := "1 (串行默认)"
+				if fileCfg.MaxConcurrentJobs > 1 {
+					concurrencyStr = fmt.Sprintf("%d (并发)", fileCfg.MaxConcurrentJobs)
+				}
 				if fileCfg.MachineID == "" {
 					fmt.Fprintf(out, "[WARN] 配置文件: %s (%s, 未配置 machine_id，请运行 'agentpulse config' 配置)\n", confPath, permStr)
 				} else {
-					fmt.Fprintf(out, "[OK] 配置文件: %s (%s, machine_id=%s, rev=%d)\n", confPath, permStr, fileCfg.MachineID, fileCfg.Rev)
+					fmt.Fprintf(out, "[OK] 配置文件: %s (%s, machine_id=%s, rev=%d, 并发上限=%s)\n", confPath, permStr, fileCfg.MachineID, fileCfg.Rev, concurrencyStr)
 				}
 				if fileCfg.Autostart {
 					fmt.Fprintf(out, "[OK] 开机自启 (LaunchAgent): 已在配置中启用\n")
