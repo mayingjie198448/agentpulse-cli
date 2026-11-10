@@ -81,6 +81,93 @@ type Prepared struct {
 	// removeFn, when set, replaces deleteOwned. Tests use it to observe cleanup.
 	removeFn       func() (CleanupOutcome, error)
 	blockedCleanup error
+	// seatbeltProfile is the exact profile string handed to sandbox-exec.
+	// It is kept on Prepared so a refused launch can audit it after the run
+	// root is deleted. It is not a verification result.
+	seatbeltProfile string
+	launchStage     string
+	childStderr     string
+	stderrW         *os.File
+	stderrDrain     chan struct{}
+}
+
+const childStderrLimit = 2048
+
+// rememberSeatbeltProfile stores the profile that configureConfinedLaunch
+// will pass to sandbox-exec. The run-root cleanup must not be the only copy.
+func rememberSeatbeltProfile(p *Prepared, profile string) {
+	if p == nil {
+		return
+	}
+	p.seatbeltProfile = profile
+	if p.launchStage == "" {
+		p.launchStage = "profile_ready"
+	}
+}
+
+// beginChildStderrCapture tees the child stderr into a capped buffer.
+// The parent write end is closed by the caller after Start so the drain
+// finishes when the child exits. It does not read the system log.
+func (p *Prepared) beginChildStderrCapture() {
+	if p == nil || p.Cmd == nil || p.stderrDrain != nil {
+		return
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return
+	}
+	prev := p.Cmd.Stderr
+	p.Cmd.Stderr = w
+	p.stderrW = w
+	done := make(chan struct{})
+	p.stderrDrain = done
+	go func() {
+		defer close(done)
+		defer r.Close()
+		buf := make([]byte, 512)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				p.noteChildStderr(buf[:n])
+				if prev != nil {
+					_, _ = prev.Write(buf[:n])
+				}
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+}
+
+// finishChildStderr closes the parent write end and waits for the drain.
+// It is safe to call more than once. It does not wait for a live child:
+// the caller must already have closed the child or not started it.
+func (p *Prepared) finishChildStderr() {
+	if p == nil {
+		return
+	}
+	if p.stderrW != nil {
+		_ = p.stderrW.Close()
+		p.stderrW = nil
+	}
+	if p.stderrDrain != nil {
+		<-p.stderrDrain
+		p.stderrDrain = nil
+	}
+}
+
+// noteChildStderr keeps a bounded prefix of the child stderr for the refusal
+// audit. Bytes past the cap are dropped. This does not read system logs.
+func (p *Prepared) noteChildStderr(b []byte) {
+	if p == nil || len(b) == 0 || len(p.childStderr) >= childStderrLimit {
+		return
+	}
+	room := childStderrLimit - len(p.childStderr)
+	if len(b) > room {
+		b = b[:room]
+	}
+	p.childStderr += string(b)
 }
 
 // Outcome separates the user child from the controller.
@@ -321,12 +408,24 @@ func (p *Prepared) Start() error {
 	if p.startFn != nil {
 		err = p.startFn()
 	} else {
+		p.beginChildStderrCapture()
 		err = p.Cmd.Start()
+		if p.stderrW != nil {
+			_ = p.stderrW.Close()
+			p.stderrW = nil
+		}
 	}
 	if err != nil {
+		if p.launchStage == "" || p.launchStage == "profile_ready" {
+			p.launchStage = "child_start_error"
+		}
+		p.finishChildStderr()
 		p.keepRoot(err)
 		p.finishRefused(err.Error(), nil)
 		return composeStartError(err)
+	}
+	if p.launchStage == "" || p.launchStage == "profile_ready" {
+		p.launchStage = "child_started"
 	}
 	p.started = true
 	if p.pid == 0 && p.Cmd != nil && p.Cmd.Process != nil {
@@ -392,6 +491,13 @@ func (p *Prepared) readConfirm() error {
 	// Record the status Wait actually returned. HelperExitVerify (78) is what
 	// the helper uses when it reaches failVerify; stamping it here hid exits
 	// that happened before any confirm byte was written.
+	switch {
+	case msg == "EOF" || msg == "helper closed confirm pipe before OK":
+		p.launchStage = "confirm_pipe_eof"
+	default:
+		p.launchStage = "confirm_rejected"
+	}
+	p.finishChildStderr()
 	p.finishRefused(msg, observedHelperExit(werr))
 	return fmt.Errorf("verification failed before user command: %s", msg)
 }
@@ -438,6 +544,7 @@ func (p *Prepared) Wait() (Outcome, error) {
 		waitErr = p.waitChild()
 		p.reaped = true
 	}
+	p.finishChildStderr()
 	out := Outcome{AuditPath: p.auditPath()}
 	if !p.Confined {
 		code, ok := exitCodeOf(waitErr)
@@ -502,6 +609,9 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 	p.audit.HelperExit = helper
 	p.audit.ExitCode = ExitRefused
 	p.audit.ChildExit = nil
+	p.audit.LaunchStage = p.launchStage
+	p.audit.SeatbeltProfile = p.seatbeltProfile
+	p.audit.ChildStderr = p.childStderr
 	if p.rec != nil || p.removeFn != nil {
 		cout, cerr := p.removeRoot()
 		p.audit.CleanupResult = cout.Result

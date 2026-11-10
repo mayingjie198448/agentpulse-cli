@@ -31,17 +31,24 @@ type AuditEvent struct {
 	IsolationBackend  string   `json:"isolation_backend"`
 	IsolationApplied  bool     `json:"isolation_applied"`
 	IsolationDetail   string   `json:"isolation_detail,omitempty"`
-	FSWrite           string   `json:"fs_write"`
-	CredentialIPC     string   `json:"credential_ipc"`
-	Network           string   `json:"network"`
-	BlockedSurfaces   []string `json:"blocked_surfaces,omitempty"`
-	ChildExit         *int     `json:"child_exit"`
-	ControllerResult  string   `json:"controller_result"`
-	HelperExit        *int     `json:"helper_exit,omitempty"`
-	CleanupTargets    []string `json:"cleanup_targets,omitempty"`
-	CleanupResult     string   `json:"cleanup_result,omitempty"`
-	CleanupReason     string   `json:"cleanup_reason,omitempty"`
-	ExitCode          int      `json:"exit_code"`
+	// SeatbeltProfile is the exact profile passed to sandbox-exec. It survives
+	// run-root cleanup because the audit file lives outside that root.
+	SeatbeltProfile string `json:"seatbelt_profile,omitempty"`
+	// LaunchStage is the controller stage that refused. It is not a Seatbelt result.
+	LaunchStage string `json:"launch_stage,omitempty"`
+	// ChildStderr is a capped, redacted prefix of the child stderr.
+	ChildStderr           string                 `json:"child_stderr,omitempty"`
+	FSWrite               string                 `json:"fs_write"`
+	CredentialIPC         string                 `json:"credential_ipc"`
+	Network               string                 `json:"network"`
+	BlockedSurfaces       []string               `json:"blocked_surfaces,omitempty"`
+	ChildExit             *int                   `json:"child_exit"`
+	ControllerResult      string                 `json:"controller_result"`
+	HelperExit            *int                   `json:"helper_exit,omitempty"`
+	CleanupTargets        []string               `json:"cleanup_targets,omitempty"`
+	CleanupResult         string                 `json:"cleanup_result,omitempty"`
+	CleanupReason         string                 `json:"cleanup_reason,omitempty"`
+	ExitCode              int                    `json:"exit_code"`
 	WindowsLaunchMetadata *WindowsLaunchMetadata `json:"windows_launch_metadata,omitempty"`
 }
 
@@ -132,14 +139,43 @@ func redactString(s string) string {
 	return s
 }
 
+// redactDiagnostic removes credential assignments entirely. redactString leaves
+// "mqtt-password=[REDACTED]", which still contains "password=" and would make
+// AppendAudit refuse to store the refusal line.
+func redactDiagnostic(s string) string {
+	s = redactString(s)
+	low := strings.ToLower(s)
+	for _, needle := range []string{"password=", "token=", "secret="} {
+		for {
+			i := strings.Index(low, needle)
+			if i < 0 {
+				break
+			}
+			start := i
+			for start > 0 && s[start-1] != ' ' && s[start-1] != '\n' && s[start-1] != '"' {
+				start--
+			}
+			end := i + len(needle)
+			for end < len(s) && s[end] != ' ' && s[end] != '\n' && s[end] != '"' {
+				end++
+			}
+			s = s[:start] + "[REDACTED]" + s[end:]
+			low = strings.ToLower(s)
+		}
+	}
+	return s
+}
+
 func redactAssignment(s, key string) string {
 	low := strings.ToLower(s)
 	needle := key + "="
-	for {
-		i := strings.Index(low, needle)
-		if i < 0 {
+	from := 0
+	for from < len(low) {
+		rel := strings.Index(low[from:], needle)
+		if rel < 0 {
 			return s
 		}
+		i := from + rel
 		start := i + len(needle)
 		end := start
 		for end < len(s) && s[end] != '&' && s[end] != ' ' && s[end] != '\n' {
@@ -147,7 +183,14 @@ func redactAssignment(s, key string) string {
 		}
 		s = s[:start] + "[REDACTED]" + s[end:]
 		low = strings.ToLower(s)
+		// The key itself still contains needle ("password=[REDACTED]").
+		// Continue after this replacement instead of replacing it forever.
+		from = start + len("[REDACTED]")
+		if from > len(low) {
+			from = len(low)
+		}
 	}
+	return s
 }
 
 // AppendAudit writes one redacted JSON line. The path must sit outside the run root.
@@ -158,6 +201,9 @@ func AppendAudit(path string, ev AuditEvent) error {
 	ev.Argv = RedactArgv(ev.Argv)
 	ev.IsolationDetail = redactString(ev.IsolationDetail)
 	ev.CleanupReason = redactString(ev.CleanupReason)
+	ev.SeatbeltProfile = redactDiagnostic(ev.SeatbeltProfile)
+	ev.LaunchStage = redactDiagnostic(ev.LaunchStage)
+	ev.ChildStderr = redactDiagnostic(ev.ChildStderr)
 	if ev.TimestampUTC == "" {
 		now := time.Now()
 		ev.TimestampUTC, ev.TimestampShanghai = formatTimes(now)

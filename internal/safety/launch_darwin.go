@@ -29,6 +29,7 @@ func configureConfinedLaunch(p *Prepared) error {
 	if err != nil {
 		return fmt.Errorf("%w: seatbelt profile generation: %v", ErrRefused, err)
 	}
+	rememberSeatbeltProfile(p, profile)
 
 	isolateArgs := p.Cmd.Args[1:]
 	argv, err := buildDarwinSandboxExecArgv(sandboxExecPath, profile, selfExe, isolateArgs)
