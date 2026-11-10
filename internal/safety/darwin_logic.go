@@ -292,14 +292,128 @@ type DarwinSyntheticProbeProof struct {
 	Dev           uint64
 	Ino           uint64
 	RunID         string
+	Root          string
 	Nonce         string
 	Minted        bool
 }
 
-var darwinSyntheticProofs sync.Map
+type darwinPendingSyntheticProbe struct {
+	CanonicalPath string
+	Dev           uint64
+	Ino           uint64
+}
+
+// DarwinImageProof proves that an executable was validated for this run.
+type DarwinImageProof struct {
+	CanonicalPath string
+	RunID         string
+	Root          string
+	ExeSHA256     string
+	Minted        bool
+}
+
+var (
+	darwinSyntheticProofs sync.Map
+	darwinPendingProbes   sync.Map
+	darwinImageProofs     sync.Map
+)
+
+func clearDarwinRegistries() {
+	darwinSyntheticProofs.Range(func(key, value any) bool {
+		darwinSyntheticProofs.Delete(key)
+		return true
+	})
+	darwinPendingProbes.Range(func(key, value any) bool {
+		darwinPendingProbes.Delete(key)
+		return true
+	})
+	darwinImageProofs.Range(func(key, value any) bool {
+		darwinImageProofs.Delete(key)
+		return true
+	})
+}
+
+// registerPendingDarwinSyntheticProbe records the fresh exclusive synthetic creation of a sentinel
+// before the run ID is generated. It validates canonical path, protected boundaries, and nonzero identity.
+func registerPendingDarwinSyntheticProbe(probePath string, dev, ino uint64) error {
+	if strings.TrimSpace(probePath) == "" {
+		return fmt.Errorf("%w: empty synthetic probe path", ErrRefused)
+	}
+	if err := validateDarwinCanonicalPath(probePath); err != nil {
+		return fmt.Errorf("%w: synthetic probe path not canonical: %v", ErrRefused, err)
+	}
+	clean := path.Clean(probePath)
+	if clean != probePath || !path.IsAbs(probePath) {
+		return fmt.Errorf("%w: synthetic probe path not canonical: %s", ErrRefused, probePath)
+	}
+	if strings.HasPrefix(clean, "/Volumes/") || strings.HasPrefix(clean, "/Users/") || strings.HasPrefix(clean, "/System/Volumes/Data/Users/") {
+		return fmt.Errorf("%w: synthetic probe cannot be in home/volume: %s", ErrRefused, clean)
+	}
+	for _, sens := range []string{".ssh", "Keychains", "login.keychain", "credentials", ".config", ".aws", ".gnupg"} {
+		for _, part := range strings.Split(clean, "/") {
+			if part == sens {
+				return fmt.Errorf("%w: synthetic probe contains sensitive segment %s", ErrRefused, sens)
+			}
+		}
+	}
+	if dev == 0 || ino == 0 {
+		return fmt.Errorf("%w: synthetic probe has zero device or inode", ErrSentinelUnusable)
+	}
+	darwinPendingProbes.Store(clean, darwinPendingSyntheticProbe{
+		CanonicalPath: clean,
+		Dev:           dev,
+		Ino:           ino,
+	})
+	return nil
+}
+
+// bindDarwinSyntheticProbe transitions an exclusive pending synthetic sentinel into an authoritative
+// one-run bound proof. If sentPath was not pending, it is a no-op (caller-provided sentinel
+// is not blessed). If pending identity mismatches or run ID/root/nonce are empty, it fails closed.
+func bindDarwinSyntheticProbe(runID, rootPath, nonce, sentPath string, sdev, sino uint64) error {
+	clean := path.Clean(sentPath)
+	val, ok := darwinPendingProbes.Load(clean)
+	if !ok {
+		// Not a pending synthetic probe created by this process.
+		return nil
+	}
+	pending, ok := val.(darwinPendingSyntheticProbe)
+	if !ok {
+		return fmt.Errorf("%w: corrupt pending probe state", ErrSentinelUnusable)
+	}
+	if pending.Dev != sdev || pending.Ino != sino || pending.CanonicalPath != clean {
+		return fmt.Errorf("%w: pending probe identity mismatch (dev/ino)", ErrSentinelUnusable)
+	}
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(rootPath) == "" || strings.TrimSpace(nonce) == "" || sdev == 0 || sino == 0 {
+		return fmt.Errorf("%w: incomplete run identity for probe binding", ErrSentinelUnusable)
+	}
+	// Atomic consume: exclusive one-run transition
+	darwinPendingProbes.Delete(clean)
+	proof := DarwinSyntheticProbeProof{
+		CanonicalPath: clean,
+		Dev:           sdev,
+		Ino:           sino,
+		RunID:         runID,
+		Root:          path.Clean(rootPath),
+		Nonce:         nonce,
+		Minted:        true,
+	}
+	darwinSyntheticProofs.Store(clean, proof)
+	return nil
+}
 
 // mintDarwinSyntheticProbe records an owned this-run synthetic probe proof.
-func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce string) (DarwinSyntheticProbeProof, error) {
+// Exact non-empty runID, nonce, and nonzero dev, ino are required; no empty wildcard.
+func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce string, root ...string) (DarwinSyntheticProbeProof, error) {
+	if strings.TrimSpace(runID) == "" {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty runID", ErrRefused)
+	}
+	if strings.TrimSpace(nonce) == "" {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty nonce", ErrRefused)
+	}
+	if dev == 0 || ino == 0 {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: zero device or inode", ErrSentinelUnusable)
+	}
 	if strings.TrimSpace(probePath) == "" {
 		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty probe path", ErrRefused)
 	}
@@ -307,6 +421,9 @@ func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce st
 		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: probe path not canonical: %v", ErrRefused, err)
 	}
 	clean := path.Clean(probePath)
+	if clean != probePath || !path.IsAbs(probePath) {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: probe path not canonical: %s", ErrRefused, probePath)
+	}
 	if strings.HasPrefix(clean, "/Volumes/") || strings.HasPrefix(clean, "/Users/") || strings.HasPrefix(clean, "/System/Volumes/Data/Users/") {
 		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: synthetic probe cannot be in home/volume: %s", ErrRefused, clean)
 	}
@@ -317,11 +434,16 @@ func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce st
 			}
 		}
 	}
+	rootPath := ""
+	if len(root) > 0 {
+		rootPath = path.Clean(root[0])
+	}
 	proof := DarwinSyntheticProbeProof{
 		CanonicalPath: clean,
 		Dev:           dev,
 		Ino:           ino,
 		RunID:         runID,
+		Root:          rootPath,
 		Nonce:         nonce,
 		Minted:        true,
 	}
@@ -329,14 +451,65 @@ func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce st
 	return proof, nil
 }
 
-func isVerifiedDarwinSyntheticProbe(p string) bool {
+func isVerifiedDarwinSyntheticProbe(p string, root ...string) bool {
 	clean := path.Clean(p)
 	val, ok := darwinSyntheticProofs.Load(clean)
 	if !ok {
 		return false
 	}
 	proof, ok := val.(DarwinSyntheticProbeProof)
-	return ok && proof.Minted && proof.CanonicalPath == clean
+	if !ok || !proof.Minted || proof.CanonicalPath != clean || proof.RunID == "" || proof.Nonce == "" || proof.Dev == 0 || proof.Ino == 0 {
+		return false
+	}
+	if len(root) > 0 && strings.TrimSpace(root[0]) != "" {
+		if proof.Root != "" && proof.Root != path.Clean(root[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+func mintDarwinImageProof(runID, root, exePath, exeSHA256 string) (DarwinImageProof, error) {
+	if strings.TrimSpace(runID) == "" {
+		return DarwinImageProof{}, fmt.Errorf("%w: empty runID for image proof", ErrRefused)
+	}
+	if strings.TrimSpace(root) == "" {
+		return DarwinImageProof{}, fmt.Errorf("%w: empty root for image proof", ErrRefused)
+	}
+	if strings.TrimSpace(exePath) == "" {
+		return DarwinImageProof{}, fmt.Errorf("%w: empty exePath for image proof", ErrRefused)
+	}
+	if strings.TrimSpace(exeSHA256) == "" {
+		return DarwinImageProof{}, fmt.Errorf("%w: empty exeSHA256 for image proof", ErrRefused)
+	}
+	clean := path.Clean(exePath)
+	proof := DarwinImageProof{
+		CanonicalPath: clean,
+		RunID:         runID,
+		Root:          path.Clean(root),
+		ExeSHA256:     exeSHA256,
+		Minted:        true,
+	}
+	darwinImageProofs.Store(clean, proof)
+	return proof, nil
+}
+
+func isVerifiedDarwinImage(p string, root ...string) bool {
+	clean := path.Clean(p)
+	val, ok := darwinImageProofs.Load(clean)
+	if !ok {
+		return false
+	}
+	proof, ok := val.(DarwinImageProof)
+	if !ok || !proof.Minted || proof.CanonicalPath != clean || proof.RunID == "" || proof.ExeSHA256 == "" {
+		return false
+	}
+	if len(root) > 0 && strings.TrimSpace(root[0]) != "" {
+		if proof.Root != "" && proof.Root != path.Clean(root[0]) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveDarwinAllowedReads strictly resolves read permissions for confined Darwin launch.
@@ -350,10 +523,27 @@ func resolveDarwinAllowedReads(rec RunRecord, selfExe string, homes []string) ([
 		return nil, fmt.Errorf("%w: target executable is not canonical: %v", ErrRefused, err)
 	}
 	cleanExe := path.Clean(selfExe)
+	if cleanExe != selfExe || !path.IsAbs(selfExe) {
+		return nil, fmt.Errorf("%w: target executable is not canonical: %q", ErrRefused, selfExe)
+	}
 	for _, home := range homes {
 		if strings.TrimSpace(home) != "" && (withinPath(home, cleanExe) || cleanExe == home) {
 			return nil, fmt.Errorf("%w: target executable cannot be inside protected home %q", ErrRefused, home)
 		}
+	}
+	for _, forbidden := range []string{
+		"/Users",
+		"/System/Volumes/Data/Users",
+		"/Library/Keychains",
+		"/private/var/root",
+		"/private/var/db/dslocal",
+	} {
+		if withinPath(forbidden, cleanExe) || cleanExe == forbidden {
+			return nil, fmt.Errorf("%w: target executable is inside protected path %q", ErrRefused, forbidden)
+		}
+	}
+	if strings.HasPrefix(cleanExe, "/Volumes/") {
+		return nil, fmt.Errorf("%w: target executable is in external volume: %s", ErrRefused, cleanExe)
 	}
 	for _, sens := range []string{".ssh", "Keychains", "login.keychain", "credentials", ".config", ".aws", ".gnupg"} {
 		for _, part := range strings.Split(cleanExe, "/") {
@@ -362,17 +552,29 @@ func resolveDarwinAllowedReads(rec RunRecord, selfExe string, homes []string) ([
 			}
 		}
 	}
+
+	// Derive image trust from actual existing validated exe identity/hash path, not an arbitrary caller label.
+	if strings.TrimSpace(rec.RunID) != "" && strings.TrimSpace(rec.Root) != "" && strings.TrimSpace(rec.ExeSHA256) != "" {
+		if _, err := mintDarwinImageProof(rec.RunID, rec.Root, cleanExe, rec.ExeSHA256); err != nil {
+			return nil, fmt.Errorf("%w: mint image proof: %v", ErrRefused, err)
+		}
+	}
+
 	allowed := []string{cleanExe}
 
 	// Only an owned, verified this-run synthetic probe can be granted read permission.
 	// Arbitrary caller sentinels, unverified paths, or paths inside protected homes FAIL CLOSED.
-	if rec.Sentinel != "" {
+	// Nonempty exact run/root/nonce and matching nonzero sentinel identity required; no empty wildcard.
+	if rec.Sentinel != "" && strings.TrimSpace(rec.RunID) != "" && strings.TrimSpace(rec.Nonce) != "" && rec.SentinelDev != 0 && rec.SentinelIno != 0 {
 		cleanSent := path.Clean(rec.Sentinel)
-		if cleanSent == rec.Sentinel { // exact canonical matching, no case or alias difference
+		if cleanSent == rec.Sentinel && path.IsAbs(rec.Sentinel) {
 			val, ok := darwinSyntheticProofs.Load(cleanSent)
 			if ok {
 				proof, isProof := val.(DarwinSyntheticProbeProof)
-				if isProof && proof.Minted && proof.CanonicalPath == cleanSent && (rec.RunID == "" || proof.RunID == "" || proof.RunID == rec.RunID) {
+				if isProof && proof.Minted && proof.CanonicalPath == cleanSent &&
+					proof.RunID == rec.RunID && proof.Nonce == rec.Nonce &&
+					proof.Dev == rec.SentinelDev && proof.Ino == rec.SentinelIno &&
+					(proof.Root == "" || rec.Root == "" || proof.Root == path.Clean(rec.Root)) {
 					inHome := false
 					for _, home := range homes {
 						if strings.TrimSpace(home) != "" && (withinPath(home, cleanSent) || cleanSent == home) {

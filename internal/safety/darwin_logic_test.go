@@ -11,6 +11,9 @@ import (
 )
 
 func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
+	clearDarwinRegistries()
+	defer clearDarwinRegistries()
+
 	root := "/private/tmp/agentpulse-runs/test-run-root"
 	prof, err := DarwinSeatbeltProfile(root)
 	if err != nil {
@@ -76,7 +79,9 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 
 	// Allowed readable literal: safe external synthetic sentinel
 	safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-12345678"
-	_, _ = mintDarwinSyntheticProbe("run1", safeProbe, 100, 200, "nonce1")
+	if _, err := mintDarwinSyntheticProbe("run1", safeProbe, 100, 200, "nonce1", root); err != nil {
+		t.Fatalf("unexpected error minting safe probe: %v", err)
+	}
 	profWithProbe, err := DarwinSeatbeltProfile(root, safeProbe)
 	if err != nil {
 		t.Fatalf("unexpected error adding safe probe literal: %v", err)
@@ -84,6 +89,20 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 	wantLit := "(allow file-read* (literal \"/private/tmp/agentpulse-sentinels/sentinel-12345678\"))"
 	if !strings.Contains(profWithProbe, wantLit) {
 		t.Errorf("seatbelt profile missing safe read literal %q", wantLit)
+	}
+
+	// Allowed readable literal: validated executable image
+	validExe := "/usr/bin/agentpulse"
+	if _, err := mintDarwinImageProof("run1", root, validExe, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); err != nil {
+		t.Fatalf("unexpected error minting image proof: %v", err)
+	}
+	profWithExe, err := DarwinSeatbeltProfile(root, validExe)
+	if err != nil {
+		t.Fatalf("unexpected error adding validated image literal: %v", err)
+	}
+	wantExeLit := "(allow file-read* (literal \"/usr/bin/agentpulse\"))"
+	if !strings.Contains(profWithExe, wantExeLit) {
+		t.Errorf("seatbelt profile missing validated image literal %q", wantExeLit)
 	}
 	// Ancestor directory literals of root must be present to permit traversal
 	for _, anc := range []string{"/", "/private", "/private/tmp", "/private/tmp/agentpulse-runs"} {
@@ -559,9 +578,16 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 	})
 
 	t.Run("LaunchAllowedReadsResolution", func(t *testing.T) {
+		clearDarwinRegistries()
+		defer clearDarwinRegistries()
+
 		rec := RunRecord{
-			RunID: "run1234567890abcdef1234567890ab",
-			Root:  "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
+			RunID:       "run1234567890abcdef1234567890ab",
+			Root:        "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
+			Nonce:       "nonce1234567890abcdef1234567890ab",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			SentinelDev: 100,
+			SentinelIno: 200,
 		}
 		selfExe := "/usr/bin/agentpulse"
 		homes := []string{"/Users/alice", "/Volumes/custom-home/bob"}
@@ -599,7 +625,7 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 
 		// Verified this-run synthetic probe enters allowed reads
 		safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-bound1"
-		_, err = mintDarwinSyntheticProbe(rec.RunID, safeProbe, 100, 200, "nonce1")
+		_, err = mintDarwinSyntheticProbe(rec.RunID, safeProbe, 100, 200, rec.Nonce, rec.Root)
 		if err != nil {
 			t.Fatalf("failed to mint synthetic probe: %v", err)
 		}
@@ -617,6 +643,177 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		badExe := "/Users/alice/bin/agentpulse"
 		if _, err := resolveDarwinAllowedReads(rec, badExe, homes); err == nil {
 			t.Fatal("expected error when self executable is inside protected home")
+		}
+	})
+
+	t.Run("ComposedResolveProfileContract", func(t *testing.T) {
+		clearDarwinRegistries()
+		defer clearDarwinRegistries()
+
+		rec := RunRecord{
+			RunID:       "run1234567890abcdef1234567890ab",
+			Root:        "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
+			Nonce:       "nonce1234567890abcdef1234567890ab",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			SentinelDev: 100,
+			SentinelIno: 200,
+		}
+		selfExe := "/usr/bin/agentpulse"
+		homes := []string{"/Users/alice"}
+
+		safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-composed1"
+		_, err := mintDarwinSyntheticProbe(rec.RunID, safeProbe, 100, 200, rec.Nonce, rec.Root)
+		if err != nil {
+			t.Fatalf("mint probe failed: %v", err)
+		}
+		rec.Sentinel = safeProbe
+
+		// 1. Resolve allowed reads contains both selfExe and safeProbe
+		allowedReads, err := resolveDarwinAllowedReads(rec, selfExe, homes)
+		if err != nil {
+			t.Fatalf("resolveDarwinAllowedReads failed: %v", err)
+		}
+		if len(allowedReads) != 2 || allowedReads[0] != selfExe || allowedReads[1] != safeProbe {
+			t.Fatalf("expected [selfExe safeProbe], got %v", allowedReads)
+		}
+
+		// 2. Pure composition: DarwinSeatbeltProfile with allowedReads must succeed
+		prof, err := DarwinSeatbeltProfile(rec.Root, allowedReads...)
+		if err != nil {
+			t.Fatalf("DarwinSeatbeltProfile failed on composed validated image + owned probe: %v", err)
+		}
+		wantExeLit := fmt.Sprintf("(allow file-read* (literal %q))", selfExe)
+		if !strings.Contains(prof, wantExeLit) {
+			t.Errorf("seatbelt profile missing selfExe literal %q", wantExeLit)
+		}
+		wantProbeLit := fmt.Sprintf("(allow file-read* (literal %q))", safeProbe)
+		if !strings.Contains(prof, wantProbeLit) {
+			t.Errorf("seatbelt profile missing safeProbe literal %q", wantProbeLit)
+		}
+
+		// 3. Arbitrary untrusted path outside runRoot MUST be rejected
+		untrusted := "/private/tmp/agentpulse-sentinels/untrusted-probe.txt"
+		if _, err := DarwinSeatbeltProfile(rec.Root, untrusted); err == nil {
+			t.Errorf("expected DarwinSeatbeltProfile to reject arbitrary untrusted path %q, got nil", untrusted)
+		}
+	})
+
+	t.Run("SyntheticOwnershipIdentityBinding", func(t *testing.T) {
+		clearDarwinRegistries()
+		defer clearDarwinRegistries()
+
+		rec := RunRecord{
+			RunID:       "run1234567890abcdef1234567890ab",
+			Root:        "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
+			Nonce:       "nonce1234567890abcdef1234567890ab",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			SentinelDev: 100,
+			SentinelIno: 200,
+		}
+		selfExe := "/usr/bin/agentpulse"
+		homes := []string{"/Users/alice"}
+
+		safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-bindtest1"
+		_, err := mintDarwinSyntheticProbe(rec.RunID, safeProbe, 100, 200, rec.Nonce, rec.Root)
+		if err != nil {
+			t.Fatalf("mint probe failed: %v", err)
+		}
+		rec.Sentinel = safeProbe
+
+		// Positive verification: exact match succeeds
+		reads, err := resolveDarwinAllowedReads(rec, selfExe, homes)
+		if err != nil || len(reads) != 2 || reads[1] != safeProbe {
+			t.Fatalf("expected positive match to return [selfExe safeProbe], got %v (err=%v)", reads, err)
+		}
+
+		// Negative 1: Empty RunID in record must NOT act as wildcard (must fail closed)
+		recNoRunID := rec
+		recNoRunID.RunID = ""
+		readsNoRunID, err := resolveDarwinAllowedReads(recNoRunID, selfExe, homes)
+		if err == nil && len(readsNoRunID) > 1 {
+			t.Fatalf("empty RunID acted as wildcard and granted sentinel read permission: %v", readsNoRunID)
+		}
+
+		// Negative 2: Empty Nonce in record must NOT grant permission
+		recNoNonce := rec
+		recNoNonce.Nonce = ""
+		readsNoNonce, err := resolveDarwinAllowedReads(recNoNonce, selfExe, homes)
+		if err == nil && len(readsNoNonce) > 1 {
+			t.Fatalf("empty Nonce granted sentinel read permission: %v", readsNoNonce)
+		}
+
+		// Negative 3: Mismatched Nonce must fail closed
+		recBadNonce := rec
+		recBadNonce.Nonce = "different-nonce"
+		readsBadNonce, err := resolveDarwinAllowedReads(recBadNonce, selfExe, homes)
+		if err == nil && len(readsBadNonce) > 1 {
+			t.Fatalf("mismatched Nonce granted sentinel read permission: %v", readsBadNonce)
+		}
+
+		// Negative 4: Dev mismatch must fail closed
+		recBadDev := rec
+		recBadDev.SentinelDev = 999
+		readsBadDev, err := resolveDarwinAllowedReads(recBadDev, selfExe, homes)
+		if err == nil && len(readsBadDev) > 1 {
+			t.Fatalf("mismatched Dev granted sentinel read permission: %v", readsBadDev)
+		}
+
+		// Negative 5: Ino mismatch must fail closed
+		recBadIno := rec
+		recBadIno.SentinelIno = 999
+		readsBadIno, err := resolveDarwinAllowedReads(recBadIno, selfExe, homes)
+		if err == nil && len(readsBadIno) > 1 {
+			t.Fatalf("mismatched Ino granted sentinel read permission: %v", readsBadIno)
+		}
+
+		// Negative 6: Zero Dev or Ino must fail closed
+		recZeroDev := rec
+		recZeroDev.SentinelDev = 0
+		readsZeroDev, err := resolveDarwinAllowedReads(recZeroDev, selfExe, homes)
+		if err == nil && len(readsZeroDev) > 1 {
+			t.Fatalf("zero Dev granted sentinel read permission: %v", readsZeroDev)
+		}
+
+		// Negative 7: Stale proof for same pathname from another run must NOT grant permission
+		recOtherRun := rec
+		recOtherRun.RunID = "run-other-99999999999999999999"
+		recOtherRun.Nonce = "nonce-other-8888888888888888888"
+		readsOtherRun, err := resolveDarwinAllowedReads(recOtherRun, selfExe, homes)
+		if err == nil && len(readsOtherRun) > 1 {
+			t.Fatalf("stale proof granted permission to different run: %v", readsOtherRun)
+		}
+
+		// Positive & exclusive provenance transition: pending creation -> one-run bind
+		pendingSentinel := "/private/tmp/agentpulse-sentinels/sentinel-pending1"
+		if err := registerPendingDarwinSyntheticProbe(pendingSentinel, 300, 400); err != nil {
+			t.Fatalf("registerPendingDarwinSyntheticProbe failed: %v", err)
+		}
+		recPending := RunRecord{
+			RunID:       "run-fresh-11111111111111111111",
+			Root:        "/private/tmp/agentpulse-runs/run-fresh-11111111111111111111",
+			Nonce:       "nonce-fresh-2222222222222222222",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			Sentinel:    pendingSentinel,
+			SentinelDev: 300,
+			SentinelIno: 400,
+		}
+		if err := bindDarwinSyntheticProbe(recPending.RunID, recPending.Root, recPending.Nonce, recPending.Sentinel, recPending.SentinelDev, recPending.SentinelIno); err != nil {
+			t.Fatalf("bindDarwinSyntheticProbe failed: %v", err)
+		}
+		boundReads, err := resolveDarwinAllowedReads(recPending, selfExe, homes)
+		if err != nil || len(boundReads) != 2 || boundReads[1] != pendingSentinel {
+			t.Fatalf("expected bound pending sentinel in allowed reads, got %v (err=%v)", boundReads, err)
+		}
+		// Exclusive consumption: second run cannot bind the already-consumed pending sentinel
+		recSecondRun := recPending
+		recSecondRun.RunID = "run-fresh-second-run-33333333333"
+		recSecondRun.Nonce = "nonce-fresh-second-run-444444444"
+		if err := bindDarwinSyntheticProbe(recSecondRun.RunID, recSecondRun.Root, recSecondRun.Nonce, recSecondRun.Sentinel, recSecondRun.SentinelDev, recSecondRun.SentinelIno); err != nil {
+			t.Fatalf("unexpected error on second bind attempt: %v", err)
+		}
+		secondReads, err := resolveDarwinAllowedReads(recSecondRun, selfExe, homes)
+		if err != nil || len(secondReads) != 1 || secondReads[0] != selfExe {
+			t.Fatalf("second run illegally obtained read permission for consumed sentinel: %v", secondReads)
 		}
 	})
 }

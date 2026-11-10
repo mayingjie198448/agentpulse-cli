@@ -74,6 +74,9 @@ func createRunRoot(opts createOpts) (RunRecord, error) {
 	if withinPath(rootPath, sentPath) {
 		return RunRecord{}, fmt.Errorf("%w: sentinel must already exist outside the run root", ErrSentinelUnusable)
 	}
+	if err := bindDarwinSyntheticProbe(runID, rootPath, nonce, sentPath, sdev, sino); err != nil {
+		return RunRecord{}, err
+	}
 
 	for _, name := range []string{"home", "work", "tmp", "xdg"} {
 		if err := unix.Mkdirat(rootFD, name, 0700); err != nil {
@@ -178,9 +181,15 @@ func createSyntheticSentinel(base string) (string, error) {
 	}
 	sentinelPath := kpath + "/" + name
 	var st unix.Stat_t
-	if err := unix.Lstat(sentinelPath, &st); err == nil {
-		dev, ino := ident(st)
-		_, _ = mintDarwinSyntheticProbe("", sentinelPath, dev, ino, "")
+	if err := unix.Lstat(sentinelPath, &st); err != nil {
+		return "", fmt.Errorf("%w: stat synthetic sentinel: %v", ErrSentinelUnusable, err)
+	}
+	dev, ino := ident(st)
+	if dev == 0 || ino == 0 {
+		return "", fmt.Errorf("%w: synthetic sentinel has zero device or inode", ErrSentinelUnusable)
+	}
+	if err := registerPendingDarwinSyntheticProbe(sentinelPath, dev, ino); err != nil {
+		return "", err
 	}
 	return sentinelPath, nil
 }

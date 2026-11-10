@@ -127,10 +127,13 @@ func validateDarwinReadableLiteral(lit string, runRoot string) error {
 			}
 		}
 	}
-	// Outside run root, only an owned, verified this-run synthetic probe can receive a read exception.
+	// Outside run root, only a validated executable image or an owned, verified this-run
+	// synthetic probe can receive a read exception. Arbitrary caller paths fail closed.
 	if !withinPath(runRoot, cleanLit) && cleanLit != runRoot {
-		if !isVerifiedDarwinSyntheticProbe(cleanLit) {
-			return fmt.Errorf("%w: read literal %q is not a verified this-run synthetic probe", ErrRefused, cleanLit)
+		isImage := isVerifiedDarwinImage(cleanLit, runRoot)
+		isProbe := isVerifiedDarwinSyntheticProbe(cleanLit, runRoot)
+		if !isImage && !isProbe {
+			return fmt.Errorf("%w: read literal %q is neither a validated executable image nor a verified this-run synthetic probe", ErrRefused, cleanLit)
 		}
 	}
 	return nil

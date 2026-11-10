@@ -79,8 +79,15 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		if err := os.WriteFile(sentinel, []byte("sentinel-v1\n"), 0600); err != nil {
 			return b.String(), err
 		}
-		if sIdent, sErr := getDarwinFileIdentity(sentinel); sErr == nil {
-			_, _ = mintDarwinSyntheticProbe("", sentinel, sIdent.Dev, sIdent.Ino, "")
+		sIdent, sErr := getDarwinFileIdentity(sentinel)
+		if sErr != nil {
+			return b.String(), fmt.Errorf("failed to get darwin sentinel identity: %w", sErr)
+		}
+		if sIdent.Dev == 0 || sIdent.Ino == 0 {
+			return b.String(), fmt.Errorf("%w: synthetic sentinel has zero device or inode", ErrSentinelUnusable)
+		}
+		if err := registerPendingDarwinSyntheticProbe(sentinel, sIdent.Dev, sIdent.Ino); err != nil {
+			return b.String(), err
 		}
 	}
 	audit := filepath.Join(base, "audit.jsonl")
