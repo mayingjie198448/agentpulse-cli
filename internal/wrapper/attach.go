@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -244,13 +243,6 @@ func normalizePIDs(pids []int) []int {
 	}
 	sort.Ints(out)
 	return out
-}
-
-// DefaultProcessLister lists processes using standard POSIX ps.
-// There is no Windows native backend. Do not route this through PowerShell
-// or a machine-wide process walk. On Windows the call stays blocked.
-func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
-	return listWithPS(ctx, nil)
 }
 
 func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
@@ -550,86 +542,6 @@ func waitOwnedLog(ctx context.Context, pid int, logDir string, nameOK func(strin
 	return ""
 }
 
-// ResolveProcessCwd probes the current working directory of a process.
-func ResolveProcessCwd(pid int) string {
-	if pid <= 0 {
-		return ""
-	}
-
-	if runtime.GOOS == "linux" {
-		if target, err := readProcLink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
-			return target
-		}
-	}
-
-	if runtime.GOOS == "darwin" {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-		cmd := commandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
-		out, err := cmd.Output()
-		if err == nil {
-			lines := strings.Split(string(out), "\n")
-			for _, l := range lines {
-				if strings.HasPrefix(l, "n") {
-					path := strings.TrimPrefix(l, "n")
-					if path != "" && path != "/" {
-						return path
-					}
-				}
-			}
-		}
-	}
-
-	return ""
-}
-
-// ResolveProcessStartTime probes the process start time.
-func ResolveProcessStartTime(pid int) time.Time {
-	if pid <= 0 {
-		return time.Now().UTC()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	cmd := commandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
-	out, err := cmd.Output()
-	if err == nil {
-		str := strings.TrimSpace(string(out))
-		layouts := []string{
-			"Mon Jan _2 15:04:05 2006",
-			"Mon Jan 2 15:04:05 2006",
-			time.ANSIC,
-		}
-		for _, layout := range layouts {
-			if t, err := time.Parse(layout, str); err == nil {
-				return t.UTC()
-			}
-		}
-	}
-
-	return time.Now().UTC()
-}
-
-// IsProcessAlive reports whether a process with the given PID is currently running.
-func IsProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, syscall.EPERM) {
-		return true
-	}
-	return false
-}
-
 // AttachManagerConfig configures the bare process attach manager.
 type AttachManagerConfig struct {
 	MachineID              string
@@ -694,6 +606,9 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 	}
 	if cfg.IsProcessAlive == nil {
 		cfg.IsProcessAlive = IsProcessAlive
+	}
+	if cfg.ProcessExitChecker == nil {
+		cfg.ProcessExitChecker = defaultExitChecker()
 	}
 	if cfg.Agents == nil {
 		cfg.Agents = config.DefaultAgents()
@@ -832,8 +747,9 @@ func (m *AttachManager) run(ctx context.Context) {
 
 // discoverProcesses lists candidate processes.
 // A non-empty allowlist on the default lister is applied before any OS read:
-// Linux opens only those PIDs' proc files, and other systems run ps -p for
-// those PIDs only. An empty allowlist keeps the existing full-table ps.
+// Linux opens only those PIDs' proc files, other POSIX systems run ps -p,
+// and Windows opens only those PIDs with QUERY_LIMITED_INFORMATION.
+// An empty allowlist keeps the platform default lister.
 func (m *AttachManager) discoverProcesses(ctx context.Context) ([]ProcessInfo, error) {
 	m.mu.Lock()
 	pids := make([]int, 0, len(m.pidAllowlist))
@@ -846,10 +762,7 @@ func (m *AttachManager) discoverProcesses(ctx context.Context) ([]ProcessInfo, e
 
 	pids = normalizePIDs(pids)
 	if useDefault && len(pids) > 0 {
-		if runtime.GOOS == "linux" {
-			return listLinuxPIDs(pids)
-		}
-		return listWithPS(ctx, pids)
+		return listDefaultAllowlisted(ctx, pids)
 	}
 	if lister == nil {
 		return nil, nil
@@ -1006,13 +919,13 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 	for {
 		select {
 		case <-ctx.Done():
-			m.finalizeJob(aj, true)
+			m.finalizeJob(aj, true, false)
 			return
 		case <-ticker.C:
 			if !m.cfg.IsProcessAlive(aj.pid) {
 				// Allow brief window for log tailer to flush trailing output
 				time.Sleep(100 * time.Millisecond)
-				m.finalizeJob(aj, false)
+				m.finalizeJob(aj, false, processReused(aj.pid, aj.startTime))
 				return
 			}
 			// Periodic refresh of job update timestamp
@@ -1024,7 +937,7 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 	}
 }
 
-func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted bool) {
+func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted, reused bool) {
 	aj.mu.Lock()
 	finishTime := time.Now().UTC()
 	aj.job.UpdatedAt = finishTime
@@ -1037,7 +950,8 @@ func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted bool) {
 
 	var exitCode int
 	var exitCodeKnown bool
-	if !interrupted && exitChecker != nil {
+	// A reused PID belongs to a different process. Its exit code is not this job's.
+	if !interrupted && !reused && exitChecker != nil {
 		exitCode, exitCodeKnown = exitChecker(aj.pid)
 	}
 
