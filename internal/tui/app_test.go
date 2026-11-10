@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,13 @@ import (
 	"github.com/mayingjie198448/agentpulse-cli/internal/store"
 	"github.com/mayingjie198448/agentpulse-cli/internal/tui"
 )
+
+// ansiPattern matches CSI and OSC sequences lipgloss may embed in View.
+var ansiPattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))`)
+
+func stripViewANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
+}
 
 // fakeStore is local test data. It is not wired to any CLI flag.
 type fakeStore struct {
@@ -798,13 +806,38 @@ func TestTUIModel_MachinesPrimaryLabelMachineID(t *testing.T) {
 	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 
 	v := tm.View()
-	// Must contain config machine_id=mac-mini, not only hostname pretending to be primary
-	if !strings.Contains(v, "mac-mini") {
-		t.Fatalf("expected View to contain machine_id 'mac-mini', got:\n%s", v)
+	line := machineLabelLine(t, stripViewANSI(v), "mac-mini", "hostname-mini")
+	const secondary = "(hostname-mini)"
+	primaryAt := strings.Index(line, "mac-mini")
+	secondaryAt := strings.Index(line, secondary)
+	if primaryAt < 0 || secondaryAt < 0 || primaryAt > secondaryAt {
+		t.Fatalf("machine line must show id before parenthetical hostname, got %q", line)
 	}
-	if !strings.Contains(v, "mac-mini") || !strings.Contains(v, "hostname-mini") {
-		t.Fatalf("expected View to contain 'mac-mini' primary and 'hostname-mini' secondary, got:\n%s", v)
+	if strings.Contains(line, "(mac-mini)") {
+		t.Fatalf("id was rendered as the parenthetical secondary, got %q", line)
 	}
+	if strings.Index(line, "hostname-mini") != secondaryAt+1 {
+		t.Fatalf("hostname must appear only as the parenthetical secondary, got %q", line)
+	}
+}
+
+// machineLabelLine returns the single View line that carries this machine's
+// id and hostname. Labels split across other rows do not count.
+func machineLabelLine(t *testing.T, plain, id, hostname string) string {
+	t.Helper()
+	var hits []string
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, id) || strings.Contains(line, hostname) {
+			hits = append(hits, line)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected one view line with the machine labels, got %d: %#v", len(hits), hits)
+	}
+	if !strings.Contains(hits[0], id) || !strings.Contains(hits[0], hostname) {
+		t.Fatalf("machine labels were not on the same line: %q", hits[0])
+	}
+	return hits[0]
 }
 
 func TestTUIModel_ExplicitRefresh(t *testing.T) {
