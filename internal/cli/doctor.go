@@ -99,18 +99,23 @@ func newDoctorCmd() *cobra.Command {
 				if aliases == "" {
 					aliases = st.ID
 				}
+				customTag := ""
+				if st.Custom {
+					customTag = " [自定义]"
+				}
 				if !st.Ok && strings.Contains(st.Detail, "禁用") {
-					fmt.Fprintf(out, "  [-] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
+					fmt.Fprintf(out, "  [-] %-10s [别名: %-14s]%s : %s\n", st.ID, aliases, customTag, st.Detail)
 				} else if st.Ok {
-					fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
+					fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s]%s : %s\n", st.ID, aliases, customTag, st.Detail)
 				} else {
-					fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s] : %s\n", st.ID, aliases, st.Detail)
+					fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s]%s : %s\n", st.ID, aliases, customTag, st.Detail)
 				}
 				announceAgents = append(announceAgents, model.AgentAnnounce{
 					ID:     st.ID,
 					Alias:  st.Alias,
 					Ok:     st.Ok,
 					Detail: st.Detail,
+					Custom: st.Custom,
 				})
 			}
 

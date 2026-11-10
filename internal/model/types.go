@@ -205,6 +205,7 @@ type AgentAnnounce struct {
 	Alias  []string `json:"alias"`
 	Ok     bool     `json:"ok"`
 	Detail string   `json:"detail"`
+	Custom bool     `json:"custom,omitempty"`
 }
 
 // MachineAnnounce represents an announcement payload published to agentpulse/v1/{machine_id}/announce.

@@ -52,6 +52,7 @@ type AgentConfig struct {
 	Path    string   `yaml:"path,omitempty"`
 	Alias   []string `yaml:"alias,omitempty"`
 	Enabled *bool    `yaml:"enabled,omitempty"`
+	Custom  bool     `yaml:"custom,omitempty"`
 }
 
 // IsEnabled returns true if the agent is enabled (defaults to true if unspecified).
@@ -62,6 +63,41 @@ func (a AgentConfig) IsEnabled() bool {
 	return *a.Enabled
 }
 
+// IsCustom returns true if the agent is a custom (non-builtin) agent CLI.
+func (a AgentConfig) IsCustom() bool {
+	if a.Custom {
+		return true
+	}
+	return !IsBuiltinEngine(a.ID)
+}
+
+// IsBuiltin returns true if the agent is a built-in adapted agent engine.
+func (a AgentConfig) IsBuiltin() bool {
+	return !a.IsCustom()
+}
+
+// BuiltinAgents returns the configured agents that are built-in adapted engines.
+func (c *Config) BuiltinAgents() []AgentConfig {
+	var list []AgentConfig
+	for _, ag := range c.Agents {
+		if ag.IsBuiltin() {
+			list = append(list, ag)
+		}
+	}
+	return list
+}
+
+// CustomAgents returns the configured agents that are custom/non-builtin agent CLIs.
+func (c *Config) CustomAgents() []AgentConfig {
+	var list []AgentConfig
+	for _, ag := range c.Agents {
+		if ag.IsCustom() {
+			list = append(list, ag)
+		}
+	}
+	return list
+}
+
 // AgentStatus represents the probed runtime status of a registered agent.
 type AgentStatus struct {
 	ID           string   `json:"id"`
@@ -70,6 +106,7 @@ type AgentStatus struct {
 	ResolvedPath string   `json:"resolved_path,omitempty"`
 	Ok           bool     `json:"ok"`
 	Detail       string   `json:"detail"`
+	Custom       bool     `json:"custom,omitempty"`
 }
 
 // DefaultAgents returns the standard built-in agent CLI presets.
@@ -209,9 +246,10 @@ func ProbeAgent(ag AgentConfig) AgentStatus {
 // ProbeAgentContext probes whether the given agent CLI executable is available within the provided context.
 func ProbeAgentContext(ctx context.Context, ag AgentConfig) AgentStatus {
 	st := AgentStatus{
-		ID:    ag.ID,
-		Alias: ag.Alias,
-		Path:  ag.Path,
+		ID:     ag.ID,
+		Alias:  ag.Alias,
+		Path:   ag.Path,
+		Custom: ag.IsCustom(),
 	}
 
 	if !ag.IsEnabled() {
