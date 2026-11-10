@@ -36,6 +36,9 @@ func DarwinSeatbeltProfile(root string, allowedReadLiterals ...string) (string, 
 			return "", err
 		}
 		clean := path.Clean(lit)
+		// The verified image must be mapped for sandbox-exec to reach the helper.
+		// A sentinel literal mapped this way is not a filesystem write.
+		fmt.Fprintf(&extraReads, "(allow file-map-executable (literal %q))\n", clean)
 		for _, anc := range darwinPathAncestors(clean) {
 			if !literalDirectives[anc] {
 				literalDirectives[anc] = true
@@ -68,6 +71,21 @@ func DarwinSeatbeltProfile(root string, allowedReadLiterals ...string) (string, 
 (allow file-read* (literal "/dev/random"))
 (allow file-read* (literal "/dev/dtracehelper"))
 (allow file-ioctl (literal "/dev/null"))
+; Go 1.27.3 runtime.osinit reads hw.pagesize before main. A denied sysctl
+; makes mallocinit throw "failed to get system page size" before the helper
+; can write the confirm pipe, so the parent observes EOF.
+(allow sysctl-read)
+; Anonymous confirm pipe and captured stderr are PIPE vnodes, not files.
+; file-write-data does not allow creating or writing regular files.
+(allow file-read-data file-write-data file-ioctl (vnode-type PIPE))
+; dyld and libSystem need to be mapped. These are the same trees already
+; granted file-read*; this is not a new filesystem root.
+(allow file-map-executable (subpath "/usr/lib"))
+(allow file-map-executable (subpath "/System/Library"))
+(allow file-map-executable (subpath "/usr/bin"))
+(allow file-map-executable (subpath "/bin"))
+(allow file-map-executable (subpath "/sbin"))
+(allow file-map-executable (subpath "/private/var/db/dyld"))
 %s(deny mach-lookup (global-name "com.apple.SecurityServer"))
 (deny mach-lookup (global-name "com.apple.securityd"))
 (deny mach-lookup (global-name "com.apple.ocspd"))

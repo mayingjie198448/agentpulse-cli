@@ -379,14 +379,35 @@ func (p *Prepared) readConfirm() error {
 		g := <-ch
 		n, readErr = g.n, g.err
 	}
-	msg := strings.TrimSpace(string(buf[:n]))
-	if strings.HasPrefix(msg, "OK") {
+	accepted, msg := classifyDarwinConfirmRead(n, readErr, buf)
+	if accepted {
 		return nil
 	}
+	var werr error
 	if !p.reaped {
-		werr := p.waitChild()
+		werr = p.waitChild()
 		p.keepRoot(werr)
 		p.reaped = true
+	}
+	// Record the status Wait actually returned. HelperExitVerify (78) is what
+	// the helper uses when it reaches failVerify; stamping it here hid exits
+	// that happened before any confirm byte was written.
+	p.finishRefused(msg, observedHelperExit(werr))
+	return fmt.Errorf("verification failed before user command: %s", msg)
+}
+
+// classifyDarwinConfirmRead decides whether the parent may treat the confirm
+// pipe as success. An empty read, including io.EOF, is never success.
+func classifyDarwinConfirmRead(n int, readErr error, buf []byte) (accepted bool, detail string) {
+	if n < 0 {
+		n = 0
+	}
+	if n > len(buf) {
+		n = len(buf)
+	}
+	msg := strings.TrimSpace(string(buf[:n]))
+	if strings.HasPrefix(msg, "OK") {
+		return true, ""
 	}
 	if msg == "" {
 		msg = "helper closed confirm pipe before OK"
@@ -394,8 +415,16 @@ func (p *Prepared) readConfirm() error {
 			msg = readErr.Error()
 		}
 	}
-	p.finishRefused(msg, helperPtr(HelperExitVerify))
-	return fmt.Errorf("verification failed before user command: %s", msg)
+	return false, msg
+}
+
+// observedHelperExit returns the child status from Wait. A nil error is exit 0.
+// Errors without an exit code leave the field unset instead of inventing 78.
+func observedHelperExit(waitErr error) *int {
+	if code, ok := exitCodeOf(waitErr); ok {
+		return helperPtr(code)
+	}
+	return nil
 }
 
 // Pid is the running process id after a successful Start.
