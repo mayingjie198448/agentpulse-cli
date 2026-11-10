@@ -668,7 +668,10 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 // executeJob executes a single dispatch command via wrapper.Run.
 func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	args := BuildCommandArgs(cmd.Command, cmd.Args)
-	if len(args) > 0 {
+	// Stub never executes the command, so it must not read the user config
+	// file to rewrite that argv. The non-stub path still resolves the binary
+	// and still reaches safety.Prepare inside wrapper.Run.
+	if len(args) > 0 && !l.cfg.Stub {
 		cfgPath := ""
 		if l.cfg.UseAgentConfigFile {
 			cfgPath = l.cfg.AgentConfigFile
