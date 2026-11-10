@@ -1469,3 +1469,41 @@ func TestDoctorCommand_AutostartDisplay(t *testing.T) {
 		t.Errorf("expected doctor output to show autostart status, got:\n%s", out)
 	}
 }
+
+func TestJobsCommand_FlagsAndHelp(t *testing.T) {
+	rootCmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"jobs", "--help"})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("failed to execute jobs --help: %v", err)
+	}
+
+	out := buf.String()
+	for _, expected := range []string{"--group-by", "--json", "项目/仓库名", "状态", "开始时间"} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("expected jobs --help to contain %q, got:\n%s", expected, out)
+		}
+	}
+}
+
+func TestDispatchCommand_ExtendedFlags(t *testing.T) {
+	rootCmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"dispatch", "--help"})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("failed to execute dispatch --help: %v", err)
+	}
+
+	out := buf.String()
+	for _, expected := range []string{"--repo", "--project", "--prompt", "-p"} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("expected dispatch --help to contain flag %q, got:\n%s", expected, out)
+		}
+	}
+}

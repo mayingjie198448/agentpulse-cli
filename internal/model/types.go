@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -60,10 +61,81 @@ type Job struct {
 	Cwd         string     `json:"cwd"`
 	Command     string     `json:"command"`
 	Title       string     `json:"title"`
+	Repo        string     `json:"repo,omitempty"`
+	Project     string     `json:"project,omitempty"`
+	Prompt      string     `json:"prompt,omitempty"` // Sanitized prompt summary (max length bounded, secrets redacted)
 	StartedAt   time.Time  `json:"started_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+	EndedAt     time.Time  `json:"ended_at,omitempty"`
 	DurationStr string     `json:"duration_str,omitempty"`
+	RequestedBy string     `json:"requested_by,omitempty"`
 	Error       string     `json:"error,omitempty"`
+}
+
+// RepoOrProject returns the primary repository or project name for the job.
+func (j Job) RepoOrProject() string {
+	if r := strings.TrimSpace(j.Repo); r != "" {
+		return r
+	}
+	if p := strings.TrimSpace(j.Project); p != "" {
+		return p
+	}
+	return ""
+}
+
+// DisplayTitle returns the human-readable title or falls back to Job ID.
+func (j Job) DisplayTitle() string {
+	if t := strings.TrimSpace(j.Title); t != "" {
+		return t
+	}
+	return j.ID
+}
+
+// MarshalJSON customizes Job JSON encoding to omit ended_at when zero (for running/queued jobs).
+func (j Job) MarshalJSON() ([]byte, error) {
+	type Alias Job
+	if j.EndedAt.IsZero() {
+		return json.Marshal(&struct {
+			EndedAt *time.Time `json:"ended_at,omitempty"`
+			Alias
+		}{
+			EndedAt: nil,
+			Alias:   (Alias)(j),
+		})
+	}
+	return json.Marshal((Alias)(j))
+}
+
+// UnmarshalJSON customizes Job JSON decoding to safely handle missing, null, empty string, or zero RFC3339 ended_at.
+func (j *Job) UnmarshalJSON(data []byte) error {
+	type Alias Job
+	aux := struct {
+		EndedAtRaw *json.RawMessage `json:"ended_at,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(j),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.EndedAtRaw != nil {
+		var s string
+		if err := json.Unmarshal(*aux.EndedAtRaw, &s); err == nil {
+			s = strings.TrimSpace(s)
+			if s == "" || s == "0001-01-01T00:00:00Z" {
+				j.EndedAt = time.Time{}
+			} else {
+				t, err := time.Parse(time.RFC3339Nano, s)
+				if err != nil {
+					t, err = time.Parse(time.RFC3339, s)
+				}
+				if err == nil {
+					j.EndedAt = t
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // LocalStatus represents the on-disk JSON snapshot of local wrapper state.
@@ -174,6 +246,9 @@ type DispatchCommand struct {
 	Command        string            `json:"command"`
 	Args           []string          `json:"args"`
 	Title          string            `json:"title"`
+	Repo           string            `json:"repo,omitempty"`
+	Project        string            `json:"project,omitempty"`
+	Prompt         string            `json:"prompt,omitempty"` // Sanitized prompt summary
 	TimeoutSeconds int               `json:"timeout_seconds"`
 	Env            map[string]string `json:"env,omitempty"`
 	RequestedBy    string            `json:"requested_by"`

@@ -162,10 +162,15 @@ flowchart TD
 | `progress` | number (float) | 进度百分比，取值范围 `0.0` 至 `100.0` |
 | `cwd` | string | 任务在目标机器上的工作目录路径 |
 | `command` | string | 派发或执行的原始 CLI 命令与参数 |
-| `title` | string | 任务标题或简要工作目标描述 |
+| `title` | string | 任务短标题或简要工作目标描述 |
+| `repo` | string (可选) | 代码仓库标识（如 `"owner/repo"` 或从 git remote 推断） |
+| `project` | string (可选) | 项目名称（如根目录名或显式指定） |
+| `prompt` | string (可选) | 脱敏后的任务提示词/目标摘要（长度受限，密钥已严格脱敏） |
 | `started_at` | string (RFC 3339) | 任务开始时间戳 |
+| `ended_at` | string (RFC 3339, 可选) | 任务结束时间戳（完成或失败时提供） |
 | `updated_at` | string (RFC 3339) | 状态最近一次更新时间戳 |
 | `duration_str` | string (可选) | 当前运行时长人类可读文本（如 `"1m 24s"`） |
+| `requested_by` | string (可选) | 派活发起者标识（如 `"user@my-laptop"`） |
 | `error` | string (可选) | 失败原因或退出错误信息（当 `status == "failed"` 时提供） |
 
 #### JSON 示例：正在运行中的 Job
@@ -179,9 +184,13 @@ flowchart TD
   "cwd": "/Users/mayingjie/Repos/agentpulse-cli",
   "command": "agy run --task 'refactor store layer'",
   "title": "Refactor store layer for MQTT integration",
+  "repo": "mayingjie198448/agentpulse-cli",
+  "project": "agentpulse-cli",
+  "prompt": "refactor store layer to support MQTT retained message cleanup and job status sync",
   "started_at": "2026-11-02T13:25:00Z",
   "updated_at": "2026-11-02T13:30:15Z",
   "duration_str": "5m 15s",
+  "requested_by": "mayingjie@mac-studio-m2",
   "error": ""
 }
 ```
@@ -197,9 +206,14 @@ flowchart TD
   "cwd": "/home/ubuntu/projects/model-finetune",
   "command": "opencode train --config train.yaml",
   "title": "LoRA Fine-tuning on Llama-3",
+  "repo": "org/model-finetune",
+  "project": "model-finetune",
+  "prompt": "fine-tune Llama-3 on custom instruction dataset with LoRA rank 16",
   "started_at": "2026-11-02T13:10:00Z",
+  "ended_at": "2026-11-02T13:14:32Z",
   "updated_at": "2026-11-02T13:14:32Z",
   "duration_str": "4m 32s",
+  "requested_by": "alice@linux-gpu-box",
   "error": "CUDA out of memory: tried to allocate 2.40 GiB (GPU 0; 23.69 GiB total capacity)"
 }
 ```
@@ -273,6 +287,9 @@ flowchart TD
 | `command` | string | 待调用的可执行命令（如 `"agy"` 或 `"opencode run"`） |
 | `args` | array[string] | 命令行附加参数数组 |
 | `title` | string | 人类可读的任务描述与摘要 |
+| `repo` | string (可选) | 目标代码仓库标识（从 git remote 推断或命令行 `--repo` 指定） |
+| `project` | string (可选) | 项目名称（从工作目录推断或命令行 `--project` 指定） |
+| `prompt` | string (可选) | 任务提示词摘要（派发时已脱敏，长度受限） |
 | `timeout_seconds` | integer | 最大运行超时秒数（0 表示无限制） |
 | `env` | map[string]string | 注入远程执行进程的环境变量 |
 | `requested_by` | string | 派活发起者标识（如 `"user@my-laptop"`） |
@@ -288,6 +305,9 @@ flowchart TD
   "command": "agy",
   "args": ["run", "--prompt", "Optimize database query pool"],
   "title": "Optimize DB pool in backend-api",
+  "repo": "mayingjie198448/backend-api",
+  "project": "backend-api",
+  "prompt": "Optimize database query pool",
   "timeout_seconds": 3600,
   "env": {
     "ENV": "production_test",

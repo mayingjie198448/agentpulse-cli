@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -15,12 +16,13 @@ import (
 
 func newJobsCmd() *cobra.Command {
 	var jsonOutput bool
+	var groupBy string
 
 	cmd := &cobra.Command{
 		Use:   "jobs",
 		Short: "查看全网任务列表及执行状态",
 		Long: `从消息存储中检索并汇总跨机器的全部 AI Agent 任务（包含运行中、排队中、已完成与失败任务）。
-支持格式化表格输出以及机器可读的 JSON 输出。`,
+支持短名称、项目/仓库名、状态、开始时间等字段展示，支持按多种维度分组查看，支持 JSON 输出。`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -52,26 +54,128 @@ func newJobsCmd() *cobra.Command {
 				return nil
 			}
 
-			fmt.Fprintf(out, "%-16s %-12s %-10s %-10s %-8s %-12s %s\n",
-				"任务 ID", "节点", "引擎", "状态", "进度", "运行时长", "任务说明")
-			fmt.Fprintln(out, strings.Repeat("-", 85))
-
-			for _, j := range jobs {
-				dur := j.DurationStr
-				if dur == "" {
-					dur = "-"
-				}
-				fmt.Fprintf(out, "%-16s %-12s %-10s %-10s %5.1f%%   %-12s %s\n",
-					j.ID, j.MachineID, j.Engine, strings.ToUpper(string(j.Status)), j.Progress, dur, j.Title)
+			normGroup := strings.ToLower(strings.TrimSpace(groupBy))
+			if normGroup != "" && normGroup != "none" {
+				renderGroupedJobsTable(out, jobs, normGroup)
+				return nil
 			}
 
+			renderJobsTable(out, jobs)
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "以 JSON 格式输出任务列表")
+	cmd.Flags().StringVar(&groupBy, "group-by", "", "按指定维度分组展示 (可选: repo, machine, status, engine, started_at, requested_by)")
 	cmd.AddCommand(newJobsDeleteCmd())
 	return cmd
+}
+
+func renderJobsTable(out io.Writer, jobs []model.Job) {
+	fmt.Fprintf(out, "%s %s %s %s %s %s %s\n",
+		termutil.PadRight("短名/标题", 22),
+		termutil.PadRight("项目/仓库", 16),
+		termutil.PadRight("状态", 10),
+		termutil.PadRight("开始时间", 16),
+		termutil.PadRight("任务 ID", 16),
+		termutil.PadRight("节点", 12),
+		termutil.PadRight("运行时长", 8))
+	fmt.Fprintln(out, strings.Repeat("-", 106))
+
+	for _, j := range jobs {
+		title := termutil.TruncateString(j.DisplayTitle(), 20, "...")
+		repo := j.RepoOrProject()
+		if repo == "" {
+			repo = "-"
+		} else {
+			repo = termutil.TruncateString(repo, 15, "...")
+		}
+		started := "-"
+		if !j.StartedAt.IsZero() {
+			started = j.StartedAt.Local().Format("01-02 15:04:05")
+		}
+		dur := j.DurationStr
+		if dur == "" {
+			dur = "-"
+		}
+		status := strings.ToUpper(string(j.Status))
+		idStr := termutil.TruncateString(j.ID, 16, "...")
+		machStr := termutil.TruncateString(j.MachineID, 12, "...")
+
+		fmt.Fprintf(out, "%s %s %s %s %s %s %s\n",
+			termutil.PadRight(title, 22),
+			termutil.PadRight(repo, 16),
+			termutil.PadRight(status, 10),
+			termutil.PadRight(started, 16),
+			termutil.PadRight(idStr, 16),
+			termutil.PadRight(machStr, 12),
+			termutil.PadRight(dur, 8))
+	}
+}
+
+func renderGroupedJobsTable(out io.Writer, jobs []model.Job, groupField string) {
+	type groupEntry struct {
+		name string
+		jobs []model.Job
+	}
+
+	getGroupKey := func(j model.Job) string {
+		switch groupField {
+		case "repo", "project":
+			r := j.RepoOrProject()
+			if r == "" {
+				return "未知/未标注"
+			}
+			return r
+		case "machine", "node":
+			m := strings.TrimSpace(j.MachineID)
+			if m == "" {
+				return "未知/未标注"
+			}
+			return m
+		case "status":
+			s := strings.TrimSpace(string(j.Status))
+			if s == "" {
+				return "未知/未标注"
+			}
+			return strings.ToUpper(s)
+		case "engine":
+			e := strings.TrimSpace(string(j.Engine))
+			if e == "" {
+				return "未知/未标注"
+			}
+			return e
+		case "started_at", "started":
+			if j.StartedAt.IsZero() {
+				return "未知/未标注"
+			}
+			return j.StartedAt.Local().Format("2006-01-02")
+		case "requested_by", "requested":
+			r := strings.TrimSpace(j.RequestedBy)
+			if r == "" {
+				return "未知/未标注"
+			}
+			return r
+		default:
+			return "未知/未标注"
+		}
+	}
+
+	groupsMap := make(map[string][]model.Job)
+	var groupKeys []string
+	for _, j := range jobs {
+		k := getGroupKey(j)
+		if _, ok := groupsMap[k]; !ok {
+			groupKeys = append(groupKeys, k)
+		}
+		groupsMap[k] = append(groupsMap[k], j)
+	}
+
+	for _, k := range groupKeys {
+		gJobs := groupsMap[k]
+		fmt.Fprintf(out, "\n▶ 分组 [%s: %s] (%d jobs)\n", groupField, k, len(gJobs))
+		renderJobsTable(out, gJobs)
+	}
 }
 
 func newJobsDeleteCmd() *cobra.Command {

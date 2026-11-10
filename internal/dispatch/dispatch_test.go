@@ -1283,3 +1283,96 @@ func TestDispatch_MQTT_TLS_InvalidCert_Fails(t *testing.T) {
 		t.Errorf("expected error to mention 'failed to read CA certificate', got: %v", err)
 	}
 }
+
+func TestDispatch_ExtendedFieldsAndSanitization(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	outBuf := new(bytes.Buffer)
+
+	cfg := dispatch.Config{
+		MachineID:   "mac-studio",
+		Command:     "agy",
+		Args:        []string{"run", "-p", "Refactor api with sk-1234567890abcdef1234567890 and password=mySecretPass"},
+		Repo:        "owner/my-repo",
+		Project:     "my-repo",
+		RequestedBy: "tester@box",
+		MQTTClient:  mockClient,
+		Out:         outBuf,
+		Quiet:       true,
+		Force:       true,
+	}
+
+	cmd, err := dispatch.Dispatch(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+	if cmd == nil {
+		t.Fatalf("expected non-nil DispatchCommand")
+	}
+
+	if cmd.Repo != "owner/my-repo" || cmd.Project != "my-repo" {
+		t.Errorf("unexpected repo/project: repo=%q project=%q", cmd.Repo, cmd.Project)
+	}
+
+	// Verify prompt was extracted and sanitized in the dispatched payload
+	if strings.Contains(cmd.Prompt, "sk-1234567890") || strings.Contains(cmd.Prompt, "mySecretPass") {
+		t.Errorf("prompt leaked secret: %q", cmd.Prompt)
+	}
+	if !strings.Contains(cmd.Prompt, "sk-[REDACTED]") || !strings.Contains(cmd.Prompt, "password=[REDACTED]") {
+		t.Errorf("prompt missing redaction tokens: %q", cmd.Prompt)
+	}
+
+	// Verify title was inferred from sanitized prompt since title was empty
+	if cmd.Title == "" {
+		t.Errorf("expected inferred title from prompt")
+	}
+	if strings.Contains(cmd.Title, "sk-1234567890") {
+		t.Errorf("title leaked secret: %q", cmd.Title)
+	}
+
+	// Verify published MQTT payload
+	pubMsgs := mockClient.GetPublished()
+	if len(pubMsgs) != 1 {
+		t.Fatalf("expected 1 published message, got %d", len(pubMsgs))
+	}
+	var pubCmd model.DispatchCommand
+	if err := json.Unmarshal(pubMsgs[0].Payload, &pubCmd); err != nil {
+		t.Fatalf("failed to unmarshal published command: %v", err)
+	}
+	if pubCmd.Repo != "owner/my-repo" || pubCmd.Project != "my-repo" {
+		t.Errorf("published payload repo/project mismatch: %+v", pubCmd)
+	}
+	if strings.Contains(pubCmd.Prompt, "sk-1234567890") {
+		t.Errorf("published MQTT payload contains unredacted key: %q", pubCmd.Prompt)
+	}
+}
+
+func TestDispatch_InferenceWhenOmitted(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	outBuf := new(bytes.Buffer)
+
+	// Omit Title, Repo, Project, Prompt
+	cfg := dispatch.Config{
+		MachineID:  "mac-studio",
+		Command:    "agy",
+		Args:       []string{"run", "--prompt", "Clean up cache entries"},
+		MQTTClient: mockClient,
+		Out:        outBuf,
+		Quiet:      true,
+		Force:      true,
+	}
+
+	cmd, err := dispatch.Dispatch(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("dispatch failed: %v", err)
+	}
+
+	if cmd.Prompt != "Clean up cache entries" {
+		t.Errorf("expected extracted prompt 'Clean up cache entries', got %q", cmd.Prompt)
+	}
+	if cmd.Title != "Clean up cache entries" {
+		t.Errorf("expected title inferred from prompt, got %q", cmd.Title)
+	}
+	if cmd.Repo == "" || cmd.Project == "" {
+		t.Errorf("expected inferred non-empty repo and project from cwd, got repo=%q proj=%q", cmd.Repo, cmd.Project)
+	}
+}

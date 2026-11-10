@@ -50,6 +50,10 @@ type Config struct {
 	JobID             string
 	Engine            model.EngineType // "agy" or "opencode"
 	Title             string
+	Repo              string
+	Project           string
+	Prompt            string
+	RequestedBy       string
 	Command           string
 	Args              []string
 	Cwd               string
@@ -128,8 +132,29 @@ func New(cfg Config) (*Wrapper, error) {
 		cfg.JobID = generateJobID(cfg.Engine)
 	}
 
+	if cfg.Prompt == "" {
+		cfg.Prompt = ExtractPrompt(cfg.Args)
+	}
+	if cfg.Prompt != "" {
+		cfg.Prompt = SanitizePrompt(cfg.Prompt, DefaultMaxPromptLength)
+	}
+
 	if cfg.Title == "" {
-		cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		if cfg.Prompt != "" {
+			cfg.Title = SanitizePrompt(cfg.Prompt, 60)
+		} else {
+			cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		}
+	} else {
+		cfg.Title = SanitizeTitle(cfg.Title, 100)
+	}
+
+	if cfg.Repo == "" && cfg.Project == "" {
+		cfg.Repo, cfg.Project = InferRepoAndProject(cfg.Cwd)
+	} else if cfg.Repo == "" {
+		cfg.Repo = cfg.Project
+	} else if cfg.Project == "" {
+		cfg.Project = cfg.Repo
 	}
 
 	if cfg.Command == "" && len(cfg.Args) > 0 {
@@ -159,16 +184,20 @@ func New(cfg Config) (*Wrapper, error) {
 	}
 
 	job := model.Job{
-		ID:        cfg.JobID,
-		MachineID: cfg.MachineID,
-		Engine:    cfg.Engine,
-		Status:    model.StatusRunning,
-		Progress:  0.0,
-		Cwd:       cfg.Cwd,
-		Command:   cfg.Command,
-		Title:     cfg.Title,
-		StartedAt: now,
-		UpdatedAt: now,
+		ID:          cfg.JobID,
+		MachineID:   cfg.MachineID,
+		Engine:      cfg.Engine,
+		Status:      model.StatusRunning,
+		Progress:    0.0,
+		Cwd:         cfg.Cwd,
+		Command:     SanitizeCommand(cfg.Command),
+		Title:       SanitizeTitle(cfg.Title, 100),
+		Repo:        cfg.Repo,
+		Project:     cfg.Project,
+		Prompt:      cfg.Prompt,
+		RequestedBy: cfg.RequestedBy,
+		StartedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	w := &Wrapper{
@@ -203,6 +232,12 @@ func (w *Wrapper) PID() int {
 	return w.pid
 }
 
+// Config returns a copy of the wrapper's configuration.
+// Callers use it to confirm child argv was not rewritten by redaction.
+func (w *Wrapper) Config() Config {
+	return w.cfg
+}
+
 // Run executes the wrapped process or stub, writes local status, and publishes MQTT telemetry.
 func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 	// Write initial local status snapshot (status: running, online: true, job_count: 1)
@@ -216,10 +251,11 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		w.mu.Lock()
 		finishTime := time.Now().UTC()
 		w.job.UpdatedAt = finishTime
+		w.job.EndedAt = finishTime
 		w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
 		if runErr != nil {
 			w.job.Status = model.StatusFailed
-			w.job.Error = runErr.Error()
+			w.job.Error = RedactSecrets(runErr.Error())
 		} else {
 			w.job.Status = model.StatusDone
 			w.job.Progress = 100.0
@@ -652,6 +688,8 @@ func (w *Wrapper) publishJobStatus() {
 	j := w.job
 	w.mu.Unlock()
 
+	j = SanitizeJob(j)
+
 	topic := fmt.Sprintf("agentpulse/v1/machines/%s/jobs/%s/status", j.MachineID, j.ID)
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -706,7 +744,7 @@ func (w *Wrapper) publishAlert() {
 		return
 	}
 	w.mu.Lock()
-	j := w.job
+	j := SanitizeJob(w.job)
 	m := w.machine
 	w.mu.Unlock()
 
@@ -715,11 +753,16 @@ func (w *Wrapper) publishAlert() {
 		"machine_id":   m.ID,
 		"engine":       string(j.Engine),
 		"status":       string(j.Status),
+		"command":      j.Command,
 		"title":        j.Title,
+		"repo":         j.Repo,
+		"project":      j.Project,
+		"prompt":       j.Prompt,
 		"cwd":          j.Cwd,
 		"duration_str": j.DurationStr,
 		"started_at":   j.StartedAt.Format(time.RFC3339),
 		"finished_at":  j.UpdatedAt.Format(time.RFC3339),
+		"requested_by": j.RequestedBy,
 		"error":        j.Error,
 	}
 
@@ -743,7 +786,7 @@ func (w *Wrapper) writeStatusFile() error {
 	w.mu.Lock()
 	st := LocalStatus{
 		Machine:   w.machine,
-		Job:       w.job,
+		Job:       SanitizeJob(w.job),
 		PID:       w.pid,
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -961,20 +1004,17 @@ func GenerateCommandID() string {
 func InferTitle(args []string, command string) string {
 	for i, arg := range args {
 		if (arg == "-p" || arg == "--prompt" || arg == "--task") && i+1 < len(args) {
-			return args[i+1]
+			return SanitizeTitle(args[i+1], 60)
 		}
 		if strings.HasPrefix(arg, "--prompt=") {
-			return strings.TrimPrefix(arg, "--prompt=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--prompt="), 60)
 		}
 		if strings.HasPrefix(arg, "--task=") {
-			return strings.TrimPrefix(arg, "--task=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--task="), 60)
 		}
 	}
 	if command != "" {
-		if len(command) > 60 {
-			return command[:57] + "..."
-		}
-		return command
+		return SanitizeTitle(command, 60)
 	}
 	return "Agent pulse job"
 }
