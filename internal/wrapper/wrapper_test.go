@@ -1148,10 +1148,7 @@ func TestWrapper_AuthFailure_FastFails(t *testing.T) {
 	w, err := wrapper.New(wrapper.Config{
 		MachineID:  "test-mac",
 		StatusFile: statusFile,
-		Args: []string{
-			"sh", "-c",
-			`echo "error getting token source: You are not logged into Antigravity."; exec sleep 5`,
-		},
+		Args:       reviewedHelperArgv(t, "auth-failure"),
 	})
 	if err != nil {
 		t.Fatalf("wrapper.New failed: %v", err)
@@ -1182,10 +1179,7 @@ func TestWrapper_StorageNotice_DoesNotFail(t *testing.T) {
 	w, err := wrapper.New(wrapper.Config{
 		MachineID:  "test-mac",
 		StatusFile: statusFile,
-		Args: []string{
-			"sh", "-c",
-			`echo "Using file-based token storage because SSH session detected"; echo "Task completed"`,
-		},
+		Args:       reviewedHelperArgv(t, "storage-notice"),
 	})
 	if err != nil {
 		t.Fatalf("wrapper.New failed: %v", err)

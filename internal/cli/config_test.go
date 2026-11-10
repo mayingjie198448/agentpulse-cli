@@ -16,7 +16,7 @@ import (
 
 func TestRunConfigWizard_FreshInstall(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Guided sequence for new configuration:
@@ -107,7 +107,7 @@ func TestRunConfigWizard_FreshInstall(t *testing.T) {
 
 func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Guided sequence:
@@ -235,7 +235,7 @@ func TestRunConfigWizard_CustomAgentsAndEnabled(t *testing.T) {
 
 func TestRunConfigWizard_ExistingConfig_SectionedEditBroker(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Seed existing config
@@ -303,7 +303,7 @@ func TestRunConfigWizard_ExistingConfig_SectionedEditBroker(t *testing.T) {
 
 func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Seed existing config
@@ -375,7 +375,7 @@ func TestRunConfigWizard_ExistingConfig_EnterKeepsDefaults(t *testing.T) {
 
 func TestRunConfigWizard_RescanAndSectionAgents(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	// Seed existing config with 1 agent
@@ -446,7 +446,7 @@ func TestRunConfigWizard_RescanAndSectionAgents(t *testing.T) {
 
 func TestRunConfigWizard_PreserveExistingAgentsAndNoDuplicates(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setSyntheticProfile(t, tmpDir)
 	confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
 
 	enabledTrue := true
@@ -843,4 +843,22 @@ func TestRunConfigWizard_BrokerUnchanged_NoRestart(t *testing.T) {
 	if strings.Contains(outStr, "检测到 Broker 配置变更") {
 		t.Errorf("expected NO broker change notification when broker is unchanged, got:\n%s", outStr)
 	}
+}
+
+// setSyntheticProfile points HOME and the Windows profile variables at dir.
+// UserHomeDir on Windows reads USERPROFILE, so HOME alone is not enough.
+func setSyntheticProfile(t *testing.T, dir string) {
+	t.Helper()
+	roaming := filepath.Join(dir, "AppData", "Roaming")
+	local := filepath.Join(dir, "AppData", "Local")
+	if err := os.MkdirAll(roaming, 0o755); err != nil {
+		t.Fatalf("mkdir AppData: %v", err)
+	}
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatalf("mkdir LocalAppData: %v", err)
+	}
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("APPDATA", roaming)
+	t.Setenv("LOCALAPPDATA", local)
 }

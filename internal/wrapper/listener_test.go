@@ -820,6 +820,7 @@ func TestListener_ConcurrentExecution(t *testing.T) {
 		StatusFile:        statusFile,
 		MQTTClient:        mockClient,
 		Stub:              true,
+		DisableBareAttach: true,
 		MaxConcurrentJobs: 3,
 		OnListening: func(_ string) {
 			close(listeningCh)
@@ -930,11 +931,12 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "worker-fields-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "worker-fields-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		Quiet:             true,
+		DisableBareAttach: true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -1031,10 +1033,11 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 func TestListener_PublishJobFailed_RetainsMetadataAndRedactsSecrets(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "fail-meta-node",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "fail-meta-node",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		Quiet:             true,
+		DisableBareAttach: true,
 	})
 	if err != nil {
 		t.Fatalf("wrapper.NewListener failed: %v", err)
@@ -1121,5 +1124,42 @@ func TestListener_PublishJobFailed_RetainsMetadataAndRedactsSecrets(t *testing.T
 	}
 	if !strings.Contains(failedJob.Title, "[REDACTED_TOKEN]") {
 		t.Errorf("expected redacted title, got %q", failedJob.Title)
+	}
+}
+
+// TestListener_EmptyAllowlistDoesNotStartDefaultDiscovery is the Windows entry
+// for "default discovery stays off". It does not call Run and does not scan.
+// It is not part of the 21-item offline driver.
+func TestListener_EmptyAllowlistDoesNotStartDefaultDiscovery(t *testing.T) {
+	profile := t.TempDir()
+	t.Setenv("HOME", profile)
+	t.Setenv("USERPROFILE", profile)
+	t.Setenv("APPDATA", profile)
+	t.Setenv("LOCALAPPDATA", profile)
+	t.Setenv("AGENTPULSE_ATTACH_PID_ALLOWLIST", "")
+
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID: "no-default-discovery",
+		Stub:      true,
+		Quiet:     true,
+	})
+	if err != nil {
+		t.Fatalf("NewListener: %v", err)
+	}
+	if l.AttachManager() != nil {
+		t.Fatal("empty allowlist started the default attach manager")
+	}
+
+	explicit, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:         "attach-explicitly-off",
+		DisableBareAttach: true,
+		Stub:              true,
+		Quiet:             true,
+	})
+	if err != nil {
+		t.Fatalf("NewListener explicit off: %v", err)
+	}
+	if explicit.AttachManager() != nil {
+		t.Fatal("DisableBareAttach still constructed an attach manager")
 	}
 }

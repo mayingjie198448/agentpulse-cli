@@ -99,17 +99,22 @@ func TestScanLocalAgents_Hermetic(t *testing.T) {
 		t.Fatalf("failed to create fake bin dir: %v", err)
 	}
 
+	// Windows discovery accepts a bare name or .exe. A .bat/.cmd fixture is not
+	// a product search suffix here. File mode is not a Windows DACL proof.
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("APPDATA", filepath.Join(fakeHome, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(fakeHome, "AppData", "Local"))
+
 	// Helper to create mock executable
 	createMockExec := func(dir, name string) string {
 		ext := ""
-		if runtime.GOOS == "windows" {
-			ext = ".bat"
-		}
-		path := filepath.Join(dir, name+ext)
 		content := "#!/bin/sh\necho mock\n"
 		if runtime.GOOS == "windows" {
-			content = "@echo off\r\necho mock\r\n"
+			ext = ".exe"
+			content = "agentpulse synthetic exe fixture\n"
 		}
+		path := filepath.Join(dir, name+ext)
 		if err := os.WriteFile(path, []byte(content), 0755); err != nil {
 			t.Fatalf("failed to write mock binary %s: %v", path, err)
 		}
@@ -196,5 +201,58 @@ func TestScanLocalAgents_Hermetic(t *testing.T) {
 	}
 	if !foundContinue {
 		t.Errorf("expected Continue to be detected as IDE plugin")
+	}
+}
+
+// TestScanLocalAgents_WindowsSyntheticExe covers the supported .exe suffix.
+// A sibling .bat is not treated as a discovered engine. This test is not in
+// the 21-item driver. File mode does not prove a Windows DACL.
+func TestScanLocalAgents_WindowsSyntheticExe(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows synthetic suffix coverage runs on windows only")
+	}
+	fakeHome := t.TempDir()
+	fakeBinDir := filepath.Join(fakeHome, "fakebin")
+	if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+	t.Setenv("APPDATA", filepath.Join(fakeHome, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(fakeHome, "AppData", "Local"))
+
+	batPath := filepath.Join(fakeBinDir, "agy.bat")
+	if err := os.WriteFile(batPath, []byte("agentpulse synthetic non-exe fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	batOnly := config.ScanLocalAgents(config.ScanOptions{
+		OverridePATH: fakeBinDir,
+		HomeDir:      fakeHome,
+	})
+	for _, b := range batOnly.DiscoveredBuiltin {
+		if b.ID == "agy" {
+			t.Fatalf("agy.bat alone must not count as a discovered engine, got %s", b.Path)
+		}
+	}
+
+	exePath := filepath.Join(fakeBinDir, "agy.exe")
+	if err := os.WriteFile(exePath, []byte("agentpulse synthetic exe fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withExe := config.ScanLocalAgents(config.ScanOptions{
+		OverridePATH: fakeBinDir,
+		HomeDir:      fakeHome,
+	})
+	var found bool
+	for _, b := range withExe.DiscoveredBuiltin {
+		if b.ID == "agy" {
+			found = true
+			if b.Path != exePath {
+				t.Fatalf("agy path = %s, want %s", b.Path, exePath)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected agy.exe to be discovered")
 	}
 }

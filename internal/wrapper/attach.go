@@ -247,6 +247,8 @@ func normalizePIDs(pids []int) []int {
 }
 
 // DefaultProcessLister lists processes using standard POSIX ps.
+// There is no Windows native backend. Do not route this through PowerShell
+// or a machine-wide process walk. On Windows the call stays blocked.
 func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
 	return listWithPS(ctx, nil)
 }

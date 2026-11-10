@@ -38,8 +38,10 @@ func TestUnscopedDiscoveryStillRequestsGlobalPS(t *testing.T) {
 		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
 			if name == "ps" || name == "lsof" {
 				calls = append(calls, name+" "+strings.Join(args, " "))
-				// Refuse the real binary. This test only records the requested argv.
-				return exec.CommandContext(ctx, "/bin/true")
+				// Record the requested argv, then run the reviewed helper.
+				// The helper exits 0 and does not start an agent. No shell.
+				argv := reviewedHelperArgv(t, "true")
+				return exec.CommandContext(ctx, argv[0], argv[1:]...)
 			}
 			return exec.CommandContext(ctx, name, args...)
 		},

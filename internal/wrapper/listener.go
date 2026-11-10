@@ -187,6 +187,13 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		dispatchPIDs:  make(map[int]bool),
 	}
 
+	// An empty allowlist must not start the default full-table lister.
+	// Injected ProcessLister remains the caller's seam. Windows still has no
+	// native process backend; this gate does not add one.
+	if !cfg.DisableBareAttach && cfg.ProcessLister == nil && !listenerHasExplicitAllowlist(cfg) {
+		cfg.DisableBareAttach = true
+	}
+
 	if !cfg.DisableBareAttach {
 		agents := cfg.Agents
 		if len(agents) == 0 {
@@ -232,6 +239,26 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	}
 
 	return l, nil
+}
+
+// listenerHasExplicitAllowlist reports a caller-named PID set from config or
+// AGENTPULSE_ATTACH_PID_ALLOWLIST. An empty result must not become a global scan.
+func listenerHasExplicitAllowlist(cfg ListenerConfig) bool {
+	for _, pid := range cfg.PIDAllowlist {
+		if pid > 0 {
+			return true
+		}
+	}
+	envPIDs := strings.TrimSpace(os.Getenv("AGENTPULSE_ATTACH_PID_ALLOWLIST"))
+	if envPIDs == "" {
+		return false
+	}
+	for _, pid := range ParsePIDAllowlist(envPIDs) {
+		if pid > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // AttachManager returns the listener's bare process attach manager instance, if enabled.

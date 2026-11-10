@@ -22,7 +22,10 @@ func TestMain(m *testing.M) {
 	tmpHome, err := os.MkdirTemp("", "agentpulse-cli-test-home-*")
 	if err == nil {
 		_ = os.Setenv("HOME", tmpHome)
+		_ = os.Setenv("USERPROFILE", tmpHome)
 		_ = os.Setenv("XDG_CONFIG_HOME", tmpHome)
+		_ = os.Setenv("APPDATA", filepath.Join(tmpHome, "AppData", "Roaming"))
+		_ = os.Setenv("LOCALAPPDATA", filepath.Join(tmpHome, "AppData", "Local"))
 		defer os.RemoveAll(tmpHome)
 	}
 	os.Exit(m.Run())
