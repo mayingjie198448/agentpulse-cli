@@ -481,6 +481,39 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		}
 	})
 
+	t.Run("MissingNameAbsenceIsDistinctFromExistingTargetDenial", func(t *testing.T) {
+		plan := DarwinFixtureLinkPlan{
+			RunRoot:             "/private/tmp/base/runs/run1",
+			ExternalTargetDir:   "/private/tmp/base/synthetic-external-target",
+			ExternalPayload:     "/private/tmp/base/synthetic-external-target/target.txt",
+			LinkInWork:          "/private/tmp/base/runs/run1/work/dir-link-escape",
+			EscapeThroughLink:   "/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt",
+			ExistingThroughLink: "/private/tmp/base/runs/run1/work/dir-link-escape/target.txt",
+		}
+		beforeIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
+		afterIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
+		payload := []byte("outside-target-v1\n")
+		// The never-created name is absent (enoent). The existing payload through the
+		// same directory symlink is denied (eperm). That pair is not an escape.
+		nativeShaped := "path=" + plan.EscapeThroughLink + "\nwrite=eperm\nremove=enoent\nread=enoent\n" +
+			"path=" + plan.ExistingThroughLink + "\nwrite=eperm\nremove=eperm\nread=eperm\n"
+		if err := verifyDarwinFixtureLinkEscape(nativeShaped, plan, beforeIdent, afterIdent, payload, false, false, true); err != nil {
+			t.Fatalf("absence of a never-created name was treated as a failed denial: %v", err)
+		}
+		// Reading the existing outside file through the link is an escape.
+		leaked := "path=" + plan.EscapeThroughLink + "\nwrite=eperm\nremove=enoent\nread=enoent\n" +
+			"path=" + plan.ExistingThroughLink + "\nwrite=eperm\nremove=eperm\nread=nil\n"
+		if err := verifyDarwinFixtureLinkEscape(leaked, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("existing outside target read through the directory link was accepted")
+		}
+		// enoent on the existing file does not prove that object was denied.
+		missed := "path=" + plan.EscapeThroughLink + "\nwrite=eperm\nremove=enoent\nread=enoent\n" +
+			"path=" + plan.ExistingThroughLink + "\nwrite=eperm\nremove=eperm\nread=enoent\n"
+		if err := verifyDarwinFixtureLinkEscape(missed, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("enoent on the existing outside target was treated as a denial")
+		}
+	})
+
 	t.Run("EscapeRecordParserStrictness", func(t *testing.T) {
 		valid := "path=/safe/a\nwrite=eperm\nremove=eperm\nread=eperm\n"
 		recs, err := parseDarwinEscapeRecords(valid)
@@ -1026,6 +1059,16 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 			t.Fatalf("burned probe illegally granted read permission: %v", readsBurned)
 		}
 	})
+}
+
+func TestFormatChildExitPrintsIntegerNotPointer(t *testing.T) {
+	zero := 0
+	if got := formatChildExit(nil); got != "null" {
+		t.Fatalf("nil child exit = %q", got)
+	}
+	if got := formatChildExit(&zero); got != "0" {
+		t.Fatalf("zero child exit = %q, pointer formatting would hide the audit integer", got)
+	}
 }
 
 func TestDarwinConfirmPipeContract(t *testing.T) {

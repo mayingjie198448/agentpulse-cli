@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -141,7 +142,10 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		if err := os.Symlink(darwinLinkPlan.ExternalTargetDir, darwinLinkPlan.LinkInWork); err != nil {
 			return b.String(), fmt.Errorf("failed to create synthetic in-root symlink: %w", err)
 		}
-		prepared.Cmd.Args = append(prepared.Cmd.Args, "--escape", darwinLinkPlan.EscapeThroughLink)
+		prepared.Cmd.Args = append(prepared.Cmd.Args,
+			"--escape", darwinLinkPlan.EscapeThroughLink,
+			"--escape", darwinLinkPlan.ExistingThroughLink,
+		)
 	}
 	noteManifest(&b, req.RegistryDir, prepared.rec)
 	fmt.Fprintf(&b, "profile_hash=%s\n", prepared.audit.ProfileHash)
@@ -159,7 +163,7 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	status, _ := os.ReadFile(filepath.Join(prepared.Work, "status.txt"))
 	sent, serr := os.ReadFile(sentinel)
 	fmt.Fprintf(&b, "child_status=%s\n", strings.TrimSpace(string(status)))
-	fmt.Fprintf(&b, "child_exit=%v\ncontroller_result=%s\n", out.ChildExit, out.ControllerResult)
+	fmt.Fprintf(&b, "child_exit=%s\ncontroller_result=%s\n", formatChildExit(out.ChildExit), out.ControllerResult)
 	if err := escapeDenials(string(escape), escapePaths(rels, fake)); err != nil {
 		fmt.Fprintf(&b, "result=FAIL\nescape=%s\nreason=%s\n", escape, err.Error())
 		return b.String(), err
@@ -278,14 +282,23 @@ func escapePaths(rels []string, fake string) []string {
 	return out
 }
 
+func formatChildExit(code *int) string {
+	if code == nil {
+		return "null"
+	}
+	return strconv.Itoa(*code)
+}
+
 func noteManifest(b *strings.Builder, registry string, rec *RunRecord) {
 	fmt.Fprintf(b, "registry_dir=%s\n", registry)
 	if rec != nil {
-		mpath, merr := manifestPath(registry, rec.RunID)
-		if merr != nil {
-			fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nmanifest_error=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, merr.Error())
+		fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nphase=root_ready\n", rec.RunID, rec.ProfileName, rec.PackageSID)
+		if rec.RegistryPath != "" {
+			fmt.Fprintf(b, "registry=%s\n", rec.RegistryPath)
+		} else if mpath, merr := manifestPath(registry, rec.RunID); merr != nil {
+			fmt.Fprintf(b, "manifest_error=%s\n", merr.Error())
 		} else {
-			fmt.Fprintf(b, "run_id=%s\nprofile_name=%s\npackage_sid=%s\nphase=root_ready\nmanifest=%s\n", rec.RunID, rec.ProfileName, rec.PackageSID, mpath)
+			fmt.Fprintf(b, "manifest=%s\n", mpath)
 		}
 		return
 	}

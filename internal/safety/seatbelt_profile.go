@@ -76,6 +76,7 @@ func DarwinSeatbeltProfile(root string, allowedReadLiterals ...string) (string, 
 ; can write the confirm pipe, so the parent observes EOF.
 (allow sysctl-read)
 ; pipe(2) objects are S_IFIFO. SBPL's bound vnode type is FIFO.
+; FIFO matches anonymous and named pipes. It is not path-filtered and is not an IPC proof.
 ; PIPE is an unbound variable: sandbox-exec rejects the profile before exec
 ; (observed: "unbound variable: PIPE" at this line, exit 65, confirm EOF).
 ; file-write-data does not allow creating or writing regular files.

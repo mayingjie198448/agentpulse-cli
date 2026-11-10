@@ -247,11 +247,12 @@ type DarwinTargetIdentity struct {
 
 // DarwinFixtureLinkPlan holds paths for the synthetic directory link escape fixture.
 type DarwinFixtureLinkPlan struct {
-	RunRoot           string
-	ExternalTargetDir string
-	ExternalPayload   string
-	LinkInWork        string
-	EscapeThroughLink string
+	RunRoot             string
+	ExternalTargetDir   string
+	ExternalPayload     string
+	LinkInWork          string
+	EscapeThroughLink   string
+	ExistingThroughLink string
 }
 
 // planDarwinFixtureLink constructs and validates the synthetic link test layout.
@@ -270,11 +271,12 @@ func planDarwinFixtureLink(base string, runRoot string) (DarwinFixtureLinkPlan, 
 		return DarwinFixtureLinkPlan{}, fmt.Errorf("symlink must be inside run root")
 	}
 	return DarwinFixtureLinkPlan{
-		RunRoot:           cleanRoot,
-		ExternalTargetDir: extTarget,
-		ExternalPayload:   path.Join(extTarget, "target.txt"),
-		LinkInWork:        link,
-		EscapeThroughLink: path.Join(link, "escape-attempt.txt"),
+		RunRoot:             cleanRoot,
+		ExternalTargetDir:   extTarget,
+		ExternalPayload:     path.Join(extTarget, "target.txt"),
+		LinkInWork:          link,
+		EscapeThroughLink:   path.Join(link, "escape-attempt.txt"),
+		ExistingThroughLink: path.Join(link, "target.txt"),
 	}, nil
 }
 
@@ -759,8 +761,29 @@ func verifyDarwinFixtureLinkEscape(escapeOutput string, plan DarwinFixtureLinkPl
 	if linkRec.Write != "eperm" {
 		return fmt.Errorf("escape through directory link was not denied with eperm (write=%s)", linkRec.Write)
 	}
-	if linkRec.Read != "eperm" {
-		return fmt.Errorf("escape through directory link read was not denied with eperm (read=%s)", linkRec.Read)
+	// escape-attempt.txt is not created. After a refused create, read and remove
+	// of that name are absence (enoent) or a denied lookup (eperm). A nil read
+	// would mean bytes came back. That is not the same check as the existing file.
+	if linkRec.Read != "enoent" && linkRec.Read != "eperm" {
+		return fmt.Errorf("never-created name through directory link was readable or unclassified (read=%s)", linkRec.Read)
+	}
+	if linkRec.Remove != "enoent" && linkRec.Remove != "eperm" {
+		return fmt.Errorf("never-created name through directory link remove was not absence or denial (remove=%s)", linkRec.Remove)
+	}
+	if plan.ExistingThroughLink != "" {
+		existRec, ok := records[plan.ExistingThroughLink]
+		if !ok {
+			return fmt.Errorf("existing outside target through directory link %q missing from escape records", plan.ExistingThroughLink)
+		}
+		if existRec.Read != "eperm" {
+			return fmt.Errorf("existing outside target read through directory link was not denied with eperm (read=%s)", existRec.Read)
+		}
+		if existRec.Write != "eperm" {
+			return fmt.Errorf("existing outside target write through directory link was not denied with eperm (write=%s)", existRec.Write)
+		}
+		if existRec.Remove != "eperm" {
+			return fmt.Errorf("existing outside target remove through directory link was not denied with eperm (remove=%s)", existRec.Remove)
+		}
 	}
 	if !targetExists {
 		return fmt.Errorf("outside target was destroyed")
