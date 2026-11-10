@@ -1249,30 +1249,93 @@ func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_Success(t *testing.T) {
 	// Retained on broker: mach-2 new node
 	fakeClient.Publish("agentpulse/v1/machines/mach-2/status", 1, true, []byte(`{"id":"mach-2","name":"mach-2","online":true}`))
 
-	// Run Refresh in background and inject real-time concurrent messages during settle
+	// SubscribeMultiple runs this hook after the refresh callback is installed
+	// and before it returns. Commit happens only after that return and the settle wait.
+	job1Realtime := `{"id":"job-1","machine_id":"mach-1","status":"running","title":"Job 1","progress":95}`
+	jobNewRealtime := `{"id":"job-new","machine_id":"mach-1","status":"running","title":"Job New","progress":0}`
+	logPayload := `{"job_id":"job-1","machine_id":"mach-1","level":"info","message":"realtime progress checkpoint"}`
+	var probe struct {
+		err      string
+		injected bool
+	}
+	windowCh := make(chan struct{})
+	var once sync.Once
+	fakeClient.SetOnSubscribeMultiple(func() {
+		once.Do(func() {
+			defer close(windowCh)
+			jobs, err := st.ListJobs(context.Background())
+			if err != nil {
+				probe.err = err.Error()
+				return
+			}
+			if jobByID(jobs, "job-1").Progress != 10 || jobByID(jobs, "job-new").ID != "" {
+				probe.err = fmt.Sprintf("live cache changed before the staging deliver: %+v", jobs)
+				return
+			}
+			logs, err := st.GetLogs(context.Background(), "job-1", 10)
+			if err != nil || len(logs) != 0 {
+				probe.err = fmt.Sprintf("live log present before commit: %+v err=%v", logs, err)
+				return
+			}
+			fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/status", []byte(job1Realtime), false)
+			fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-new/status", []byte(jobNewRealtime), false)
+			fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/logs", []byte(logPayload), false)
+			jobs, err = st.ListJobs(context.Background())
+			if err != nil {
+				probe.err = err.Error()
+				return
+			}
+			if jobByID(jobs, "job-1").Progress != 10 || jobByID(jobs, "job-new").ID != "" {
+				probe.err = fmt.Sprintf("in-window deliver reached the live cache before commit: %+v", jobs)
+				return
+			}
+			logs, err = st.GetLogs(context.Background(), "job-1", 10)
+			if err != nil || len(logs) != 0 {
+				probe.err = fmt.Sprintf("in-window log reached the live cache before commit: %+v err=%v", logs, err)
+				return
+			}
+			probe.injected = true
+		})
+	})
+
 	refreshErrCh := make(chan error, 1)
 	go func() {
 		refreshErrCh <- st.Refresh(ctx)
 	}()
 
-	// Wait 20ms into refresh, then publish concurrent real-time messages (retained: false)
-	time.Sleep(20 * time.Millisecond)
-
-	// Real-time job progress update (progress 95%)
-	job1Realtime := `{"id":"job-1","machine_id":"mach-1","status":"running","title":"Job 1","progress":95}`
-	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/status", []byte(job1Realtime), false)
-
-	// Real-time new job
-	jobNewRealtime := `{"id":"job-new","machine_id":"mach-1","status":"running","title":"Job New","progress":0}`
-	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-new/status", []byte(jobNewRealtime), false)
-
-	// Real-time log entry
-	logPayload := `{"job_id":"job-1","machine_id":"mach-1","level":"info","message":"realtime progress checkpoint"}`
-	fakeClient.Deliver("agentpulse/v1/machines/mach-1/jobs/job-1/logs", []byte(logPayload), false)
-
-	// Wait for refresh to finish
-	if err := <-refreshErrCh; err != nil {
-		t.Fatalf("Refresh returned unexpected error: %v", err)
+	var refreshErr error
+	refreshDone := false
+	select {
+	case <-windowCh:
+	case err := <-refreshErrCh:
+		select {
+		case <-windowCh:
+			refreshErr = err
+			refreshDone = true
+		default:
+			t.Fatalf("Refresh ended before the staging window: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("staging window was not established")
+	}
+	if probe.err != "" {
+		t.Fatal(probe.err)
+	}
+	if !refreshDone {
+		select {
+		case refreshErr = <-refreshErrCh:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatal("Refresh did not return after the staging window")
+		}
+	}
+	if refreshErr != nil {
+		t.Fatalf("Refresh returned unexpected error: %v", refreshErr)
+	}
+	if !probe.injected {
+		jobs, _ := st.ListJobs(ctx)
+		t.Fatalf("three non-retained delivers were not inside the open staging window; live jobs=%+v", jobs)
 	}
 
 	// Live cache must be exactly these ids. A same-sized substitute does not count.
