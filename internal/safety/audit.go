@@ -42,6 +42,54 @@ type AuditEvent struct {
 	CleanupResult     string   `json:"cleanup_result,omitempty"`
 	CleanupReason     string   `json:"cleanup_reason,omitempty"`
 	ExitCode          int      `json:"exit_code"`
+	WindowsLaunchMetadata *WindowsLaunchMetadata `json:"windows_launch_metadata,omitempty"`
+}
+
+// WindowsPathCategory is a closed classifier for Windows path shapes.
+type WindowsPathCategory string
+
+const (
+	PathCategoryEmpty         WindowsPathCategory = "empty"
+	PathCategoryRelative      WindowsPathCategory = "relative"
+	PathCategoryDriveAbsolute WindowsPathCategory = "drive_absolute"
+	PathCategoryDriveRelative WindowsPathCategory = "drive_relative"
+	PathCategoryRootRelative  WindowsPathCategory = "root_relative"
+	PathCategoryUNC           WindowsPathCategory = "unc"
+	PathCategoryNTDevice      WindowsPathCategory = "nt_device"
+	PathCategoryUnknown       WindowsPathCategory = "unknown"
+)
+
+// WindowsLaunchMetadata is a strictly closed-typed, redacted snapshot of
+// parameters and observations at the Windows CreateProcess launch boundary.
+type WindowsLaunchMetadata struct {
+	CreationFlags                uint32              `json:"creation_flags"`
+	StartupInfoCb                uint32              `json:"startup_info_cb"`
+	StartupInfoExSize            uint32              `json:"startup_info_ex_size"`
+	SecurityCapabilitiesSize     uint32              `json:"security_capabilities_size"`
+	PopulatedAttributeCount      int                 `json:"populated_attribute_count"`
+	SecurityCapabilitiesAttrSize uint32              `json:"security_capabilities_attr_size"`
+	HandleListAttrSize           uint32              `json:"handle_list_attr_size"`
+	HandleListCount              int                 `json:"handle_list_count"`
+	CapabilityCount              uint32              `json:"capability_count"`
+	CapabilityReserved           uint32              `json:"capability_reserved"`
+	SIDPresent                   bool                `json:"sid_present"`
+	EnvPointerProvided           bool                `json:"env_pointer_provided"`
+	EnvUTF16UnitCount            int                 `json:"env_utf16_unit_count"`
+	EnvDoubleNULValid            bool                `json:"env_double_nul_valid"`
+	EnvStructureValid            bool                `json:"env_structure_valid"`
+	EnvSorted                    bool                `json:"env_sorted"`
+	ParentSystemRootPresent      bool                `json:"parent_systemroot_present"`
+	ParentSystemRootNonEmpty     bool                `json:"parent_systemroot_nonempty"`
+	ParentLocalAppDataPresent    bool                `json:"parent_localappdata_present"`
+	ParentLocalAppDataNonEmpty   bool                `json:"parent_localappdata_nonempty"`
+	ChildSystemRootAnyPresent    bool                `json:"child_systemroot_any_present"`
+	ChildSystemRootAnyNonEmpty   bool                `json:"child_systemroot_any_nonempty"`
+	ChildLocalAppDataAnyPresent  bool                `json:"child_localappdata_any_present"`
+	ChildLocalAppDataAnyNonEmpty bool                `json:"child_localappdata_any_nonempty"`
+	AppPathCategory              WindowsPathCategory `json:"app_path_category"`
+	AppPathUTF16Length           int                 `json:"app_path_utf16_length"`
+	CurrentDirCategory           WindowsPathCategory `json:"current_dir_category"`
+	CurrentDirUTF16Length        int                 `json:"current_dir_utf16_length"`
 }
 
 var auditMu sync.Mutex

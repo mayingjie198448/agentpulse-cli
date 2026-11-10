@@ -146,6 +146,8 @@ flowchart TD
 
 ### 4.2 作业生命周期与状态 (Job State & Lifecycle)
 
+> **裸进程自动挂接**：自 v0.8.0 起，除 dispatch 派发的任务外，本机直接启动的裸 Agent CLI 进程亦由守护进程自动发现并按本协议上报状态与日志。详见 [本机裸 Agent CLI 进程自动挂接机制 (Bare CLI Attach)](bare-cli-attach.md)。
+
 - **主题**：`agentpulse/v1/machines/{machine_id}/jobs/{job_id}/status`
 - **发布者**：Thin Wrapper
 - **触发时机**：Job 状态跃迁（排队、开始运行、进度刷新、正常完成、异常失败）时实时发布。
@@ -160,10 +162,15 @@ flowchart TD
 | `progress` | number (float) | 进度百分比，取值范围 `0.0` 至 `100.0` |
 | `cwd` | string | 任务在目标机器上的工作目录路径 |
 | `command` | string | 派发或执行的原始 CLI 命令与参数 |
-| `title` | string | 任务标题或简要工作目标描述 |
+| `title` | string | 任务短标题或简要工作目标描述 |
+| `repo` | string (可选) | 代码仓库标识（如 `"owner/repo"` 或从 git remote 推断） |
+| `project` | string (可选) | 项目名称（如根目录名或显式指定） |
+| `prompt` | string (可选) | 脱敏后的任务提示词/目标摘要（长度受限，密钥已严格脱敏） |
 | `started_at` | string (RFC 3339) | 任务开始时间戳 |
+| `ended_at` | string (RFC 3339, 可选) | 任务结束时间戳（完成或失败时提供） |
 | `updated_at` | string (RFC 3339) | 状态最近一次更新时间戳 |
 | `duration_str` | string (可选) | 当前运行时长人类可读文本（如 `"1m 24s"`） |
+| `requested_by` | string (可选) | 派活发起者标识（如 `"user@my-laptop"`） |
 | `error` | string (可选) | 失败原因或退出错误信息（当 `status == "failed"` 时提供） |
 
 #### JSON 示例：正在运行中的 Job
@@ -177,9 +184,13 @@ flowchart TD
   "cwd": "/Users/mayingjie/Repos/agentpulse-cli",
   "command": "agy run --task 'refactor store layer'",
   "title": "Refactor store layer for MQTT integration",
+  "repo": "mayingjie198448/agentpulse-cli",
+  "project": "agentpulse-cli",
+  "prompt": "refactor store layer to support MQTT retained message cleanup and job status sync",
   "started_at": "2026-11-02T13:25:00Z",
   "updated_at": "2026-11-02T13:30:15Z",
   "duration_str": "5m 15s",
+  "requested_by": "mayingjie@mac-studio-m2",
   "error": ""
 }
 ```
@@ -195,9 +206,14 @@ flowchart TD
   "cwd": "/home/ubuntu/projects/model-finetune",
   "command": "opencode train --config train.yaml",
   "title": "LoRA Fine-tuning on Llama-3",
+  "repo": "org/model-finetune",
+  "project": "model-finetune",
+  "prompt": "fine-tune Llama-3 on custom instruction dataset with LoRA rank 16",
   "started_at": "2026-11-02T13:10:00Z",
+  "ended_at": "2026-11-02T13:14:32Z",
   "updated_at": "2026-11-02T13:14:32Z",
   "duration_str": "4m 32s",
+  "requested_by": "alice@linux-gpu-box",
   "error": "CUDA out of memory: tried to allocate 2.40 GiB (GPU 0; 23.69 GiB total capacity)"
 }
 ```
@@ -271,6 +287,9 @@ flowchart TD
 | `command` | string | 待调用的可执行命令（如 `"agy"` 或 `"opencode run"`） |
 | `args` | array[string] | 命令行附加参数数组 |
 | `title` | string | 人类可读的任务描述与摘要 |
+| `repo` | string (可选) | 目标代码仓库标识（从 git remote 推断或命令行 `--repo` 指定） |
+| `project` | string (可选) | 项目名称（从工作目录推断或命令行 `--project` 指定） |
+| `prompt` | string (可选) | 任务提示词摘要（派发时已脱敏，长度受限） |
 | `timeout_seconds` | integer | 最大运行超时秒数（0 表示无限制） |
 | `env` | map[string]string | 注入远程执行进程的环境变量 |
 | `requested_by` | string | 派活发起者标识（如 `"user@my-laptop"`） |
@@ -286,6 +305,9 @@ flowchart TD
   "command": "agy",
   "args": ["run", "--prompt", "Optimize database query pool"],
   "title": "Optimize DB pool in backend-api",
+  "repo": "mayingjie198448/backend-api",
+  "project": "backend-api",
+  "prompt": "Optimize database query pool",
   "timeout_seconds": 3600,
   "env": {
     "ENV": "production_test",
@@ -295,6 +317,20 @@ flowchart TD
   "timestamp": "2026-11-02T13:32:00Z"
 }
 ```
+
+#### 4.4.1 并发调度、工作区 (cwd / worktree) 隔离与资源风险说明
+
+为了兼顾高吞吐与执行安全性，AgentPulse 支持通过 `config.yaml` 的 `max_concurrent_jobs` 或 CLI 参数 `--max-concurrent-jobs` 配置单机并发作业数：
+
+1. **默认串行安全（Default Serial Execution）**：
+   - `max_concurrent_jobs` 默认为 `1`。当机器当前已有作业处于 `running` 状态时，新派发的任务将在调度队列中保持 `queued` 状态排队等待，保证单机作业严格按序执行。
+2. **工作区目录 (cwd / worktree) 隔离要求**：
+   - 当 `max_concurrent_jobs > 1` 时，多个 Agent 进程可能在同一台物理机器上并发运行。
+   - **禁止共用相同 Git 仓库工作区**：若两个或多个并发任务指定了相同的 `cwd`，Agent 在执行代码分析、修改、测试与 git 提交时必然发生严重冲突（例如 `.git/index.lock` 争用、未提交代码覆盖、构建产物互相干扰等）。
+   - **推荐隔离机制**：调度发起方应确保并发任务的 `cwd` 指向不同物理路径，推荐结合 `git worktree add <path> <branch>` 为每个并发任务派生独立的瞬态工作树，任务结束后再合并清理。
+3. **计算与外部 API 资源风险**：
+   - **主机资源**：每个并发 Agent 进程（如 Node.js / Go / Python 进程与 LSP 语言服务器）均会消耗可观的 CPU 与内存（约 500MB~2GB/进程），需根据物理主机规格合理设置并发度，避免 OOM。
+   - **模型配额限制**：多任务并发对云端大模型 API 发起请求时易触发并发速率限制（Rate Limit / 429 Too Many Requests），需确保 API Token 配额充足。
 
 ---
 

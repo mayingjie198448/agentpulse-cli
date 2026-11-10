@@ -23,6 +23,9 @@ func newDispatchCmd() *cobra.Command {
 		engine             string
 		cwd                string
 		title              string
+		repoFlag           string
+		projectFlag        string
+		promptFlag         string
 		timeoutSeconds     int
 		waitTimeoutSeconds int
 		requestedBy        string
@@ -79,12 +82,19 @@ func newDispatchCmd() *cobra.Command {
 
 			if len(rawArgs) > 0 {
 				agentOrCLI = rawArgs[0]
-				finalArgs = append(finalArgs, rawArgs[1:]...)
+				args := rawArgs[1:]
+				if len(args) > 0 && args[0] == "--" {
+					args = args[1:]
+				}
+				finalArgs = append(finalArgs, args...)
 			} else if commandFlag != "" {
 				agentOrCLI = commandFlag
 			}
 			if len(argFlags) > 0 {
 				finalArgs = append(finalArgs, argFlags...)
+			}
+			if len(finalArgs) > 0 && finalArgs[0] == "--" {
+				finalArgs = finalArgs[1:]
 			}
 
 			if strings.TrimSpace(agentOrCLI) == "" {
@@ -189,6 +199,9 @@ func newDispatchCmd() *cobra.Command {
 				Command:            agentOrCLI,
 				Args:               finalArgs,
 				Title:              title,
+				Repo:               repoFlag,
+				Project:            projectFlag,
+				Prompt:             promptFlag,
 				TimeoutSeconds:     timeoutSeconds,
 				WaitTimeoutSeconds: waitTimeoutSeconds,
 				Env:                envMap,
@@ -202,7 +215,7 @@ func newDispatchCmd() *cobra.Command {
 				ErrOut:             errOut,
 			}
 
-			_, err := dispatch.Dispatch(ctx, cfg)
+			_, err := dispatchInvoker(ctx, cfg)
 			return err
 		},
 	}
@@ -215,6 +228,9 @@ func newDispatchCmd() *cobra.Command {
 	dispatchCmd.Flags().StringVar(&engine, "engine", "", "Agent 引擎类型 ('agy' 或 'opencode')")
 	dispatchCmd.Flags().StringVar(&cwd, "cwd", "", "远端工作目录")
 	dispatchCmd.Flags().StringVar(&title, "title", "", "作业标题或说明")
+	dispatchCmd.Flags().StringVar(&repoFlag, "repo", "", "仓库名 (如 org/repo，省略时自动推断)")
+	dispatchCmd.Flags().StringVar(&projectFlag, "project", "", "项目名 (省略时自动推断)")
+	dispatchCmd.Flags().StringVarP(&promptFlag, "prompt", "p", "", "任务提示词 (省略时从命令参数自动提取)")
 	dispatchCmd.Flags().IntVar(&timeoutSeconds, "timeout-seconds", 0, "远端作业超时时间 (秒，0 表示不设限)")
 	dispatchCmd.Flags().IntVar(&waitTimeoutSeconds, "wait-timeout", 0, "本地等待超时时间 (秒，0 表示不设限)")
 	dispatchCmd.Flags().StringVar(&requestedBy, "requested-by", "", "派发者身份标识 (默认: $USER@hostname)")
@@ -228,3 +244,9 @@ func newDispatchCmd() *cobra.Command {
 
 	return dispatchCmd
 }
+
+// dispatchInvoker is the publish path used by the dispatch command.
+// The default is dispatch.Dispatch. Tests in this package may replace it
+// with a function that still calls dispatch.Dispatch after attaching an
+// in-memory client. Production builds keep the default.
+var dispatchInvoker = dispatch.Dispatch

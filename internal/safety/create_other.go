@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package safety
 
@@ -10,12 +10,4 @@ func createSyntheticSentinel(base string) (string, error) {
 
 func createRunRoot(opts createOpts) (RunRecord, error) {
 	return RunRecord{}, fmt.Errorf("%w: run-root identity creation is BLOCKED on this OS", ErrBackendUnavailable)
-}
-
-type createOpts struct {
-	BaseDir     string
-	RegistryDir string
-	RealHome    string
-	Sentinel    string
-	ExeHash     string
 }
