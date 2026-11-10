@@ -37,7 +37,13 @@ type AuditEvent struct {
 	// LaunchStage is the controller stage that refused. It is not a Seatbelt result.
 	LaunchStage string `json:"launch_stage,omitempty"`
 	// ChildStderr is a capped, redacted prefix of the child stderr.
-	ChildStderr           string                 `json:"child_stderr,omitempty"`
+	ChildStderr string `json:"child_stderr,omitempty"`
+	// WorkerProbe is the raw per-path write/remove/read text. It is not a boolean summary.
+	WorkerProbe string `json:"worker_probe,omitempty"`
+	// FinalArgv is the user argv after later --escape arguments were appended.
+	FinalArgv []string `json:"final_argv,omitempty"`
+	// SeatbeltProfileSHA256 hashes the -p text, not the run-identity profile_hash.
+	SeatbeltProfileSHA256 string                 `json:"seatbelt_profile_sha256,omitempty"`
 	FSWrite               string                 `json:"fs_write"`
 	CredentialIPC         string                 `json:"credential_ipc"`
 	Network               string                 `json:"network"`
@@ -204,6 +210,8 @@ func AppendAudit(path string, ev AuditEvent) error {
 	ev.SeatbeltProfile = redactDiagnostic(ev.SeatbeltProfile)
 	ev.LaunchStage = redactDiagnostic(ev.LaunchStage)
 	ev.ChildStderr = redactDiagnostic(ev.ChildStderr)
+	ev.WorkerProbe = redactDiagnostic(ev.WorkerProbe)
+	ev.FinalArgv = RedactArgv(ev.FinalArgv)
 	if ev.TimestampUTC == "" {
 		now := time.Now()
 		ev.TimestampUTC, ev.TimestampShanghai = formatTimes(now)

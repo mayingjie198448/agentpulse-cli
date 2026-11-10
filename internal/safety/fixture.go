@@ -216,6 +216,30 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		}
 		fmt.Fprintf(&b, "dir_link_escape_denied=true\n")
 	}
+	if runtime.GOOS == "darwin" {
+		ev, rerr := retainRunEvidence(evidenceRetention{
+			Parent:      base,
+			RunRoot:     prepared.Root,
+			AuditPath:   audit,
+			WorkerProbe: string(escape),
+			FinalArgv:   argvAfterSeparator(prepared.Cmd.Args),
+			Profile:     prepared.seatbeltProfile,
+			RunID:       prepared.RunID,
+		})
+		if rerr != nil {
+			fmt.Fprintf(&b, "result=FAIL\nreason=retention_refused\n")
+			return b.String(), rerr
+		}
+		if err := AppendAudit(audit, ev); err != nil {
+			fmt.Fprintf(&b, "result=FAIL\nreason=retention_refused\n")
+			return b.String(), err
+		}
+		if ev.ControllerResult != "retained" {
+			fmt.Fprintf(&b, "retention=BLOCKED\nreason=%s\nresult=FAIL\n", ev.CleanupReason)
+			return b.String(), fmt.Errorf("%w: %s", ErrRefused, ev.CleanupReason)
+		}
+		fmt.Fprintf(&b, "retention=retained\n")
+	}
 	cout, cerr := CleanupRun(prepared.RunID, CleanupOptions{RegistryDir: req.RegistryDir, AuditPath: audit, RealHome: fake})
 	auditBody, _ := os.ReadFile(audit)
 	if strings.Contains(string(auditBody), "s3cr3t-mqtt-password") || !strings.Contains(string(auditBody), "[REDACTED]") {
