@@ -2,6 +2,7 @@ package safety
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"strings"
@@ -75,6 +76,7 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 
 	// Allowed readable literal: safe external synthetic sentinel
 	safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-12345678"
+	_, _ = mintDarwinSyntheticProbe("run1", safeProbe, 100, 200, "nonce1")
 	profWithProbe, err := DarwinSeatbeltProfile(root, safeProbe)
 	if err != nil {
 		t.Fatalf("unexpected error adding safe probe literal: %v", err)
@@ -82,6 +84,13 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 	wantLit := "(allow file-read* (literal \"/private/tmp/agentpulse-sentinels/sentinel-12345678\"))"
 	if !strings.Contains(profWithProbe, wantLit) {
 		t.Errorf("seatbelt profile missing safe read literal %q", wantLit)
+	}
+	// Ancestor directory literals of root must be present to permit traversal
+	for _, anc := range []string{"/", "/private", "/private/tmp", "/private/tmp/agentpulse-runs"} {
+		wantAnc := fmt.Sprintf("(allow file-read* (literal %q))", anc)
+		if !strings.Contains(profWithProbe, wantAnc) {
+			t.Errorf("seatbelt profile missing ancestor literal %q", wantAnc)
+		}
 	}
 
 	// Refuse whitelisting protected user/credential paths
@@ -94,6 +103,8 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 		"/private/tmp/bad\"literal",
 		"",
 		"relative/path",
+		"/Volumes/custom-home/alice/private.txt",
+		"/private/tmp/not-created-by-this-run.txt",
 	} {
 		if _, err := DarwinSeatbeltProfile(root, forbiddenLit); err == nil {
 			t.Errorf("expected error whitelisting forbidden read literal %q, got nil", forbiddenLit)
@@ -347,7 +358,7 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 			LinkInWork:        "/private/tmp/base/runs/run1/work/dir-link-escape",
 			EscapeThroughLink: "/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt",
 		}
-		escapeOutput := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=eperm\nremove=eperm\n"
+		escapeOutput := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=eperm\nremove=eperm\nread=eperm\n"
 		beforeIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
 		afterIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
 		payload := []byte("outside-target-v1\n")
@@ -359,26 +370,44 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		}
 
 		// Negative: write through link permitted
-		badEscape := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=nil\n"
+		badEscape := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=nil\nremove=eperm\nread=eperm\n"
 		if err := verifyDarwinFixtureLinkEscape(badEscape, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
 			t.Fatal("expected error when link write was not denied")
 		}
 
 		// Negative: other paths denied with eperm but link write permitted (R3 mixed counterexample)
-		mixedEscape := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/.config/agentpulse/config.yaml\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/Library/Keychains/login.keychain-db\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/Library/CloudStorage/OneDrive-Personal/doc.txt\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/OneDrive/file.txt\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/Desktop/file.txt\nwrite=eperm\nremove=eperm\n" +
-			"path=/Users/testuser/Documents/file.txt\nwrite=eperm\nremove=eperm\n" +
-			"path=" + plan.EscapeThroughLink + "\nwrite=nil\nremove=nil\n"
+		mixedEscape := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/.config/agentpulse/config.yaml\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/Library/Keychains/login.keychain-db\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/Library/CloudStorage/OneDrive-Personal/doc.txt\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/OneDrive/file.txt\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/Desktop/file.txt\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=/Users/testuser/Documents/file.txt\nwrite=eperm\nremove=eperm\nread=eperm\n" +
+			"path=" + plan.EscapeThroughLink + "\nwrite=nil\nremove=nil\nread=nil\n"
 		if err := verifyDarwinFixtureLinkEscape(mixedEscape, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
 			t.Fatal("expected error on mixed escape where link write was allowed despite other eperm denials")
 		}
 
+		// Negative R3: duplicate field reversal in same record
+		dupReversal := "path=" + plan.EscapeThroughLink + "\nwrite=nil\nremove=eperm\nread=eperm\nwrite=eperm\n"
+		if err := verifyDarwinFixtureLinkEscape(dupReversal, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error on duplicate field reversal (write=nil then write=eperm)")
+		}
+
+		// Negative R3: missing read outcome
+		missingRead := "path=" + plan.EscapeThroughLink + "\nwrite=eperm\nremove=eperm\n"
+		if err := verifyDarwinFixtureLinkEscape(missingRead, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when read outcome is missing from link record")
+		}
+
+		// Negative R3: unknown field in record
+		unknownField := "path=" + plan.EscapeThroughLink + "\nwrite=eperm\nremove=eperm\nread=eperm\nunknown=123\n"
+		if err := verifyDarwinFixtureLinkEscape(unknownField, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error on unknown field in escape record")
+		}
+
 		// Negative: link record missing entirely
-		missingLink := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\n"
+		missingLink := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\nread=eperm\n"
 		if err := verifyDarwinFixtureLinkEscape(missingLink, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
 			t.Fatal("expected error when link escape record is missing")
 		}
@@ -416,6 +445,178 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		// Negative: symlink not reclaimed
 		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, payload, false, true, true); err == nil {
 			t.Fatal("expected error when symlink was not reclaimed")
+		}
+	})
+
+	t.Run("EscapeRecordParserStrictness", func(t *testing.T) {
+		valid := "path=/safe/a\nwrite=eperm\nremove=eperm\nread=eperm\n"
+		recs, err := parseDarwinEscapeRecords(valid)
+		if err != nil || len(recs) != 1 || recs["/safe/a"].Read != "eperm" {
+			t.Fatalf("unexpected failure parsing valid records: %v", err)
+		}
+
+		// Missing read outcome
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=eperm\nremove=eperm\n"); err == nil {
+			t.Fatal("expected error on missing read field")
+		}
+
+		// Missing write outcome
+		if _, err := parseDarwinEscapeRecords("path=/a\nremove=eperm\nread=eperm\n"); err == nil {
+			t.Fatal("expected error on missing write field")
+		}
+
+		// Missing remove outcome
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=eperm\nread=eperm\n"); err == nil {
+			t.Fatal("expected error on missing remove field")
+		}
+
+		// Duplicate write field
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=nil\nremove=eperm\nread=eperm\nwrite=eperm\n"); err == nil {
+			t.Fatal("expected error on duplicate write field")
+		}
+
+		// Duplicate read field
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=eperm\nremove=eperm\nread=nil\nread=eperm\n"); err == nil {
+			t.Fatal("expected error on duplicate read field")
+		}
+
+		// Unknown field
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=eperm\nremove=eperm\nread=eperm\nunknown=123\n"); err == nil {
+			t.Fatal("expected error on unknown field")
+		}
+
+		// Duplicate record for same path
+		dupPath := "path=/a\nwrite=eperm\nremove=eperm\nread=eperm\npath=/a\nwrite=eperm\nremove=eperm\nread=eperm\n"
+		if _, err := parseDarwinEscapeRecords(dupPath); err == nil {
+			t.Fatal("expected error on duplicate record for same path")
+		}
+
+		// Invalid outcome value
+		if _, err := parseDarwinEscapeRecords("path=/a\nwrite=invalid_val\nremove=eperm\nread=eperm\n"); err == nil {
+			t.Fatal("expected error on invalid outcome value")
+		}
+
+		// Field before path
+		if _, err := parseDarwinEscapeRecords("write=eperm\npath=/a\nremove=eperm\nread=eperm\n"); err == nil {
+			t.Fatal("expected error on field before path")
+		}
+	})
+
+	t.Run("WorkerProbeSeamPlatformScope", func(t *testing.T) {
+		readFileCalled := false
+		writeFileCalled := false
+		removeCalled := false
+
+		mockSeam := workerEscapeProberSeam{
+			WriteFile: func(name string, data []byte, perm os.FileMode) error {
+				writeFileCalled = true
+				return nil
+			},
+			Remove: func(name string) error {
+				removeCalled = true
+				return nil
+			},
+			ReadFile: func(name string) ([]byte, error) {
+				readFileCalled = true
+				return []byte("data"), nil
+			},
+		}
+
+		// On Windows: ReadFile is NEVER called, and format has no read= field (restores 6041)
+		mockSeam.GOOS = "windows"
+		readFileCalled = false
+		writeFileCalled = false
+		removeCalled = false
+		winOut := probeAndFormatWorkerEscape("/fake/target", mockSeam)
+		if !writeFileCalled || !removeCalled {
+			t.Fatal("expected write and remove called on windows")
+		}
+		if readFileCalled {
+			t.Fatal("windows probe illegally called ReadFile; PR pollution detected")
+		}
+		if strings.Contains(winOut, "read=") {
+			t.Fatalf("windows probe output illegally contains read= field: %q", winOut)
+		}
+		wantWin := "path=/fake/target\nwrite=nil\nremove=nil\n"
+		if winOut != wantWin {
+			t.Fatalf("windows probe output mismatch: got %q, want %q", winOut, wantWin)
+		}
+
+		// On Darwin: ReadFile IS called, and format includes read= field
+		mockSeam.GOOS = "darwin"
+		readFileCalled = false
+		darwinOut := probeAndFormatWorkerEscape("/fake/target", mockSeam)
+		if !readFileCalled {
+			t.Fatal("darwin probe must invoke ReadFile for read denial verification")
+		}
+		if !strings.Contains(darwinOut, "read=") {
+			t.Fatalf("darwin probe output missing read= field: %q", darwinOut)
+		}
+		wantDarwin := "path=/fake/target\nwrite=nil\nremove=nil\nread=nil\n"
+		if darwinOut != wantDarwin {
+			t.Fatalf("darwin probe output mismatch: got %q, want %q", darwinOut, wantDarwin)
+		}
+	})
+
+	t.Run("LaunchAllowedReadsResolution", func(t *testing.T) {
+		rec := RunRecord{
+			RunID: "run1234567890abcdef1234567890ab",
+			Root:  "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
+		}
+		selfExe := "/usr/bin/agentpulse"
+		homes := []string{"/Users/alice", "/Volumes/custom-home/bob"}
+
+		// Baseline: without synthetic probe, allowed reads contains ONLY selfExe
+		baselineReads, err := resolveDarwinAllowedReads(rec, selfExe, homes)
+		if err != nil {
+			t.Fatalf("unexpected error resolving baseline reads: %v", err)
+		}
+		if len(baselineReads) != 1 || baselineReads[0] != selfExe {
+			t.Fatalf("expected only selfExe in baseline, got %v", baselineReads)
+		}
+
+		// Arbitrary caller sentinel (unverified) fails closed and is NOT added
+		recWithCaller := rec
+		recWithCaller.Sentinel = "/private/tmp/not-created-by-this-run.txt"
+		callerReads, err := resolveDarwinAllowedReads(recWithCaller, selfExe, homes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(callerReads) != 1 || callerReads[0] != selfExe {
+			t.Fatalf("unverified caller sentinel illegally entered allowed reads: %v", callerReads)
+		}
+
+		// Custom HOME sentinel fails closed and is NOT added
+		recWithCustomHome := rec
+		recWithCustomHome.Sentinel = "/Volumes/custom-home/bob/secret.txt"
+		customHomeReads, err := resolveDarwinAllowedReads(recWithCustomHome, selfExe, homes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(customHomeReads) != 1 {
+			t.Fatalf("custom home sentinel illegally entered allowed reads: %v", customHomeReads)
+		}
+
+		// Verified this-run synthetic probe enters allowed reads
+		safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-bound1"
+		_, err = mintDarwinSyntheticProbe(rec.RunID, safeProbe, 100, 200, "nonce1")
+		if err != nil {
+			t.Fatalf("failed to mint synthetic probe: %v", err)
+		}
+		recWithSynthetic := rec
+		recWithSynthetic.Sentinel = safeProbe
+		synthReads, err := resolveDarwinAllowedReads(recWithSynthetic, selfExe, homes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(synthReads) != 2 || synthReads[1] != safeProbe {
+			t.Fatalf("expected synthetic probe in allowed reads, got %v", synthReads)
+		}
+
+		// Self executable inside protected home is rejected
+		badExe := "/Users/alice/bin/agentpulse"
+		if _, err := resolveDarwinAllowedReads(rec, badExe, homes); err == nil {
+			t.Fatal("expected error when self executable is inside protected home")
 		}
 	})
 }

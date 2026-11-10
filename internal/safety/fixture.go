@@ -79,6 +79,9 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		if err := os.WriteFile(sentinel, []byte("sentinel-v1\n"), 0600); err != nil {
 			return b.String(), err
 		}
+		if sIdent, sErr := getDarwinFileIdentity(sentinel); sErr == nil {
+			_, _ = mintDarwinSyntheticProbe("", sentinel, sIdent.Dev, sIdent.Ino, "")
+		}
 	}
 	audit := filepath.Join(base, "audit.jsonl")
 	exe, err := os.Executable()

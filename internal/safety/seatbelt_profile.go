@@ -19,13 +19,29 @@ func DarwinSeatbeltProfile(root string, allowedReadLiterals ...string) (string, 
 		return "", fmt.Errorf("%w: run root cannot be embedded in a seatbelt profile", ErrRefused)
 	}
 
+	literalDirectives := make(map[string]bool)
 	var extraReads strings.Builder
+
+	// Add exact literal directory ancestors of run root to allow openDirNoFollow traversal
+	// without granting broad subpath access or permissions to other files.
+	for _, anc := range darwinPathAncestors(root) {
+		if anc != root && !literalDirectives[anc] {
+			literalDirectives[anc] = true
+			fmt.Fprintf(&extraReads, "(allow file-read* (literal %q))\n", anc)
+		}
+	}
+
 	for _, lit := range allowedReadLiterals {
 		if err := validateDarwinReadableLiteral(lit, root); err != nil {
 			return "", err
 		}
 		clean := path.Clean(lit)
-		fmt.Fprintf(&extraReads, "(allow file-read* (literal %q))\n", clean)
+		for _, anc := range darwinPathAncestors(clean) {
+			if !literalDirectives[anc] {
+				literalDirectives[anc] = true
+				fmt.Fprintf(&extraReads, "(allow file-read* (literal %q))\n", anc)
+			}
+		}
 	}
 
 	return fmt.Sprintf(`(version 1)
@@ -78,6 +94,12 @@ func validateDarwinReadableLiteral(lit string, runRoot string) error {
 		return fmt.Errorf("%w: read literal contains injection characters", ErrRefused)
 	}
 	cleanLit := path.Clean(lit)
+	if cleanLit != lit || !path.IsAbs(lit) {
+		return fmt.Errorf("%w: read literal is not canonical: %q", ErrRefused, lit)
+	}
+	if strings.HasPrefix(cleanLit, "/Volumes/") {
+		return fmt.Errorf("%w: read literal %q is in external/custom volume", ErrRefused, cleanLit)
+	}
 	for _, forbidden := range []string{
 		"/Users",
 		"/System/Volumes/Data/Users",
@@ -103,6 +125,12 @@ func validateDarwinReadableLiteral(lit string, runRoot string) error {
 			if part == sensitive {
 				return fmt.Errorf("%w: read literal %q contains sensitive segment %q", ErrRefused, cleanLit, sensitive)
 			}
+		}
+	}
+	// Outside run root, only an owned, verified this-run synthetic probe can receive a read exception.
+	if !withinPath(runRoot, cleanLit) && cleanLit != runRoot {
+		if !isVerifiedDarwinSyntheticProbe(cleanLit) {
+			return fmt.Errorf("%w: read literal %q is not a verified this-run synthetic probe", ErrRefused, cleanLit)
 		}
 	}
 	return nil

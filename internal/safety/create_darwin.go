@@ -176,7 +176,13 @@ func createSyntheticSentinel(base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return kpath + "/" + name, nil
+	sentinelPath := kpath + "/" + name
+	var st unix.Stat_t
+	if err := unix.Lstat(sentinelPath, &st); err == nil {
+		dev, ino := ident(st)
+		_, _ = mintDarwinSyntheticProbe("", sentinelPath, dev, ino, "")
+	}
+	return sentinelPath, nil
 }
 
 func createSafeDarwinDir(target string, homes []string) (int, string, error) {

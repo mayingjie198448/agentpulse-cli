@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -285,55 +286,249 @@ type DarwinEscapeRecord struct {
 	Read   string
 }
 
+// DarwinSyntheticProbeProof proves that a file was synthetically created during this run.
+type DarwinSyntheticProbeProof struct {
+	CanonicalPath string
+	Dev           uint64
+	Ino           uint64
+	RunID         string
+	Nonce         string
+	Minted        bool
+}
+
+var darwinSyntheticProofs sync.Map
+
+// mintDarwinSyntheticProbe records an owned this-run synthetic probe proof.
+func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce string) (DarwinSyntheticProbeProof, error) {
+	if strings.TrimSpace(probePath) == "" {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty probe path", ErrRefused)
+	}
+	if err := validateDarwinCanonicalPath(probePath); err != nil {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: probe path not canonical: %v", ErrRefused, err)
+	}
+	clean := path.Clean(probePath)
+	if strings.HasPrefix(clean, "/Volumes/") || strings.HasPrefix(clean, "/Users/") || strings.HasPrefix(clean, "/System/Volumes/Data/Users/") {
+		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: synthetic probe cannot be in home/volume: %s", ErrRefused, clean)
+	}
+	for _, sens := range []string{".ssh", "Keychains", "login.keychain", "credentials", ".config", ".aws", ".gnupg"} {
+		for _, part := range strings.Split(clean, "/") {
+			if part == sens {
+				return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: synthetic probe contains sensitive segment %s", ErrRefused, sens)
+			}
+		}
+	}
+	proof := DarwinSyntheticProbeProof{
+		CanonicalPath: clean,
+		Dev:           dev,
+		Ino:           ino,
+		RunID:         runID,
+		Nonce:         nonce,
+		Minted:        true,
+	}
+	darwinSyntheticProofs.Store(clean, proof)
+	return proof, nil
+}
+
+func isVerifiedDarwinSyntheticProbe(p string) bool {
+	clean := path.Clean(p)
+	val, ok := darwinSyntheticProofs.Load(clean)
+	if !ok {
+		return false
+	}
+	proof, ok := val.(DarwinSyntheticProbeProof)
+	return ok && proof.Minted && proof.CanonicalPath == clean
+}
+
+// resolveDarwinAllowedReads strictly resolves read permissions for confined Darwin launch.
+// Caller sentinels, unverified caller paths, custom HOME, and paths with sensitive segments
+// are rejected. Only valid target executable and verified this-run synthetic probes are allowed.
+func resolveDarwinAllowedReads(rec RunRecord, selfExe string, homes []string) ([]string, error) {
+	if strings.TrimSpace(selfExe) == "" {
+		return nil, fmt.Errorf("%w: missing self executable", ErrRefused)
+	}
+	if err := validateDarwinCanonicalPath(selfExe); err != nil {
+		return nil, fmt.Errorf("%w: target executable is not canonical: %v", ErrRefused, err)
+	}
+	cleanExe := path.Clean(selfExe)
+	for _, home := range homes {
+		if strings.TrimSpace(home) != "" && (withinPath(home, cleanExe) || cleanExe == home) {
+			return nil, fmt.Errorf("%w: target executable cannot be inside protected home %q", ErrRefused, home)
+		}
+	}
+	for _, sens := range []string{".ssh", "Keychains", "login.keychain", "credentials", ".config", ".aws", ".gnupg"} {
+		for _, part := range strings.Split(cleanExe, "/") {
+			if part == sens {
+				return nil, fmt.Errorf("%w: target executable contains sensitive segment %s", ErrRefused, sens)
+			}
+		}
+	}
+	allowed := []string{cleanExe}
+
+	// Only an owned, verified this-run synthetic probe can be granted read permission.
+	// Arbitrary caller sentinels, unverified paths, or paths inside protected homes FAIL CLOSED.
+	if rec.Sentinel != "" {
+		cleanSent := path.Clean(rec.Sentinel)
+		if cleanSent == rec.Sentinel { // exact canonical matching, no case or alias difference
+			val, ok := darwinSyntheticProofs.Load(cleanSent)
+			if ok {
+				proof, isProof := val.(DarwinSyntheticProbeProof)
+				if isProof && proof.Minted && proof.CanonicalPath == cleanSent && (rec.RunID == "" || proof.RunID == "" || proof.RunID == rec.RunID) {
+					inHome := false
+					for _, home := range homes {
+						if strings.TrimSpace(home) != "" && (withinPath(home, cleanSent) || cleanSent == home) {
+							inHome = true
+							break
+						}
+					}
+					if !inHome && !withinPath(rec.Root, cleanSent) && cleanSent != rec.Root {
+						allowed = append(allowed, cleanSent)
+					}
+				}
+			}
+		}
+	}
+	return allowed, nil
+}
+
+// darwinPathAncestors computes the literal directory ancestors of a path up to root "/".
+func darwinPathAncestors(p string) []string {
+	clean := path.Clean(p)
+	if clean == "" || clean == "." || clean == "/" {
+		return []string{"/"}
+	}
+	var ancestors []string
+	curr := clean
+	for curr != "/" && curr != "." && curr != "" {
+		ancestors = append([]string{curr}, ancestors...)
+		parent := path.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
+	}
+	ancestors = append([]string{"/"}, ancestors...)
+	return ancestors
+}
+
 // parseDarwinEscapeRecords parses escape.txt into per-path records.
+// It strictly binds every path, action, and outcome:
+// - required fields (path, write, remove, read) must appear exactly once per record
+// - duplicate, missing, unknown, or contradictory records are rejected
 func parseDarwinEscapeRecords(text string) (map[string]DarwinEscapeRecord, error) {
 	lines := strings.Split(text, "\n")
 	records := make(map[string]DarwinEscapeRecord)
+
+	type fieldPresence struct {
+		hasWrite  bool
+		hasRemove bool
+		hasRead   bool
+	}
+
 	var curr DarwinEscapeRecord
-	for _, rawLine := range lines {
+	var seen fieldPresence
+	inRecord := false
+
+	flushRecord := func() error {
+		if !inRecord {
+			return nil
+		}
+		if curr.Path == "" {
+			return fmt.Errorf("record missing path")
+		}
+		if !seen.hasWrite {
+			return fmt.Errorf("record for %q missing write field", curr.Path)
+		}
+		if !seen.hasRemove {
+			return fmt.Errorf("record for %q missing remove field", curr.Path)
+		}
+		if !seen.hasRead {
+			return fmt.Errorf("record for %q missing read field", curr.Path)
+		}
+		if err := validateDarwinEscapeRecord(curr); err != nil {
+			return err
+		}
+		if _, exists := records[curr.Path]; exists {
+			return fmt.Errorf("duplicate record for %q", curr.Path)
+		}
+		records[curr.Path] = curr
+		curr = DarwinEscapeRecord{}
+		seen = fieldPresence{}
+		inRecord = false
+		return nil
+	}
+
+	for lineNum, rawLine := range lines {
 		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "path=") {
-			if curr.Path != "" {
-				if err := validateDarwinEscapeRecord(curr); err != nil {
+		idx := strings.IndexByte(line, '=')
+		if idx <= 0 {
+			return nil, fmt.Errorf("line %d: malformed record line %q", lineNum+1, line)
+		}
+		key := line[:idx]
+		val := line[idx+1:]
+
+		switch key {
+		case "path":
+			if inRecord {
+				if err := flushRecord(); err != nil {
 					return nil, err
 				}
-				if existing, exists := records[curr.Path]; exists {
-					if existing != curr {
-						return nil, fmt.Errorf("contradictory duplicate record for %q", curr.Path)
-					}
-				} else {
-					records[curr.Path] = curr
-				}
 			}
-			curr = DarwinEscapeRecord{Path: strings.TrimPrefix(line, "path=")}
-		} else if strings.HasPrefix(line, "write=") {
-			curr.Write = strings.TrimPrefix(line, "write=")
-		} else if strings.HasPrefix(line, "remove=") {
-			curr.Remove = strings.TrimPrefix(line, "remove=")
-		} else if strings.HasPrefix(line, "read=") {
-			curr.Read = strings.TrimPrefix(line, "read=")
+			cleanPath := path.Clean(val)
+			if cleanPath == "" || cleanPath == "." {
+				return nil, fmt.Errorf("line %d: empty or invalid path %q", lineNum+1, val)
+			}
+			curr.Path = val
+			inRecord = true
+
+		case "write":
+			if !inRecord {
+				return nil, fmt.Errorf("line %d: write field before path", lineNum+1)
+			}
+			if seen.hasWrite {
+				return nil, fmt.Errorf("line %d: duplicate write field for %q", lineNum+1, curr.Path)
+			}
+			curr.Write = val
+			seen.hasWrite = true
+
+		case "remove":
+			if !inRecord {
+				return nil, fmt.Errorf("line %d: remove field before path", lineNum+1)
+			}
+			if seen.hasRemove {
+				return nil, fmt.Errorf("line %d: duplicate remove field for %q", lineNum+1, curr.Path)
+			}
+			curr.Remove = val
+			seen.hasRemove = true
+
+		case "read":
+			if !inRecord {
+				return nil, fmt.Errorf("line %d: read field before path", lineNum+1)
+			}
+			if seen.hasRead {
+				return nil, fmt.Errorf("line %d: duplicate read field for %q", lineNum+1, curr.Path)
+			}
+			curr.Read = val
+			seen.hasRead = true
+
+		default:
+			return nil, fmt.Errorf("line %d: unknown field %q for record %q", lineNum+1, key, curr.Path)
 		}
 	}
-	if curr.Path != "" {
-		if err := validateDarwinEscapeRecord(curr); err != nil {
+
+	if inRecord {
+		if err := flushRecord(); err != nil {
 			return nil, err
 		}
-		if existing, exists := records[curr.Path]; exists {
-			if existing != curr {
-				return nil, fmt.Errorf("contradictory duplicate record for %q", curr.Path)
-			}
-		} else {
-			records[curr.Path] = curr
-		}
 	}
+
 	return records, nil
 }
 
 func validateDarwinEscapeRecord(r DarwinEscapeRecord) error {
-	if r.Path == "" {
+	if strings.TrimSpace(r.Path) == "" {
 		return fmt.Errorf("record missing path")
 	}
 	isValidErrno := func(v string) bool {
@@ -345,7 +540,7 @@ func validateDarwinEscapeRecord(r DarwinEscapeRecord) error {
 	if !isValidErrno(r.Remove) {
 		return fmt.Errorf("record for %q has invalid remove outcome %q", r.Path, r.Remove)
 	}
-	if r.Read != "" && !isValidErrno(r.Read) {
+	if !isValidErrno(r.Read) {
 		return fmt.Errorf("record for %q has invalid read outcome %q", r.Path, r.Read)
 	}
 	return nil
@@ -364,7 +559,7 @@ func verifyDarwinFixtureLinkEscape(escapeOutput string, plan DarwinFixtureLinkPl
 	if linkRec.Write != "eperm" {
 		return fmt.Errorf("escape through directory link was not denied with eperm (write=%s)", linkRec.Write)
 	}
-	if linkRec.Read != "" && linkRec.Read != "eperm" {
+	if linkRec.Read != "eperm" {
 		return fmt.Errorf("escape through directory link read was not denied with eperm (read=%s)", linkRec.Read)
 	}
 	if !targetExists {

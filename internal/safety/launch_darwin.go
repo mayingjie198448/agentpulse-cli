@@ -21,11 +21,9 @@ func configureConfinedLaunch(p *Prepared) error {
 		return fmt.Errorf("%w: /usr/bin/sandbox-exec is not executable", ErrBackendUnavailable)
 	}
 	selfExe := p.Cmd.Path
-	allowedReads := []string{selfExe}
-	if p.rec.Sentinel != "" {
-		if err := validateDarwinReadableLiteral(p.rec.Sentinel, p.rec.Root); err == nil {
-			allowedReads = append(allowedReads, p.rec.Sentinel)
-		}
+	allowedReads, err := resolveDarwinAllowedReads(*p.rec, selfExe, protectedHomes(p.audit.RealHome))
+	if err != nil {
+		return fmt.Errorf("%w: resolve allowed reads: %v", ErrRefused, err)
 	}
 	profile, err := DarwinSeatbeltProfile(p.rec.Root, allowedReads...)
 	if err != nil {
