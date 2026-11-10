@@ -247,11 +247,12 @@ type DarwinTargetIdentity struct {
 
 // DarwinFixtureLinkPlan holds paths for the synthetic directory link escape fixture.
 type DarwinFixtureLinkPlan struct {
-	RunRoot           string
-	ExternalTargetDir string
-	ExternalPayload   string
-	LinkInWork        string
-	EscapeThroughLink string
+	RunRoot             string
+	ExternalTargetDir   string
+	ExternalPayload     string
+	LinkInWork          string
+	EscapeThroughLink   string
+	ExistingThroughLink string
 }
 
 // planDarwinFixtureLink constructs and validates the synthetic link test layout.
@@ -270,11 +271,12 @@ func planDarwinFixtureLink(base string, runRoot string) (DarwinFixtureLinkPlan, 
 		return DarwinFixtureLinkPlan{}, fmt.Errorf("symlink must be inside run root")
 	}
 	return DarwinFixtureLinkPlan{
-		RunRoot:           cleanRoot,
-		ExternalTargetDir: extTarget,
-		ExternalPayload:   path.Join(extTarget, "target.txt"),
-		LinkInWork:        link,
-		EscapeThroughLink: path.Join(link, "escape-attempt.txt"),
+		RunRoot:             cleanRoot,
+		ExternalTargetDir:   extTarget,
+		ExternalPayload:     path.Join(extTarget, "target.txt"),
+		LinkInWork:          link,
+		EscapeThroughLink:   path.Join(link, "escape-attempt.txt"),
+		ExistingThroughLink: path.Join(link, "target.txt"),
 	}, nil
 }
 
@@ -304,12 +306,15 @@ type darwinPendingSyntheticProbe struct {
 }
 
 // DarwinImageProof proves that an executable was validated for this run.
+// Nonce is required and must be the exact non-empty run nonce. An empty
+// nonce is not a proof, even when run, root, and hash are present.
 type DarwinImageProof struct {
 	CanonicalPath string
 	Dev           uint64
 	Ino           uint64
 	RunID         string
 	Root          string
+	Nonce         string
 	ExeSHA256     string
 	Minted        bool
 }
@@ -403,59 +408,6 @@ func bindDarwinSyntheticProbe(runID, rootPath, nonce, sentPath string, sdev, sin
 	return nil
 }
 
-// mintDarwinSyntheticProbe records an owned this-run synthetic probe proof.
-// Exact non-empty runID, root, nonce, and nonzero dev, ino are required; no empty wildcard.
-func mintDarwinSyntheticProbe(runID, probePath string, dev, ino uint64, nonce, root string) (DarwinSyntheticProbeProof, error) {
-	if strings.TrimSpace(runID) == "" {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty runID", ErrRefused)
-	}
-	if strings.TrimSpace(nonce) == "" {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty nonce", ErrRefused)
-	}
-	if strings.TrimSpace(root) == "" {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty root", ErrRefused)
-	}
-	if err := validateDarwinCanonicalPath(root); err != nil {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: invalid root: %v", ErrRefused, err)
-	}
-	if dev == 0 || ino == 0 {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: zero device or inode", ErrSentinelUnusable)
-	}
-	if strings.TrimSpace(probePath) == "" {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: empty probe path", ErrRefused)
-	}
-	if err := validateDarwinCanonicalPath(probePath); err != nil {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: probe path not canonical: %v", ErrRefused, err)
-	}
-	clean := path.Clean(probePath)
-	if clean != probePath || !path.IsAbs(probePath) {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: probe path not canonical: %s", ErrRefused, probePath)
-	}
-	if strings.HasPrefix(clean, "/Volumes/") || strings.HasPrefix(clean, "/Users/") || strings.HasPrefix(clean, "/System/Volumes/Data/Users/") {
-		return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: synthetic probe cannot be in home/volume: %s", ErrRefused, clean)
-	}
-	for _, sens := range []string{".ssh", "Keychains", "login.keychain", "credentials", ".config", ".aws", ".gnupg"} {
-		for _, part := range strings.Split(clean, "/") {
-			if part == sens {
-				return DarwinSyntheticProbeProof{}, fmt.Errorf("%w: synthetic probe contains sensitive segment %s", ErrRefused, sens)
-			}
-		}
-	}
-	proof := DarwinSyntheticProbeProof{
-		CanonicalPath: clean,
-		Dev:           dev,
-		Ino:           ino,
-		RunID:         runID,
-		Root:          path.Clean(root),
-		Nonce:         nonce,
-		Minted:        true,
-	}
-	darwinProbeMu.Lock()
-	darwinSyntheticProofs[clean] = proof
-	darwinProbeMu.Unlock()
-	return proof, nil
-}
-
 func isVerifiedDarwinSyntheticProbe(p string, root string) bool {
 	clean := path.Clean(p)
 	cleanRoot := path.Clean(root)
@@ -473,44 +425,6 @@ func isVerifiedDarwinSyntheticProbe(p string, root string) bool {
 	return true
 }
 
-func mintDarwinImageProof(runID, root, exePath, exeSHA256 string, dev, ino uint64) (DarwinImageProof, error) {
-	if strings.TrimSpace(runID) == "" {
-		return DarwinImageProof{}, fmt.Errorf("%w: empty runID for image proof", ErrRefused)
-	}
-	if strings.TrimSpace(root) == "" {
-		return DarwinImageProof{}, fmt.Errorf("%w: empty root for image proof", ErrRefused)
-	}
-	if err := validateDarwinCanonicalPath(root); err != nil {
-		return DarwinImageProof{}, fmt.Errorf("%w: invalid root for image proof: %v", ErrRefused, err)
-	}
-	if strings.TrimSpace(exePath) == "" {
-		return DarwinImageProof{}, fmt.Errorf("%w: empty exePath for image proof", ErrRefused)
-	}
-	if err := validateDarwinCanonicalPath(exePath); err != nil {
-		return DarwinImageProof{}, fmt.Errorf("%w: invalid exePath for image proof: %v", ErrRefused, err)
-	}
-	if strings.TrimSpace(exeSHA256) == "" {
-		return DarwinImageProof{}, fmt.Errorf("%w: empty exeSHA256 for image proof", ErrRefused)
-	}
-	if dev == 0 || ino == 0 {
-		return DarwinImageProof{}, fmt.Errorf("%w: zero dev or ino for image proof", ErrRefused)
-	}
-	clean := path.Clean(exePath)
-	proof := DarwinImageProof{
-		CanonicalPath: clean,
-		Dev:           dev,
-		Ino:           ino,
-		RunID:         runID,
-		Root:          path.Clean(root),
-		ExeSHA256:     exeSHA256,
-		Minted:        true,
-	}
-	darwinProbeMu.Lock()
-	darwinImageProofs[clean] = proof
-	darwinProbeMu.Unlock()
-	return proof, nil
-}
-
 func isVerifiedDarwinImage(p string, root string) bool {
 	clean := path.Clean(p)
 	cleanRoot := path.Clean(root)
@@ -521,7 +435,8 @@ func isVerifiedDarwinImage(p string, root string) bool {
 	defer darwinProbeMu.Unlock()
 	proof, ok := darwinImageProofs[clean]
 	if !ok || !proof.Minted || proof.CanonicalPath != clean ||
-		proof.RunID == "" || proof.ExeSHA256 == "" || proof.Dev == 0 || proof.Ino == 0 ||
+		strings.TrimSpace(proof.RunID) == "" || strings.TrimSpace(proof.Nonce) == "" ||
+		strings.TrimSpace(proof.ExeSHA256) == "" || proof.Dev == 0 || proof.Ino == 0 ||
 		proof.Root == "" || proof.Root != cleanRoot {
 		return false
 	}
@@ -568,7 +483,7 @@ func resolveDarwinAllowedReads(rec RunRecord, selfExe string, homes []string) ([
 	if cleanExe != selfExe || !path.IsAbs(selfExe) {
 		return nil, fmt.Errorf("%w: target executable is not canonical: %q", ErrRefused, selfExe)
 	}
-	if strings.TrimSpace(rec.RunID) == "" || strings.TrimSpace(rec.Root) == "" || strings.TrimSpace(rec.ExeSHA256) == "" {
+	if strings.TrimSpace(rec.RunID) == "" || strings.TrimSpace(rec.Root) == "" || strings.TrimSpace(rec.Nonce) == "" || strings.TrimSpace(rec.ExeSHA256) == "" {
 		return nil, fmt.Errorf("%w: incomplete run record for image verification", ErrRefused)
 	}
 	if err := validateDarwinCanonicalPath(rec.Root); err != nil {
@@ -638,6 +553,7 @@ func resolveDarwinAllowedReads(rec RunRecord, selfExe string, homes []string) ([
 		Ino:           ino,
 		RunID:         rec.RunID,
 		Root:          path.Clean(rec.Root),
+		Nonce:         rec.Nonce,
 		ExeSHA256:     actualSHA,
 		Minted:        true,
 	}
@@ -845,8 +761,29 @@ func verifyDarwinFixtureLinkEscape(escapeOutput string, plan DarwinFixtureLinkPl
 	if linkRec.Write != "eperm" {
 		return fmt.Errorf("escape through directory link was not denied with eperm (write=%s)", linkRec.Write)
 	}
-	if linkRec.Read != "eperm" {
-		return fmt.Errorf("escape through directory link read was not denied with eperm (read=%s)", linkRec.Read)
+	// escape-attempt.txt is not created. After a refused create, read and remove
+	// of that name are absence (enoent) or a denied lookup (eperm). A nil read
+	// would mean bytes came back. That is not the same check as the existing file.
+	if linkRec.Read != "enoent" && linkRec.Read != "eperm" {
+		return fmt.Errorf("never-created name through directory link was readable or unclassified (read=%s)", linkRec.Read)
+	}
+	if linkRec.Remove != "enoent" && linkRec.Remove != "eperm" {
+		return fmt.Errorf("never-created name through directory link remove was not absence or denial (remove=%s)", linkRec.Remove)
+	}
+	if plan.ExistingThroughLink != "" {
+		existRec, ok := records[plan.ExistingThroughLink]
+		if !ok {
+			return fmt.Errorf("existing outside target through directory link %q missing from escape records", plan.ExistingThroughLink)
+		}
+		if existRec.Read != "eperm" {
+			return fmt.Errorf("existing outside target read through directory link was not denied with eperm (read=%s)", existRec.Read)
+		}
+		if existRec.Write != "eperm" {
+			return fmt.Errorf("existing outside target write through directory link was not denied with eperm (write=%s)", existRec.Write)
+		}
+		if existRec.Remove != "eperm" {
+			return fmt.Errorf("existing outside target remove through directory link was not denied with eperm (remove=%s)", existRec.Remove)
+		}
 	}
 	if !targetExists {
 		return fmt.Errorf("outside target was destroyed")
