@@ -27,6 +27,9 @@ type Config struct {
 	Command            string
 	Args               []string
 	Title              string
+	Repo               string
+	Project            string
+	Prompt             string
 	TimeoutSeconds     int // Constrains remote job execution timeout (passed in payload)
 	WaitTimeoutSeconds int // Local wait wall-clock timeout in seconds (0 = unlimited)
 	Env                map[string]string
@@ -79,8 +82,27 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 	if cfg.CommandID == "" {
 		cfg.CommandID = wrapper.GenerateCommandID()
 	}
+	if cfg.Prompt == "" {
+		cfg.Prompt = wrapper.ExtractPrompt(commandArgs)
+	}
+	if cfg.Prompt != "" {
+		cfg.Prompt = wrapper.SanitizePrompt(cfg.Prompt, wrapper.DefaultMaxPromptLength)
+	}
 	if cfg.Title == "" {
-		cfg.Title = wrapper.InferTitle(commandArgs, commandBin)
+		if cfg.Prompt != "" {
+			cfg.Title = wrapper.SanitizePrompt(cfg.Prompt, 60)
+		} else {
+			cfg.Title = wrapper.InferTitle(commandArgs, commandBin)
+		}
+	} else {
+		cfg.Title = wrapper.SanitizeTitle(cfg.Title, 100)
+	}
+	if cfg.Repo == "" && cfg.Project == "" {
+		cfg.Repo, cfg.Project = wrapper.InferRepoAndProject(cfg.Cwd)
+	} else if cfg.Repo == "" {
+		cfg.Repo = cfg.Project
+	} else if cfg.Project == "" {
+		cfg.Project = cfg.Repo
 	}
 	if cfg.RequestedBy == "" {
 		user := os.Getenv("USER")
@@ -290,6 +312,9 @@ func Dispatch(ctx context.Context, cfg Config) (*model.DispatchCommand, error) {
 		Command:        commandBin,
 		Args:           commandArgs,
 		Title:          cfg.Title,
+		Repo:           cfg.Repo,
+		Project:        cfg.Project,
+		Prompt:         cfg.Prompt,
 		TimeoutSeconds: cfg.TimeoutSeconds,
 		Env:            cfg.Env,
 		RequestedBy:    cfg.RequestedBy,
