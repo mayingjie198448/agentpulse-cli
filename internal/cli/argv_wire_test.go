@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +34,7 @@ import (
 // The actual argv is the helper's own os.Args file, not a copy of the expectation.
 
 func TestDispatchWireChildArgv_PositionalSeparator(t *testing.T) {
+	beginArgvWire(t)
 	prompt := "修复 数据库连接池"
 	quoted := `say "你好 世界"`
 	opaque := "ghp_FAKE_NOT_A_TOKEN"
@@ -50,6 +53,7 @@ func TestDispatchWireChildArgv_PositionalSeparator(t *testing.T) {
 }
 
 func TestDispatchWireChildArgv_CommandArgFlags(t *testing.T) {
+	beginArgvWire(t)
 	args := []string{
 		"record-argv", "0",
 		"git", "checkout", "--", "README 中文.md",
@@ -65,6 +69,7 @@ func TestDispatchWireChildArgv_CommandArgFlags(t *testing.T) {
 }
 
 func TestDispatchWireChildArgv_HistoricalLeadingSeparator(t *testing.T) {
+	beginArgvWire(t)
 	helper := testHelperPath(t)
 	injected := []string{"--", "record-argv", "0", "git", "checkout", "--", "README 中文.md"}
 	payload := model.DispatchCommand{
@@ -79,8 +84,9 @@ func TestDispatchWireChildArgv_HistoricalLeadingSeparator(t *testing.T) {
 		t.Fatal("fixture must still carry the historical leading separator")
 	}
 	got, err := runInjectedWire(t, payload)
-	assertExitCode(t, err, 0)
 	wantArgs := []string{"record-argv", "0", "git", "checkout", "--", "README 中文.md"}
+	finishEvidence(t, helper, wantArgs)
+	assertExitCode(t, err, 0)
 	assertChildArgs(t, helper, got, wantArgs)
 	if !containsExactSequence(got[1:], []string{"checkout", "--", "README 中文.md"}) {
 		t.Fatalf("child lost internal --: %#v", got)
@@ -88,6 +94,7 @@ func TestDispatchWireChildArgv_HistoricalLeadingSeparator(t *testing.T) {
 }
 
 func TestDispatchWireChildArgv_HistoricalEmbeddedCommand(t *testing.T) {
+	beginArgvWire(t)
 	helper := testHelperPath(t)
 	if strings.ContainsAny(helper, " \t") {
 		t.Fatalf("helper path %q contains whitespace; Fields() would split the command token", helper)
@@ -102,6 +109,7 @@ func TestDispatchWireChildArgv_HistoricalEmbeddedCommand(t *testing.T) {
 		Args:      wantArgs,
 	}
 	got, err := runInjectedWire(t, payload)
+	finishEvidence(t, helper, wantArgs)
 	assertExitCode(t, err, 0)
 	// The injected command string still contains the separator.
 	// The real child must see the helper path and must keep the later "--".
@@ -112,6 +120,7 @@ func TestDispatchWireChildArgv_HistoricalEmbeddedCommand(t *testing.T) {
 }
 
 func TestDispatchWireChildArgv_ExitCode(t *testing.T) {
+	beginArgvWire(t)
 	opaque := "ghp_FAKE_NOT_A_TOKEN"
 	rest := []string{"--qa-duration", "1", "--qa-exit", "7", "-p", "失败 码", "--qa-opaque", opaque}
 	args := append([]string{"record-argv", "7"}, rest...)
@@ -150,10 +159,10 @@ func runCLIDispatch(t *testing.T, jobID string, positional []string, extra []str
 	prev := dispatchInvoker
 	dispatchInvoker = func(ctx context.Context, cfg dispatch.Config) (*model.DispatchCommand, error) {
 		if !cfg.Force {
-			t.Errorf("dispatch command did not keep --force")
+			t.Fatalf("dispatch command did not keep --force")
 		}
 		if cfg.MQTTClient != nil {
-			t.Errorf("CLI constructed a real MQTT client before the in-memory hook")
+			t.Fatalf("CLI constructed a real MQTT client before the in-memory hook")
 		}
 		cfg.MQTTClient = wireMock
 		return dispatch.Dispatch(ctx, cfg)
@@ -190,7 +199,8 @@ func runCLIDispatch(t *testing.T, jobID string, positional []string, extra []str
 	if err := json.Unmarshal(published[0], &wire); err != nil {
 		t.Fatalf("wire json: %v", err)
 	}
-	got, runErr := runListenerOnPayload(t, profile, published[0], jobID)
+	got, runErr := runListenerOnPayload(t, profile, published[0], jobID, "cobra-dispatch-mock-listener-helper")
+	finishEvidence(t, wire.Command, wire.Args)
 	return wire, got, runErr
 }
 
@@ -206,18 +216,25 @@ func runInjectedWire(t *testing.T, payload model.DispatchCommand) ([]string, err
 		t.Fatalf("marshal injected wire: %v", err)
 	}
 	t.Log("wire=injected historical payload in memory; not a CLI parse and not an MQTT network publish")
-	return runListenerOnPayload(t, profile, raw, payload.JobID)
+	return runListenerOnPayload(t, profile, raw, payload.JobID, "injected-historical-payload")
 }
 
-func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID string) ([]string, error) {
+func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID, chain string) ([]string, error) {
 	t.Helper()
 	argvPath := filepath.Join(profile, "argv-"+jobID+".json")
 	_ = os.Remove(argvPath)
 	installArgvWireSeams(t)
 
-	mock := newArgvMock()
+	var stdout, stderr bytes.Buffer
+	obs := &argvObs{
+		chain:    chain,
+		payload:  append([]byte(nil), payload...),
+		profile:  profile,
+		argvPath: argvPath,
+	}
 	done := make(chan error, 1)
 	listening := make(chan struct{})
+	mock := newArgvMock()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
 		MachineID:          "qa-box",
 		StatusFile:         filepath.Join(profile, "status-"+jobID+".json"),
@@ -231,12 +248,23 @@ func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID st
 		BaseEnviron:        childBaseEnviron(profile, argvPath),
 		AuditPath:          filepath.Join(profile, "audit-"+jobID+".jsonl"),
 		RealHome:           profile,
-		Stdout:             bytes.NewBuffer(nil),
-		Stderr:             bytes.NewBuffer(nil),
+		Stdout:             &stdout,
+		Stderr:             &stderr,
 		OnListening: func(string) {
 			close(listening)
 		},
+		OnChildStart: func(pid int) {
+			obs.mu.Lock()
+			obs.pid = pid
+			obs.started = time.Now().UTC()
+			obs.mu.Unlock()
+		},
 		OnJobComplete: func(job model.Job, runErr error) {
+			obs.mu.Lock()
+			obs.waitSeen = true
+			obs.stdout = append([]byte(nil), stdout.Bytes()...)
+			obs.stderr = append([]byte(nil), stderr.Bytes()...)
+			obs.mu.Unlock()
 			if job.ID == jobID || jobID == "" {
 				done <- runErr
 			}
@@ -250,13 +278,21 @@ func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID st
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	runDone := make(chan struct{})
 	go func() {
 		_ = l.Run(ctx)
+		close(runDone)
 	}()
+	// Registered after the seam install, so this runs before seam restore and
+	// before t.TempDir removal. Run's return is after workerWg.Wait.
 	t.Cleanup(func() {
 		l.Stop()
 		cancel()
+		<-runDone
+		obs.mu.Lock()
+		obs.runJoined = true
+		obs.mu.Unlock()
+		writeLifecycleReceipt(t, obs)
 	})
 
 	select {
@@ -275,8 +311,249 @@ func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID st
 		t.Fatal("timed out waiting for the real helper process")
 	}
 	got := readArgvFile(t, argvPath)
+	obs.mu.Lock()
+	obs.child = append([]string(nil), got...)
+	obs.runErr = runErr
+	if jobCwd := payloadCwd(payload); jobCwd != "" {
+		obs.helperCwd = jobCwd
+	}
+	obs.mu.Unlock()
+	obsMu.Lock()
+	latestObs = obs
+	obsMu.Unlock()
 	t.Logf("wire=in-memory payload bytes; child=real helper process; udp and git seams are test-only; argv file %s", argvPath)
 	return got, runErr
+}
+
+// argvWireStop is the same-process stop contract for the five argv-wire tests.
+// -test.failfast does not stop on Skip and does not stop the current test at Errorf.
+// beginArgvWire holds argvWireMu until cleanup, so the next test cannot pass the
+// gate until this test has joined Listener.Run, restored seams, and dropped temp.
+var (
+	argvWireMu   sync.Mutex
+	argvWireStop string
+	obsMu        sync.Mutex
+	latestObs    *argvObs
+)
+
+type argvObs struct {
+	mu        sync.Mutex
+	chain     string
+	payload   []byte
+	profile   string
+	argvPath  string
+	helperCwd string
+	child     []string
+	pid       int
+	started   time.Time
+	waitSeen  bool
+	runJoined bool
+	runErr    error
+	stdout    []byte
+	stderr    []byte
+}
+
+func beginArgvWire(t *testing.T) {
+	t.Helper()
+	argvWireMu.Lock()
+	t.Cleanup(func() {
+		if (t.Failed() || t.Skipped()) && argvWireStop == "" {
+			argvWireStop = t.Name()
+		}
+		argvWireMu.Unlock()
+	})
+	if argvWireStop != "" {
+		t.Skip("argv-wire stop-contract: side effects not started after " + argvWireStop)
+	}
+	dir := os.Getenv("AGENTPULSE_ARGV_WIRE_EVIDENCE")
+	if !filepath.IsAbs(dir) {
+		t.Fatal("AGENTPULSE_ARGV_WIRE_EVIDENCE must be an absolute directory this test does not delete")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func argvWireAllows() (bool, string) {
+	argvWireMu.Lock()
+	defer argvWireMu.Unlock()
+	if argvWireStop != "" {
+		return false, argvWireStop
+	}
+	return true, ""
+}
+
+func noteArgvWireStop(reason string) {
+	argvWireMu.Lock()
+	if argvWireStop == "" {
+		argvWireStop = reason
+	}
+	argvWireMu.Unlock()
+}
+
+func TestArgvWireStopContractPure(t *testing.T) {
+	// Not one of the five authorized runs. Memory only: no listener, helper, UDP, or git.
+	argvWireMu.Lock()
+	prev := argvWireStop
+	argvWireStop = ""
+	argvWireMu.Unlock()
+	t.Cleanup(func() {
+		argvWireMu.Lock()
+		argvWireStop = prev
+		argvWireMu.Unlock()
+	})
+	if ok, why := argvWireAllows(); !ok {
+		t.Fatalf("gate closed before the pure check: %s", why)
+	}
+	noteArgvWireStop("pure-test-stop")
+	ok, why := argvWireAllows()
+	if ok || why != "pure-test-stop" {
+		t.Fatalf("gate after stop = %v %q", ok, why)
+	}
+}
+
+func finishEvidence(t *testing.T, wantCommand string, wantArgs []string) {
+	t.Helper()
+	obsMu.Lock()
+	obs := latestObs
+	obsMu.Unlock()
+	if obs == nil {
+		t.Fatal("missing argv observation")
+	}
+	obs.mu.Lock()
+	snap := argvSnap{
+		chain: obs.chain, payload: append([]byte(nil), obs.payload...),
+		helperCwd: obs.helperCwd, child: append([]string(nil), obs.child...),
+		pid: obs.pid, started: obs.started, waitSeen: obs.waitSeen,
+		runErr: obs.runErr, stdout: append([]byte(nil), obs.stdout...),
+		stderr: append([]byte(nil), obs.stderr...),
+	}
+	obs.mu.Unlock()
+	writeArgvEvidence(t, snap, wantCommand, wantArgs)
+}
+
+type argvSnap struct {
+	chain     string
+	payload   []byte
+	helperCwd string
+	child     []string
+	pid       int
+	started   time.Time
+	waitSeen  bool
+	runErr    error
+	stdout    []byte
+	stderr    []byte
+}
+
+func writeArgvEvidence(t *testing.T, obs argvSnap, wantCommand string, wantArgs []string) {
+	t.Helper()
+	dir := os.Getenv("AGENTPULSE_ARGV_WIRE_EVIDENCE")
+	sum := sha256.Sum256(obs.payload)
+	var wire model.DispatchCommand
+	_ = json.Unmarshal(obs.payload, &wire)
+	want := append([]string{wantCommand}, wantArgs...)
+	elements := make([]map[string]any, 0, len(want))
+	match := len(obs.child) == len(want)
+	n := len(want)
+	if len(obs.child) > n {
+		n = len(obs.child)
+	}
+	for i := 0; i < n; i++ {
+		var g, w string
+		var gm, wm bool
+		if i < len(obs.child) {
+			g, gm = obs.child[i], true
+		}
+		if i < len(want) {
+			w, wm = want[i], true
+		}
+		eq := gm && wm && (g == w || (i == 0 && samePath(g, w)))
+		if !eq {
+			match = false
+		}
+		elements = append(elements, map[string]any{
+			"index": i, "want": w, "got": g, "match": eq,
+		})
+	}
+	code := 0
+	if obs.runErr != nil {
+		var ee *exec.ExitError
+		if errors.As(obs.runErr, &ee) {
+			code = ee.ExitCode()
+		} else {
+			code = -1
+		}
+	}
+	body := map[string]any{
+		"test":                        t.Name(),
+		"chain":                       obs.chain,
+		"parent_env_persisted":        false,
+		"wire_payload_sha256":         fmt.Sprintf("%x", sum),
+		"wire_payload":                json.RawMessage(obs.payload),
+		"wire_command":                wire.Command,
+		"wire_args":                   wire.Args,
+		"helper_cwd":                  obs.helperCwd,
+		"profile_dir_deleted_by_test": true,
+		"actual_os_args":              obs.child,
+		"element_compare":             elements,
+		"element_match":               match,
+		"helper": map[string]any{
+			"pid":                               obs.pid,
+			"start_utc":                         obs.started.Format(time.RFC3339Nano),
+			"wait_returned_via_on_job_complete": obs.waitSeen,
+			"exit_code":                         code,
+			"stdout":                            string(obs.stdout),
+			"stderr":                            string(obs.stderr),
+		},
+	}
+	writeEvidenceJSON(t, dir, t.Name()+".json", body)
+}
+
+func writeLifecycleReceipt(t *testing.T, obs *argvObs) {
+	t.Helper()
+	dir := os.Getenv("AGENTPULSE_ARGV_WIRE_EVIDENCE")
+	if !filepath.IsAbs(dir) {
+		return
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	body := map[string]any{
+		"test":                            t.Name(),
+		"listener_run_joined":             obs.runJoined,
+		"helper_pid":                      obs.pid,
+		"helper_wait_observed":            obs.waitSeen,
+		"hard_timeout_kills_test_pe_only": true,
+		"helper_exit_claimed":             obs.runJoined && obs.waitSeen,
+		"boundary":                        "listener_run_joined is true only after Listener.Run returns, which is after workerWg.Wait. OnJobComplete runs after prepared.Wait. An outside kill of the test PE does not prove the helper exited. This test does not scan the machine, change ACLs, create an OS Job, or kill arbitrary processes.",
+	}
+	writeEvidenceJSON(t, dir, t.Name()+".lifecycle.json", body)
+}
+
+func writeEvidenceJSON(t *testing.T, dir, name string, body any) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(body, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, '\n')
+	if bytes.Contains(bytes.ToLower(raw), []byte("password=")) {
+		t.Fatal("refusing to persist an evidence file that contains a password assignment")
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func payloadCwd(raw []byte) string {
+	var cmd model.DispatchCommand
+	if err := json.Unmarshal(raw, &cmd); err != nil {
+		return ""
+	}
+	return cmd.Cwd
 }
 
 func testHelperPath(t *testing.T) string {

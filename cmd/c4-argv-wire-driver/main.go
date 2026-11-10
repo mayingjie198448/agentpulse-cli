@@ -44,6 +44,9 @@ func main() {
 			"These tests replace only the UDP IP probe and the git lookup. Production defaults still dial and still run git.",
 			"Child environment is an explicit synthetic list, not the parent credential environment.",
 			"Config reads use the synthetic --config / AgentConfigFile, not the user profile.",
+			"Set AGENTPULSE_ARGV_WIRE_EVIDENCE to an absolute directory outside the test TempDir. The test writes payload, os.Args, element compare, and helper pid/wait/rc/stdout/stderr there and does not delete it.",
+			"-test.failfast is not the stop contract. The five tests share an in-process gate: after a failure or skip, the next test returns before seams, listener, or helper. Run with -test.parallel=1.",
+			"Cleanup joins Listener.Run before restoring UDP/git seams or deleting TempDir. Killing the test PE from outside does not prove the helper exited.",
 		},
 	}
 	enc := json.NewEncoder(os.Stdout)

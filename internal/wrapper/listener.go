@@ -42,6 +42,9 @@ type ListenerConfig struct {
 	OnListening                func(topic string)
 	OnJobStart                 func(job model.Job)
 	OnJobComplete              func(job model.Job, err error)
+	// OnChildStart, when set, receives the child pid after Start returns.
+	// Nil does not change production launch or dispatch-pid tracking.
+	OnChildStart func(pid int)
 	// UseAgentConfigFile selects AgentConfigFile for executeJob.
 	// Production leaves it false and still calls LoadConfig("") (the default path).
 	UseAgentConfigFile bool
@@ -750,6 +753,9 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 			l.pidsMu.Lock()
 			l.dispatchPIDs[pid] = true
 			l.pidsMu.Unlock()
+			if l.cfg.OnChildStart != nil {
+				l.cfg.OnChildStart(pid)
+			}
 		},
 	})
 	if err != nil {
