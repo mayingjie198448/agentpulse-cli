@@ -20,12 +20,18 @@ func configureConfinedLaunch(p *Prepared) error {
 	if st.Mode()&0111 == 0 {
 		return fmt.Errorf("%w: /usr/bin/sandbox-exec is not executable", ErrBackendUnavailable)
 	}
-	profile, err := DarwinSeatbeltProfile(p.rec.Root)
+	selfExe := p.Cmd.Path
+	allowedReads := []string{selfExe}
+	if p.rec.Sentinel != "" {
+		if err := validateDarwinReadableLiteral(p.rec.Sentinel, p.rec.Root); err == nil {
+			allowedReads = append(allowedReads, p.rec.Sentinel)
+		}
+	}
+	profile, err := DarwinSeatbeltProfile(p.rec.Root, allowedReads...)
 	if err != nil {
 		return fmt.Errorf("%w: seatbelt profile generation: %v", ErrRefused, err)
 	}
 
-	selfExe := p.Cmd.Path
 	isolateArgs := p.Cmd.Args[1:]
 	argv, err := buildDarwinSandboxExecArgv(sandboxExecPath, profile, selfExe, isolateArgs)
 	if err != nil {

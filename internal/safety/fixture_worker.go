@@ -77,9 +77,10 @@ func FixtureWorker(args []string) int {
 	if len(escapes) > 0 {
 		var msg strings.Builder
 		for _, escape := range escapes {
+			_, readErr := os.ReadFile(escape)
 			writeErr := os.WriteFile(escape, []byte("hacked"), 0600)
 			removeErr := os.Remove(escape)
-			fmt.Fprintf(&msg, "path=%s\nwrite=%s\nremove=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr))
+			fmt.Fprintf(&msg, "path=%s\nwrite=%s\nremove=%s\nread=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr), errnoClass(readErr))
 		}
 		if err := os.WriteFile("escape.txt", []byte(msg.String()), 0600); err != nil {
 			return 53

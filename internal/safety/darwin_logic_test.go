@@ -22,14 +22,19 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 		"(allow process-exec)",
 		"(allow process-fork)",
 		"(allow signal (target self))",
-		"(allow file-read*)",
-		"(allow file-ioctl (literal \"/dev/null\"))",
-		"(allow file-write* (literal \"/dev/null\"))",
 		"(deny file-write*)",
 		"(allow file-write* (subpath \"/private/tmp/agentpulse-runs/test-run-root\"))",
+		"(allow file-read* (subpath \"/private/tmp/agentpulse-runs/test-run-root\"))",
+		"(allow file-read* (subpath \"/System/Library\"))",
+		"(allow file-read* (subpath \"/usr/lib\"))",
+		"(allow file-read* (subpath \"/usr/share\"))",
+		"(allow file-read* (subpath \"/private/var/db/dyld\"))",
+		"(allow file-ioctl (literal \"/dev/null\"))",
+		"(allow file-write* (literal \"/dev/null\"))",
 		"(deny mach-lookup (global-name \"com.apple.SecurityServer\"))",
 		"(deny mach-lookup (global-name \"com.apple.securityd\"))",
 		"(deny mach-lookup (global-name \"com.apple.ocspd\"))",
+		"(deny file-read* (subpath \"/Users\"))",
 	}
 	for _, req := range requiredSubstrings {
 		if !strings.Contains(prof, req) {
@@ -43,6 +48,10 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 		"(allow network*)",
 		"(allow mach-lookup (global-name \"com.apple.securityd\"))",
 		"(allow file-write* (subpath \"/Users",
+		"(allow file-read*)",
+		"(allow file-read* (subpath \"/System\")",
+		"(allow file-read* (subpath \"/usr\")",
+		"(allow file-read* (subpath \"/private/var\")",
 	} {
 		if strings.Contains(prof, forbidden) {
 			t.Errorf("seatbelt profile illegally contains broad permission %q", forbidden)
@@ -61,6 +70,33 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 	} {
 		if _, err := DarwinSeatbeltProfile(bad); err == nil {
 			t.Errorf("expected error for dangerous path %q, got nil", bad)
+		}
+	}
+
+	// Allowed readable literal: safe external synthetic sentinel
+	safeProbe := "/private/tmp/agentpulse-sentinels/sentinel-12345678"
+	profWithProbe, err := DarwinSeatbeltProfile(root, safeProbe)
+	if err != nil {
+		t.Fatalf("unexpected error adding safe probe literal: %v", err)
+	}
+	wantLit := "(allow file-read* (literal \"/private/tmp/agentpulse-sentinels/sentinel-12345678\"))"
+	if !strings.Contains(profWithProbe, wantLit) {
+		t.Errorf("seatbelt profile missing safe read literal %q", wantLit)
+	}
+
+	// Refuse whitelisting protected user/credential paths
+	for _, forbiddenLit := range []string{
+		"/Users/alice/.ssh/id_ed25519",
+		"/Users/alice/.config/agentpulse/config.yaml",
+		"/Users/alice/Library/Keychains/login.keychain-db",
+		"/System/Volumes/Data/Users/alice/.ssh/id_rsa",
+		"/private/var/root/.ssh/id_rsa",
+		"/private/tmp/bad\"literal",
+		"",
+		"relative/path",
+	} {
+		if _, err := DarwinSeatbeltProfile(root, forbiddenLit); err == nil {
+			t.Errorf("expected error whitelisting forbidden read literal %q, got nil", forbiddenLit)
 		}
 	}
 }
@@ -326,6 +362,34 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		badEscape := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=nil\n"
 		if err := verifyDarwinFixtureLinkEscape(badEscape, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
 			t.Fatal("expected error when link write was not denied")
+		}
+
+		// Negative: other paths denied with eperm but link write permitted (R3 mixed counterexample)
+		mixedEscape := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/.config/agentpulse/config.yaml\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/Library/Keychains/login.keychain-db\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/Library/CloudStorage/OneDrive-Personal/doc.txt\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/OneDrive/file.txt\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/Desktop/file.txt\nwrite=eperm\nremove=eperm\n" +
+			"path=/Users/testuser/Documents/file.txt\nwrite=eperm\nremove=eperm\n" +
+			"path=" + plan.EscapeThroughLink + "\nwrite=nil\nremove=nil\n"
+		if err := verifyDarwinFixtureLinkEscape(mixedEscape, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error on mixed escape where link write was allowed despite other eperm denials")
+		}
+
+		// Negative: link record missing entirely
+		missingLink := "path=/Users/testuser/.ssh/id_ed25519\nwrite=eperm\nremove=eperm\n"
+		if err := verifyDarwinFixtureLinkEscape(missingLink, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when link escape record is missing")
+		}
+
+		// Negative: zero identity before or after
+		zeroIdent := DarwinTargetIdentity{Dev: 0, Ino: 0}
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, zeroIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when before identity is zero")
+		}
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, zeroIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when after identity is zero")
 		}
 
 		// Negative: target destroyed

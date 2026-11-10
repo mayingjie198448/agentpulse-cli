@@ -277,10 +277,95 @@ func planDarwinFixtureLink(base string, runRoot string) (DarwinFixtureLinkPlan, 
 	}, nil
 }
 
+// DarwinEscapeRecord holds the outcomes of a worker probe for a specific path.
+type DarwinEscapeRecord struct {
+	Path   string
+	Write  string
+	Remove string
+	Read   string
+}
+
+// parseDarwinEscapeRecords parses escape.txt into per-path records.
+func parseDarwinEscapeRecords(text string) (map[string]DarwinEscapeRecord, error) {
+	lines := strings.Split(text, "\n")
+	records := make(map[string]DarwinEscapeRecord)
+	var curr DarwinEscapeRecord
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "path=") {
+			if curr.Path != "" {
+				if err := validateDarwinEscapeRecord(curr); err != nil {
+					return nil, err
+				}
+				if existing, exists := records[curr.Path]; exists {
+					if existing != curr {
+						return nil, fmt.Errorf("contradictory duplicate record for %q", curr.Path)
+					}
+				} else {
+					records[curr.Path] = curr
+				}
+			}
+			curr = DarwinEscapeRecord{Path: strings.TrimPrefix(line, "path=")}
+		} else if strings.HasPrefix(line, "write=") {
+			curr.Write = strings.TrimPrefix(line, "write=")
+		} else if strings.HasPrefix(line, "remove=") {
+			curr.Remove = strings.TrimPrefix(line, "remove=")
+		} else if strings.HasPrefix(line, "read=") {
+			curr.Read = strings.TrimPrefix(line, "read=")
+		}
+	}
+	if curr.Path != "" {
+		if err := validateDarwinEscapeRecord(curr); err != nil {
+			return nil, err
+		}
+		if existing, exists := records[curr.Path]; exists {
+			if existing != curr {
+				return nil, fmt.Errorf("contradictory duplicate record for %q", curr.Path)
+			}
+		} else {
+			records[curr.Path] = curr
+		}
+	}
+	return records, nil
+}
+
+func validateDarwinEscapeRecord(r DarwinEscapeRecord) error {
+	if r.Path == "" {
+		return fmt.Errorf("record missing path")
+	}
+	isValidErrno := func(v string) bool {
+		return v == "eperm" || v == "enoent" || v == "nil" || v == "other"
+	}
+	if !isValidErrno(r.Write) {
+		return fmt.Errorf("record for %q has invalid write outcome %q", r.Path, r.Write)
+	}
+	if !isValidErrno(r.Remove) {
+		return fmt.Errorf("record for %q has invalid remove outcome %q", r.Path, r.Remove)
+	}
+	if r.Read != "" && !isValidErrno(r.Read) {
+		return fmt.Errorf("record for %q has invalid read outcome %q", r.Path, r.Read)
+	}
+	return nil
+}
+
 // verifyDarwinFixtureLinkEscape evaluates the escape output and cleanup outcomes.
 func verifyDarwinFixtureLinkEscape(escapeOutput string, plan DarwinFixtureLinkPlan, beforeIdent, afterIdent DarwinTargetIdentity, targetContent []byte, rootExists, linkExists, targetExists bool) error {
-	if !strings.Contains(escapeOutput, "path="+plan.EscapeThroughLink) || !strings.Contains(escapeOutput, "write=eperm") {
-		return fmt.Errorf("escape through directory link was not denied with eperm")
+	records, err := parseDarwinEscapeRecords(escapeOutput)
+	if err != nil {
+		return fmt.Errorf("failed to parse escape output: %w", err)
+	}
+	linkRec, ok := records[plan.EscapeThroughLink]
+	if !ok {
+		return fmt.Errorf("link escape path %q missing from escape records", plan.EscapeThroughLink)
+	}
+	if linkRec.Write != "eperm" {
+		return fmt.Errorf("escape through directory link was not denied with eperm (write=%s)", linkRec.Write)
+	}
+	if linkRec.Read != "" && linkRec.Read != "eperm" {
+		return fmt.Errorf("escape through directory link read was not denied with eperm (read=%s)", linkRec.Read)
 	}
 	if !targetExists {
 		return fmt.Errorf("outside target was destroyed")
@@ -288,7 +373,13 @@ func verifyDarwinFixtureLinkEscape(escapeOutput string, plan DarwinFixtureLinkPl
 	if string(targetContent) != "outside-target-v1\n" {
 		return fmt.Errorf("outside target content was altered")
 	}
-	if beforeIdent.Dev != 0 && (afterIdent.Dev != beforeIdent.Dev || afterIdent.Ino != beforeIdent.Ino) {
+	if beforeIdent.Dev == 0 || beforeIdent.Ino == 0 {
+		return fmt.Errorf("outside target baseline identity was zero or unrecorded")
+	}
+	if afterIdent.Dev == 0 || afterIdent.Ino == 0 {
+		return fmt.Errorf("outside target after-run identity was zero or unrecorded")
+	}
+	if afterIdent.Dev != beforeIdent.Dev || afterIdent.Ino != beforeIdent.Ino {
 		return fmt.Errorf("outside target identity changed (dev/ino mismatch)")
 	}
 	if rootExists {
