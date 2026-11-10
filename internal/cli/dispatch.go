@@ -215,7 +215,7 @@ func newDispatchCmd() *cobra.Command {
 				ErrOut:             errOut,
 			}
 
-			_, err := dispatch.Dispatch(ctx, cfg)
+			_, err := dispatchInvoker(ctx, cfg)
 			return err
 		},
 	}
@@ -244,3 +244,9 @@ func newDispatchCmd() *cobra.Command {
 
 	return dispatchCmd
 }
+
+// dispatchInvoker is the publish path used by the dispatch command.
+// The default is dispatch.Dispatch. Tests in this package may replace it
+// with a function that still calls dispatch.Dispatch after attaching an
+// in-memory client. Production builds keep the default.
+var dispatchInvoker = dispatch.Dispatch
