@@ -74,6 +74,14 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		}
 	}
 	sentinel := filepath.Join(fake, ".ssh", "id_ed25519")
+	if runtime.GOOS == "darwin" {
+		rawSentinel := filepath.Join(base, "synthetic-sentinel.txt")
+		canon, _, _, err := createDarwinExclusiveSentinel(rawSentinel, []byte("sentinel-v1\n"))
+		if err != nil {
+			return b.String(), fmt.Errorf("failed to create exclusive darwin sentinel: %w", err)
+		}
+		sentinel = canon
+	}
 	audit := filepath.Join(base, "audit.jsonl")
 	exe, err := os.Executable()
 	if err != nil {
@@ -101,6 +109,39 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		noteManifest(&b, req.RegistryDir, nil)
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
 		return b.String(), err
+	}
+	var darwinLinkPlan DarwinFixtureLinkPlan
+	var darwinTargetDirIdent DarwinTargetIdentity
+	var darwinTargetPayloadIdent DarwinTargetIdentity
+	darwinTargetPayloadContent := []byte("outside-target-v1\n")
+	if runtime.GOOS == "darwin" {
+		plan, err := planDarwinFixtureLink(base, prepared.Root)
+		if err != nil {
+			return b.String(), fmt.Errorf("fixture link plan failed: %w", err)
+		}
+		darwinLinkPlan = plan
+		if err := os.MkdirAll(darwinLinkPlan.ExternalTargetDir, 0700); err != nil {
+			return b.String(), fmt.Errorf("failed to create fixture external target: %w", err)
+		}
+		if err := os.WriteFile(darwinLinkPlan.ExternalPayload, darwinTargetPayloadContent, 0600); err != nil {
+			return b.String(), fmt.Errorf("failed to write fixture external payload: %w", err)
+		}
+		dirIdent, err := getDarwinFileIdentity(darwinLinkPlan.ExternalTargetDir)
+		if err != nil || dirIdent.Dev == 0 || dirIdent.Ino == 0 {
+			return b.String(), fmt.Errorf("failed to get external target dir baseline identity: %w", err)
+		}
+		darwinTargetDirIdent = dirIdent
+
+		payloadIdent, err := getDarwinFileIdentity(darwinLinkPlan.ExternalPayload)
+		if err != nil || payloadIdent.Dev == 0 || payloadIdent.Ino == 0 {
+			return b.String(), fmt.Errorf("failed to get external payload baseline identity: %w", err)
+		}
+		darwinTargetPayloadIdent = payloadIdent
+
+		if err := os.Symlink(darwinLinkPlan.ExternalTargetDir, darwinLinkPlan.LinkInWork); err != nil {
+			return b.String(), fmt.Errorf("failed to create synthetic in-root symlink: %w", err)
+		}
+		prepared.Cmd.Args = append(prepared.Cmd.Args, "--escape", darwinLinkPlan.EscapeThroughLink)
 	}
 	noteManifest(&b, req.RegistryDir, prepared.rec)
 	fmt.Fprintf(&b, "profile_hash=%s\n", prepared.audit.ProfileHash)
@@ -142,6 +183,35 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 			return b.String(), fmt.Errorf("protected file changed: %s", rel)
 		}
 	}
+	if runtime.GOOS == "darwin" {
+		payloadAfterRun, err := os.ReadFile(darwinLinkPlan.ExternalPayload)
+		if err != nil || string(payloadAfterRun) != string(darwinTargetPayloadContent) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_modified_during_run\n")
+			return b.String(), fmt.Errorf("outside target modified during run")
+		}
+		if err := verifyDarwinFixtureLinkEscape(string(escape), darwinLinkPlan, darwinTargetPayloadIdent, darwinTargetPayloadIdent, darwinTargetPayloadContent, false, false, true); err != nil {
+			fmt.Fprintf(&b, "result=FAIL\nreason=directory_link_escape_not_denied\nescape=%s\n", escape)
+			return b.String(), fmt.Errorf("directory link escape was not denied: %w", err)
+		}
+		records, err := parseDarwinEscapeRecords(string(escape))
+		if err != nil {
+			fmt.Fprintf(&b, "result=FAIL\nreason=corrupt_escape_records\n")
+			return b.String(), fmt.Errorf("corrupt escape records: %w", err)
+		}
+		for _, rel := range rels {
+			fullPath := filepath.Join(fake, rel)
+			rec, ok := records[fullPath]
+			if !ok {
+				fmt.Fprintf(&b, "result=FAIL\nreason=missing_record_for_%s\n", rel)
+				return b.String(), fmt.Errorf("missing escape record for protected asset %s", rel)
+			}
+			if rec.Write != "eperm" || rec.Read != "eperm" {
+				fmt.Fprintf(&b, "result=FAIL\nreason=protected_asset_not_denied_%s\n", rel)
+				return b.String(), fmt.Errorf("protected asset %s was not denied (write=%s read=%s)", rel, rec.Write, rec.Read)
+			}
+		}
+		fmt.Fprintf(&b, "dir_link_escape_denied=true\n")
+	}
 	cout, cerr := CleanupRun(prepared.RunID, CleanupOptions{RegistryDir: req.RegistryDir, AuditPath: audit, RealHome: fake})
 	auditBody, _ := os.ReadFile(audit)
 	if strings.Contains(string(auditBody), "s3cr3t-mqtt-password") || !strings.Contains(string(auditBody), "[REDACTED]") {
@@ -159,6 +229,41 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	if _, err := os.Stat(audit); err != nil {
 		fmt.Fprintf(&b, "result=FAIL\naudit_removed=true\n")
 		return b.String(), fmt.Errorf("audit was inside the cleaned root")
+	}
+	if runtime.GOOS == "darwin" {
+		if _, err := os.Lstat(prepared.Root); !os.IsNotExist(err) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=run_root_not_cleaned\n")
+			return b.String(), fmt.Errorf("run root was not removed by cleanup")
+		}
+		if _, err := os.Lstat(darwinLinkPlan.LinkInWork); !os.IsNotExist(err) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=symlink_not_cleaned\n")
+			return b.String(), fmt.Errorf("symlink was not removed by cleanup")
+		}
+		afterDirIdent, err := getDarwinFileIdentity(darwinLinkPlan.ExternalTargetDir)
+		if err != nil || afterDirIdent.Dev == 0 || afterDirIdent.Ino == 0 {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_dir_stat_failed\n")
+			return b.String(), fmt.Errorf("outside target dir stat failed after cleanup: %v", err)
+		}
+		if afterDirIdent.Dev != darwinTargetDirIdent.Dev || afterDirIdent.Ino != darwinTargetDirIdent.Ino {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_dir_identity_changed\n")
+			return b.String(), fmt.Errorf("outside target dir identity changed")
+		}
+		afterPayloadIdent, err := getDarwinFileIdentity(darwinLinkPlan.ExternalPayload)
+		if err != nil || afterPayloadIdent.Dev == 0 || afterPayloadIdent.Ino == 0 {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_payload_stat_failed\n")
+			return b.String(), fmt.Errorf("outside target payload stat failed after cleanup: %v", err)
+		}
+		if afterPayloadIdent.Dev != darwinTargetPayloadIdent.Dev || afterPayloadIdent.Ino != darwinTargetPayloadIdent.Ino {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_identity_changed\n")
+			return b.String(), fmt.Errorf("outside target identity changed")
+		}
+		payloadAfterClean, err := os.ReadFile(darwinLinkPlan.ExternalPayload)
+		if err != nil || string(payloadAfterClean) != string(darwinTargetPayloadContent) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_modified_after_cleanup\n")
+			return b.String(), fmt.Errorf("outside target modified after cleanup")
+		}
+		fmt.Fprintf(&b, "outside_target_retained=true\n")
+		fmt.Fprintf(&b, "outside_target_identity_retained=true\n")
 	}
 	fmt.Fprintf(&b, "result=PASS\n")
 	fmt.Fprintf(&b, "native_windows_catalog=%s\n", NativeVerification()["windows_appcontainer_native_fixture"])

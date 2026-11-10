@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -76,16 +77,48 @@ func FixtureWorker(args []string) int {
 	}
 	if len(escapes) > 0 {
 		var msg strings.Builder
+		seam := defaultWorkerEscapeProberSeam()
 		for _, escape := range escapes {
-			writeErr := os.WriteFile(escape, []byte("hacked"), 0600)
-			removeErr := os.Remove(escape)
-			fmt.Fprintf(&msg, "path=%s\nwrite=%s\nremove=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr))
+			msg.WriteString(probeAndFormatWorkerEscape(escape, seam))
 		}
 		if err := os.WriteFile("escape.txt", []byte(msg.String()), 0600); err != nil {
 			return 53
 		}
 	}
 	return exitCode
+}
+
+// workerEscapeProberSeam abstracts file operations for the fixture worker escape probe.
+type workerEscapeProberSeam struct {
+	GOOS      string
+	WriteFile func(name string, data []byte, perm os.FileMode) error
+	Remove    func(name string) error
+	ReadFile  func(name string) ([]byte, error)
+}
+
+func defaultWorkerEscapeProberSeam() workerEscapeProberSeam {
+	return workerEscapeProberSeam{
+		GOOS:      runtime.GOOS,
+		WriteFile: os.WriteFile,
+		Remove:    os.Remove,
+		ReadFile:  os.ReadFile,
+	}
+}
+
+// probeAndFormatWorkerEscape probes a single escape path and formats its outcome record.
+// Added read probes are Darwin-specific; on Windows and other platforms, original
+// behavior without ReadFile and without read= field is preserved exactly.
+func probeAndFormatWorkerEscape(escape string, seam workerEscapeProberSeam) string {
+	writeErr := seam.WriteFile(escape, []byte("hacked"), 0600)
+	removeErr := seam.Remove(escape)
+	if seam.GOOS == "darwin" {
+		var readErr error
+		if seam.ReadFile != nil {
+			_, readErr = seam.ReadFile(escape)
+		}
+		return fmt.Sprintf("path=%s\nwrite=%s\nremove=%s\nread=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr), errnoClass(readErr))
+	}
+	return fmt.Sprintf("path=%s\nwrite=%s\nremove=%s\n", escape, errnoClass(writeErr), errnoClass(removeErr))
 }
 
 func errnoClass(err error) string {
