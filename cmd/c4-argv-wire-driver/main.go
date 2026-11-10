@@ -41,6 +41,9 @@ func main() {
 			"Do not re-run the offline21 names.",
 			"Redirect USERPROFILE, HOME, APPDATA, LOCALAPPDATA, TEMP, and TMP to this run's directory before the PE starts.",
 			"In-memory mock publish is not an MQTT broker test. The helper process is the real child.",
+			"These tests replace only the UDP IP probe and the git lookup. Production defaults still dial and still run git.",
+			"Child environment is an explicit synthetic list, not the parent credential environment.",
+			"Config reads use the synthetic --config / AgentConfigFile, not the user profile.",
 		},
 	}
 	enc := json.NewEncoder(os.Stdout)

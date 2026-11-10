@@ -69,11 +69,14 @@ type Config struct {
 	// ExplicitDanger opts this launch into skip-permissions mode.
 	// The daemon default is false. Opt-in still runs only inside verified
 	// OS write isolation; a failure does not retry without that isolation.
-	ExplicitDanger    bool
-	AuditPath         string
-	RealHome          string
-	SentinelPath      string
-	IsolationBackend  safety.Backend
+	ExplicitDanger   bool
+	AuditPath        string
+	RealHome         string
+	SentinelPath     string
+	IsolationBackend safety.Backend
+	// BaseEnviron, when non-nil, replaces os.Environ() before credential filtering.
+	// Nil keeps the production default: inherit the parent environment.
+	BaseEnviron       []string
 	KeepMachineOnline bool
 	StartedAt         time.Time
 	OnMQTTConnected   func()
@@ -464,7 +467,11 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 	}, w.cfg.MirrorStderr)
 
 	// Every real child, including MQTT listener jobs and wrap, starts here.
-	cmdEnv := config.FilterChildProcessEnv(os.Environ())
+	parentEnv := os.Environ()
+	if w.cfg.BaseEnviron != nil {
+		parentEnv = w.cfg.BaseEnviron
+	}
+	cmdEnv := config.FilterChildProcessEnv(parentEnv)
 	if len(w.cfg.Env) > 0 {
 		for k, v := range w.cfg.Env {
 			cmdEnv = append(cmdEnv, fmt.Sprintf("%s=%s", k, v))
@@ -1044,8 +1051,12 @@ func DetectLocalIP() string {
 	return "127.0.0.1"
 }
 
+// localIPDetector is DetectLocalIP unless a test replaces it.
+// Production calls still reach the UDP probe.
+var localIPDetector = DetectLocalIP
+
 func detectLocalIP() string {
-	return DetectLocalIP()
+	return localIPDetector()
 }
 
 // BuildCommandArgs normalizes command and arguments into an argument list for execution.

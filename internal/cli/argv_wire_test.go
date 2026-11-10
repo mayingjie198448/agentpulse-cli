@@ -145,6 +145,7 @@ func runCommandArgDispatch(t *testing.T, jobID string, rest []string) (model.Dis
 func runCLIDispatch(t *testing.T, jobID string, positional []string, extra []string) (model.DispatchCommand, []string, error) {
 	t.Helper()
 	profile := syntheticProfile(t)
+	installArgvWireSeams(t)
 	wireMock := newArgvMock()
 	prev := dispatchInvoker
 	dispatchInvoker = func(ctx context.Context, cfg dispatch.Config) (*model.DispatchCommand, error) {
@@ -171,6 +172,7 @@ func runCLIDispatch(t *testing.T, jobID string, positional []string, extra []str
 		"--engine", "agy",
 		"--job-id", jobID,
 		"--cwd", profile,
+		"--config", syntheticConfigPath(profile),
 		"--mqtt-url", "tcp://203.0.113.9:1883",
 	}
 	argv = append(argv, extra...)
@@ -195,6 +197,7 @@ func runCLIDispatch(t *testing.T, jobID string, positional []string, extra []str
 func runInjectedWire(t *testing.T, payload model.DispatchCommand) ([]string, error) {
 	t.Helper()
 	profile := syntheticProfile(t)
+	installArgvWireSeams(t)
 	if payload.Cwd == "" {
 		payload.Cwd = profile
 	}
@@ -209,24 +212,27 @@ func runInjectedWire(t *testing.T, payload model.DispatchCommand) ([]string, err
 func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID string) ([]string, error) {
 	t.Helper()
 	argvPath := filepath.Join(profile, "argv-"+jobID+".json")
-	t.Setenv("AGENTPULSE_TEST_ARGV_OUT", argvPath)
 	_ = os.Remove(argvPath)
+	installArgvWireSeams(t)
 
 	mock := newArgvMock()
 	done := make(chan error, 1)
 	listening := make(chan struct{})
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:         "qa-box",
-		StatusFile:        filepath.Join(profile, "status-"+jobID+".json"),
-		MQTTClient:        mock,
-		Stub:              false,
-		Quiet:             true,
-		DisableBareAttach: true,
-		MaxConcurrentJobs: 1,
-		AuditPath:         filepath.Join(profile, "audit-"+jobID+".jsonl"),
-		RealHome:          profile,
-		Stdout:            bytes.NewBuffer(nil),
-		Stderr:            bytes.NewBuffer(nil),
+		MachineID:          "qa-box",
+		StatusFile:         filepath.Join(profile, "status-"+jobID+".json"),
+		MQTTClient:         mock,
+		Stub:               false,
+		Quiet:              true,
+		DisableBareAttach:  true,
+		MaxConcurrentJobs:  1,
+		UseAgentConfigFile: true,
+		AgentConfigFile:    syntheticConfigPath(profile),
+		BaseEnviron:        childBaseEnviron(profile, argvPath),
+		AuditPath:          filepath.Join(profile, "audit-"+jobID+".jsonl"),
+		RealHome:           profile,
+		Stdout:             bytes.NewBuffer(nil),
+		Stderr:             bytes.NewBuffer(nil),
 		OnListening: func(string) {
 			close(listening)
 		},
@@ -269,7 +275,7 @@ func runListenerOnPayload(t *testing.T, profile string, payload []byte, jobID st
 		t.Fatal("timed out waiting for the real helper process")
 	}
 	got := readArgvFile(t, argvPath)
-	t.Logf("wire=in-memory payload bytes; child=real process argv file %s", argvPath)
+	t.Logf("wire=in-memory payload bytes; child=real helper process; udp and git seams are test-only; argv file %s", argvPath)
 	return got, runErr
 }
 
@@ -303,6 +309,12 @@ func syntheticProfile(t *testing.T) string {
 	if err := os.MkdirAll(local, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// No broker password and no agent paths. CLI --config and the listener
+	// both read this file instead of a user profile.
+	body := []byte("version: 1\nmachine_id: qa-box\nbroker:\n  url: tcp://203.0.113.9:1883\n")
+	if err := os.WriteFile(syntheticConfigPath(dir), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HOME", dir)
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("APPDATA", roaming)
@@ -310,6 +322,44 @@ func syntheticProfile(t *testing.T) string {
 	t.Setenv("TMP", dir)
 	t.Setenv("TEMP", dir)
 	return dir
+}
+
+func syntheticConfigPath(profile string) string {
+	return filepath.Join(profile, "config.yaml")
+}
+
+func installArgvWireSeams(t *testing.T) {
+	t.Helper()
+	restoreIP := wrapper.SetLocalIPDetectorForTest(func() string { return "203.0.113.10" })
+	restoreGit := wrapper.SetRepoGitLookupForTest(func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("argv-wire test does not run git")
+	})
+	t.Cleanup(restoreIP)
+	t.Cleanup(restoreGit)
+}
+
+func childBaseEnviron(profile, argvPath string) []string {
+	roaming := filepath.Join(profile, "AppData", "Roaming")
+	local := filepath.Join(profile, "AppData", "Local")
+	env := []string{
+		"AGENTPULSE_TEST_ARGV_OUT=" + argvPath,
+		"HOME=" + profile,
+		"USERPROFILE=" + profile,
+		"APPDATA=" + roaming,
+		"LOCALAPPDATA=" + local,
+		"TEMP=" + profile,
+		"TMP=" + profile,
+	}
+	// Windows needs the system directory to start a process. It is not a credential.
+	if runtime.GOOS == "windows" {
+		if v := os.Getenv("SYSTEMROOT"); v != "" {
+			env = append(env, "SYSTEMROOT="+v)
+		}
+		if v := os.Getenv("WINDIR"); v != "" {
+			env = append(env, "WINDIR="+v)
+		}
+	}
+	return env
 }
 
 func readArgvFile(t *testing.T, path string) []string {

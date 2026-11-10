@@ -42,6 +42,13 @@ type ListenerConfig struct {
 	OnListening                func(topic string)
 	OnJobStart                 func(job model.Job)
 	OnJobComplete              func(job model.Job, err error)
+	// UseAgentConfigFile selects AgentConfigFile for executeJob.
+	// Production leaves it false and still calls LoadConfig("") (the default path).
+	UseAgentConfigFile bool
+	AgentConfigFile    string
+	// BaseEnviron, when non-nil, is passed to each child instead of os.Environ().
+	// Nil keeps production inheritance. The filter still removes broker secrets.
+	BaseEnviron []string
 
 	// Bare agent process attach options
 	DisableBareAttach      bool
@@ -172,7 +179,7 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		Online:        true,
 		LastHeartbeat: now,
 		Platform:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		IP:            DetectLocalIP(),
+		IP:            detectLocalIP(),
 		JobCount:      0,
 	}
 
@@ -659,7 +666,11 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	args := BuildCommandArgs(cmd.Command, cmd.Args)
 	if len(args) > 0 {
-		fileCfg, _ := config.LoadConfig("")
+		cfgPath := ""
+		if l.cfg.UseAgentConfigFile {
+			cfgPath = l.cfg.AgentConfigFile
+		}
+		fileCfg, _ := config.LoadConfig(cfgPath)
 		resolved := config.ResolveAgentBinary(fileCfg, args[0])
 		if resolved != "" {
 			args[0] = resolved
@@ -715,6 +726,7 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		Args:              args,
 		Cwd:               cmd.Cwd,
 		Env:               cmd.Env,
+		BaseEnviron:       l.cfg.BaseEnviron,
 		StatusFile:        l.cfg.StatusFile,
 		HeartbeatInterval: l.cfg.HeartbeatInterval,
 		MQTTClient:        l.mqttClient,

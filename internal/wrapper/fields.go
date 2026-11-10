@@ -169,6 +169,16 @@ func ExtractPrompt(args []string) string {
 	return ""
 }
 
+// repoGitLookup runs git for InferRepoAndProject.
+// The default starts the git binary. Tests may replace it; production does not.
+var repoGitLookup = defaultRepoGitLookup
+
+func defaultRepoGitLookup(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	return cmd.Output()
+}
+
 // InferRepoAndProject inspects the given working directory or git remote to infer
 // the repository slug (e.g. "owner/repo" or "repo") and project name.
 func InferRepoAndProject(cwd string) (repo, project string) {
@@ -188,10 +198,8 @@ func InferRepoAndProject(cwd string) (repo, project string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// 1. Check if git repository
-	cmdGitRoot := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
-	cmdGitRoot.Dir = cleanCwd
-	outGitRoot, errGitRoot := cmdGitRoot.Output()
+	// 1. Check if git repository. Production runs git; tests may replace repoGitLookup.
+	outGitRoot, errGitRoot := repoGitLookup(ctx, cleanCwd, "rev-parse", "--show-toplevel")
 	if errGitRoot == nil {
 		gitRoot := strings.TrimSpace(string(outGitRoot))
 		if gitRoot != "" {
@@ -199,9 +207,7 @@ func InferRepoAndProject(cwd string) (repo, project string) {
 			repo = project
 
 			// Try to extract remote origin url
-			cmdRemote := exec.CommandContext(ctx, "git", "config", "--get", "remote.origin.url")
-			cmdRemote.Dir = cleanCwd
-			outRemote, errRemote := cmdRemote.Output()
+			outRemote, errRemote := repoGitLookup(ctx, cleanCwd, "config", "--get", "remote.origin.url")
 			if errRemote == nil {
 				remoteURL := strings.TrimSpace(string(outRemote))
 				slug := extractGitRepoSlug(remoteURL)
