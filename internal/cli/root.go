@@ -184,6 +184,7 @@ func runDualRoleDaemon(cmd *cobra.Command, args []string) error {
 		MQTT:                       pMQTT,
 		DangerouslySkipPermissions: defaultDangerouslySkipPermissions,
 		Quiet:                      !isPlain,
+		Agents:                     agentsToProbe,
 		Stdout:                     io.Discard,
 		Stderr:                     io.Discard,
 		OnMQTTConnected: func() {

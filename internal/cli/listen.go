@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet bool) error {
+func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet, noAttach bool) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.OutOrStderr()
 
@@ -92,6 +92,12 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 
 	pMQTT := &mqttCfg
 
+	fileCfg, _, _ := loadActiveConfig(cmd)
+	var agents []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agents = fileCfg.Agents
+	}
+
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
 		MachineID:                  machineID,
 		MachineName:                machineName,
@@ -101,6 +107,8 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 		Stub:                       stub,
 		DangerouslySkipPermissions: dangerouslySkipPermissions,
 		Quiet:                      quiet,
+		DisableBareAttach:          noAttach,
+		Agents:                     agents,
 		Stdout:                     out,
 		Stderr:                     errOut,
 		OnMQTTConnected: func() {
@@ -160,6 +168,7 @@ func newListenCmd() *cobra.Command {
 		stub                       bool
 		dangerouslySkipPermissions bool
 		quiet                      bool
+		noAttach                   bool
 	)
 
 	listenCmd := &cobra.Command{
@@ -186,7 +195,7 @@ Examples:
 			if machineID == "" {
 				machineID = machineIDFlag
 			}
-			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet)
+			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, noAttach)
 		},
 	}
 
@@ -198,6 +207,7 @@ Examples:
 	listenCmd.Flags().BoolVar(&stub, "stub", false, "Run executed jobs in simulated stub mode")
 	listenCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when running agy commands")
 	listenCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse listener header/footer banners")
+	listenCmd.Flags().BoolVar(&noAttach, "no-attach", false, "Disable automatic attachment of local bare agent CLI processes")
 
 	return listenCmd
 }
