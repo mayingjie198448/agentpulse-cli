@@ -410,6 +410,19 @@ func TestArgvWireStopContractPure(t *testing.T) {
 	if ok || why != "pure-test-stop" {
 		t.Fatalf("gate after stop = %v %q", ok, why)
 	}
+	// The blocked subtest must Skip inside beginArgvWire, before evidence
+	// directory creation or any listener/helper work.
+	t.Run("blocked", func(t *testing.T) {
+		beginArgvWire(t)
+		t.Fatal("side effect would have started")
+	})
+	if !t.Failed() {
+		// t.Run Skip does not fail the parent. Confirm the gate stayed closed.
+		ok, why = argvWireAllows()
+		if ok || why != "pure-test-stop" {
+			t.Fatalf("gate changed by the blocked subtest: %v %q", ok, why)
+		}
+	}
 }
 
 func finishEvidence(t *testing.T, wantCommand string, wantArgs []string) {
