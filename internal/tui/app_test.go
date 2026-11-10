@@ -909,7 +909,23 @@ func TestTUIModel_ExplicitRefresh(t *testing.T) {
 	}
 }
 
+const (
+	refreshFailureText = "刷新失败: MQTT subscription timeout"
+	// At the fixture width, lipgloss wraps the footer. This help phrase stays
+	// on the same row as the full failure text; later phrases wrap below it.
+	refreshFailureFooterHelp = "选择任务"
+)
+
 func TestTUIModel_RefreshFailure(t *testing.T) {
+	for _, key := range []rune{'r', 'R'} {
+		t.Run(string(key), func(t *testing.T) {
+			assertRefreshFailureKey(t, key)
+		})
+	}
+}
+
+func assertRefreshFailureKey(t *testing.T, key rune) {
+	t.Helper()
 	st := &fakeStore{
 		machines: []model.Machine{
 			{ID: "node-orig", Name: "node-orig", Online: true},
@@ -928,47 +944,66 @@ func TestTUIModel_RefreshFailure(t *testing.T) {
 	var tm tea.Model = m
 	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	// Trigger manual refresh via 'r' key
 	var cmd tea.Cmd
-	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
 	if cmd == nil {
-		t.Fatalf("expected 'r' key to produce a tea.Cmd for refresh")
+		t.Fatalf("expected %q to produce a tea.Cmd for refresh", string(key))
 	}
-
-	// Execute cmd (fails with refreshErr)
 	msg := cmd()
 	if msg == nil {
 		t.Fatalf("expected refresh cmd to return a message")
 	}
-
-	// Deliver refreshDoneMsg
 	tm, _ = tm.Update(msg)
 
 	mAfter := tm.(*tui.Model)
-
-	// 1. Existing view data must be kept
 	if len(mAfter.MachinesForTest()) != 1 || mAfter.MachinesForTest()[0].ID != "node-orig" {
 		t.Fatalf("expected original machines to be preserved, got %+v", mAfter.MachinesForTest())
 	}
 	if len(mAfter.JobsForTest()) != 1 || mAfter.JobsForTest()[0].ID != "job-orig" {
 		t.Fatalf("expected original jobs to be preserved, got %+v", mAfter.JobsForTest())
 	}
-
-	// 2. Visible Chinese error hint in status/help area
-	if !strings.Contains(mAfter.RefreshErrorForTest(), "刷新失败") {
-		t.Fatalf("expected RefreshErrorForTest to contain '刷新失败', got %q", mAfter.RefreshErrorForTest())
+	if mAfter.RefreshErrorForTest() != refreshFailureText {
+		t.Fatalf("RefreshErrorForTest() = %q, want %q", mAfter.RefreshErrorForTest(), refreshFailureText)
 	}
-	view := mAfter.View()
-	if !strings.Contains(view, "刷新失败") {
-		t.Fatalf("expected view to contain '刷新失败', got:\n%s", view)
-	}
+	refreshFailureFooterLine(t, stripViewANSI(mAfter.View()))
 
-	// 3. Next key clears the error hint
 	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	mCleared := tm.(*tui.Model)
 	if mCleared.RefreshErrorForTest() != "" {
-		t.Fatalf("expected error hint to be cleared on next key, got %q", mCleared.RefreshErrorForTest())
+		t.Fatalf("expected error field to be cleared on next key, got %q", mCleared.RefreshErrorForTest())
 	}
+	cleared := stripViewANSI(tm.View())
+	if strings.Contains(cleared, "刷新失败") {
+		t.Fatalf("refresh failure hint still visible after j, got %q", refreshFailureHits(cleared))
+	}
+}
+
+// refreshFailureFooterLine returns the single ANSI-stripped row that shows the
+// refresh failure. The full cause and a footer help phrase must share that row.
+func refreshFailureFooterLine(t *testing.T, plain string) string {
+	t.Helper()
+	hits := refreshFailureHits(plain)
+	if len(hits) != 1 {
+		t.Fatalf("expected exactly one view line containing 刷新失败, got %d: %#v", len(hits), hits)
+	}
+	line := hits[0]
+	if !strings.Contains(line, refreshFailureText) {
+		t.Fatalf("failure line must contain %q, got %q", refreshFailureText, line)
+	}
+	if !strings.Contains(line, refreshFailureFooterHelp) {
+		t.Fatalf("failure line must be the footer help row containing %q, got %q", refreshFailureFooterHelp, line)
+	}
+	return line
+}
+
+func refreshFailureHits(plain string) []string {
+	var hits []string
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, "刷新失败") {
+			hits = append(hits, line)
+		}
+	}
+	return hits
 }
 
 func TestTUIModel_GroupingAndSelectionPreservation(t *testing.T) {
