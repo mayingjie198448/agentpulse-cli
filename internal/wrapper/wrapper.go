@@ -733,7 +733,7 @@ func (w *Wrapper) publishLog(level model.LogLevel, message string) {
 		MachineID: machID,
 		Engine:    engine,
 		Level:     level,
-		Message:   TruncateLogMessage(message),
+		Message:   TruncateLogMessage(RedactSecrets(message)),
 		Seq:       seq,
 	}
 

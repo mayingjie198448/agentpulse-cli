@@ -54,6 +54,24 @@ func main() {
 		fmt.Println("Using file-based token storage because SSH session detected")
 		fmt.Println("Task completed")
 		os.Exit(0)
+	case "stream":
+		// stream <0|7> writes fixed stdout, stderr, and progress lines, then
+		// exits with that code. It does not read HOME or start a child.
+		code := 0
+		if len(os.Args) > 2 {
+			n, err := strconv.Atoi(os.Args[2])
+			if err != nil || (n != 0 && n != 7) {
+				fmt.Fprintf(os.Stderr, "stream exit must be 0 or 7\n")
+				os.Exit(2)
+			}
+			code = n
+		}
+		fmt.Println("helper-stdout-1")
+		fmt.Println("progress: 25%")
+		fmt.Println("progress: 80%")
+		fmt.Println("password=synthetic-secret")
+		fmt.Fprintln(os.Stderr, "helper-stderr-1")
+		os.Exit(code)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(2)
