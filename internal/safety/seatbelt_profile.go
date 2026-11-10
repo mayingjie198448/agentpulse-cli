@@ -75,9 +75,11 @@ func DarwinSeatbeltProfile(root string, allowedReadLiterals ...string) (string, 
 ; makes mallocinit throw "failed to get system page size" before the helper
 ; can write the confirm pipe, so the parent observes EOF.
 (allow sysctl-read)
-; Anonymous confirm pipe and captured stderr are PIPE vnodes, not files.
+; pipe(2) objects are S_IFIFO. SBPL's bound vnode type is FIFO.
+; PIPE is an unbound variable: sandbox-exec rejects the profile before exec
+; (observed: "unbound variable: PIPE" at this line, exit 65, confirm EOF).
 ; file-write-data does not allow creating or writing regular files.
-(allow file-read-data file-write-data file-ioctl (vnode-type PIPE))
+(allow file-read-data file-write-data file-ioctl (vnode-type FIFO))
 ; dyld and libSystem need to be mapped. These are the same trees already
 ; granted file-read*; this is not a new filesystem root.
 (allow file-map-executable (subpath "/usr/lib"))

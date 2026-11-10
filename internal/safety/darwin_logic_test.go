@@ -37,7 +37,7 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 		"(allow file-ioctl (literal \"/dev/null\"))",
 		"(allow file-write* (literal \"/dev/null\"))",
 		"(allow sysctl-read)",
-		"(allow file-read-data file-write-data file-ioctl (vnode-type PIPE))",
+		"(allow file-read-data file-write-data file-ioctl (vnode-type FIFO))",
 		"(allow file-map-executable (subpath \"/usr/lib\"))",
 		"(allow file-map-executable (subpath \"/System/Library\"))",
 		"(deny mach-lookup (global-name \"com.apple.SecurityServer\"))",

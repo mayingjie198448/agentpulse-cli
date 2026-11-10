@@ -47,7 +47,7 @@ func TestDarwinHelperStartupChannelContract(t *testing.T) {
 		prof := startupProfile(t)
 		required := []string{
 			"(allow sysctl-read)",
-			"(allow file-read-data file-write-data file-ioctl (vnode-type PIPE))",
+			"(allow file-read-data file-write-data file-ioctl (vnode-type FIFO))",
 			"(allow file-map-executable (subpath \"/usr/lib\"))",
 			"(allow file-map-executable (subpath \"/System/Library\"))",
 			"(allow file-map-executable (subpath \"/usr/bin\"))",
@@ -60,6 +60,9 @@ func TestDarwinHelperStartupChannelContract(t *testing.T) {
 			if !strings.Contains(prof, line) {
 				t.Errorf("startup profile missing %s", line)
 			}
+		}
+		if strings.Contains(prof, "(vnode-type PIPE)") {
+			t.Error("profile uses unbound vnode-type PIPE; sandbox-exec rejects the profile before the helper starts")
 		}
 		if strings.Contains(prof, "(allow sysctl-write)") {
 			t.Error("profile allows sysctl-write")
