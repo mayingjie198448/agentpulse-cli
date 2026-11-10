@@ -204,9 +204,9 @@ func TestScanLocalAgents_Hermetic(t *testing.T) {
 	}
 }
 
-// TestScanLocalAgents_WindowsSyntheticExe covers the supported .exe suffix.
-// A sibling .bat is not treated as a discovered engine. This test is not in
-// the 21-item driver. File mode does not prove a Windows DACL.
+// TestScanLocalAgents_WindowsSyntheticExe checks Windows suffix priority.
+// .bat alone is discovered. .exe wins when it is added beside .bat and .cmd.
+// Nothing in the fixture is executed. File mode does not prove a Windows DACL.
 func TestScanLocalAgents_WindowsSyntheticExe(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("windows synthetic suffix coverage runs on windows only")
@@ -221,38 +221,43 @@ func TestScanLocalAgents_WindowsSyntheticExe(t *testing.T) {
 	t.Setenv("APPDATA", filepath.Join(fakeHome, "AppData", "Roaming"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(fakeHome, "AppData", "Local"))
 
-	batPath := filepath.Join(fakeBinDir, "agy.bat")
-	if err := os.WriteFile(batPath, []byte("agentpulse synthetic non-exe fixture\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	batOnly := config.ScanLocalAgents(config.ScanOptions{
-		OverridePATH: fakeBinDir,
-		HomeDir:      fakeHome,
-	})
-	for _, b := range batOnly.DiscoveredBuiltin {
-		if b.ID == "agy" {
-			t.Fatalf("agy.bat alone must not count as a discovered engine, got %s", b.Path)
+	writeFix := func(name, body string) string {
+		path := filepath.Join(fakeBinDir, name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
 		}
+		return path
+	}
+	batPath := writeFix("agy.bat", "agentpulse synthetic bat fixture\n")
+	opts := config.ScanOptions{OverridePATH: fakeBinDir, HomeDir: fakeHome}
+	foundPath := discoveredBuiltinPath(t, config.ScanLocalAgents(opts), "agy")
+	if foundPath != batPath {
+		t.Fatalf("agy.bat path = %s, want %s", foundPath, batPath)
 	}
 
-	exePath := filepath.Join(fakeBinDir, "agy.exe")
-	if err := os.WriteFile(exePath, []byte("agentpulse synthetic exe fixture\n"), 0o644); err != nil {
-		t.Fatal(err)
+	cmdPath := writeFix("agy.cmd", "agentpulse synthetic cmd fixture\n")
+	foundPath = discoveredBuiltinPath(t, config.ScanLocalAgents(opts), "agy")
+	if foundPath != batPath {
+		t.Fatalf("bat must stay ahead of cmd, got %s want %s (cmd %s)", foundPath, batPath, cmdPath)
 	}
-	withExe := config.ScanLocalAgents(config.ScanOptions{
-		OverridePATH: fakeBinDir,
-		HomeDir:      fakeHome,
-	})
-	var found bool
-	for _, b := range withExe.DiscoveredBuiltin {
-		if b.ID == "agy" {
-			found = true
-			if b.Path != exePath {
-				t.Fatalf("agy path = %s, want %s", b.Path, exePath)
-			}
+
+	exePath := writeFix("agy.exe", "agentpulse synthetic exe fixture\n")
+	foundPath = discoveredBuiltinPath(t, config.ScanLocalAgents(opts), "agy")
+	if foundPath != exePath {
+		t.Fatalf("agy.exe path = %s, want %s", foundPath, exePath)
+	}
+}
+
+func discoveredBuiltinPath(t *testing.T, res config.ScanResult, id string) string {
+	t.Helper()
+	var paths []string
+	for _, b := range res.DiscoveredBuiltin {
+		if b.ID == id {
+			paths = append(paths, b.Path)
 		}
 	}
-	if !found {
-		t.Fatal("expected agy.exe to be discovered")
+	if len(paths) != 1 {
+		t.Fatalf("%s discovered %d times: %v", id, len(paths), paths)
 	}
+	return paths[0]
 }

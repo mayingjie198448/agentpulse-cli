@@ -351,6 +351,15 @@ func expandHome(path string, home string) string {
 	return path
 }
 
+// WizardDefaultExecutablePath keeps a configured path. An empty configured
+// path takes the scanned path. The scan does not overwrite a saved path.
+func WizardDefaultExecutablePath(existingPath, discoveredPath string) string {
+	if strings.TrimSpace(existingPath) != "" {
+		return existingPath
+	}
+	return discoveredPath
+}
+
 func findExecutableForEngine(def BuiltinEngineDef, searchDirs []string, pathEnv string) string {
 	for _, binName := range def.BinaryNames {
 		p := findExecutable(binName, searchDirs, pathEnv)
@@ -362,17 +371,10 @@ func findExecutableForEngine(def BuiltinEngineDef, searchDirs []string, pathEnv 
 }
 
 func findExecutable(binName string, searchDirs []string, pathEnv string) string {
-	// Look up in search directories
+	names := ExecutableSearchNames(binName, runtime.GOOS == "windows")
 	for _, dir := range searchDirs {
-		candidate := filepath.Join(dir, binName)
-		if isExecutableFile(candidate) {
-			return candidate
-		}
-		if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(binName), ".exe") {
-			candidateExe := filepath.Join(dir, binName+".exe")
-			if isExecutableFile(candidateExe) {
-				return candidateExe
-			}
+		if found := FirstExistingNamed(dir, names); found != "" {
+			return found
 		}
 	}
 
@@ -383,6 +385,32 @@ func findExecutable(binName string, searchDirs []string, pathEnv string) string 
 		}
 	}
 
+	return ""
+}
+
+// ExecutableSearchNames is the directory-search order for one binary name.
+// On Windows the suffix order follows PATHEXT for the extensions this
+// scanner already accepts: .exe, then .bat, then .cmd. A name that already
+// has one of those suffixes is used as-is. Other platforms search the name only.
+func ExecutableSearchNames(binName string, windows bool) []string {
+	if !windows {
+		return []string{binName}
+	}
+	switch strings.ToLower(filepath.Ext(binName)) {
+	case ".exe", ".bat", ".cmd":
+		return []string{binName}
+	default:
+		return []string{binName, binName + ".exe", binName + ".bat", binName + ".cmd"}
+	}
+}
+
+func FirstExistingNamed(dir string, names []string) string {
+	for _, name := range names {
+		candidate := filepath.Join(dir, name)
+		if isExecutableFile(candidate) {
+			return candidate
+		}
+	}
 	return ""
 }
 

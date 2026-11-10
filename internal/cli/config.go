@@ -518,10 +518,11 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 		var aliases []string
 		if enabled {
 			defaultPath := ""
-			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && ex.Path != "" {
+			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok {
 				defaultPath = ex.Path
-			} else if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok && disc.Path != "" {
-				defaultPath = disc.Path
+			}
+			if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok {
+				defaultPath = config.WizardDefaultExecutablePath(defaultPath, disc.Path)
 			}
 			path = promptLine(reader, out, "  可执行文件路径 (留空自动搜索 PATH)", defaultPath)
 
