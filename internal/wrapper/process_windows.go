@@ -22,32 +22,33 @@ const stillActive = 259
 // windows.WAIT_TIMEOUT is an errno, not this wait status.
 const waitTimeoutStatus = 0x102
 
-// DefaultProcessLister lists processes with Toolhelp32.
-// Each returned row is limited to what QUERY_LIMITED_INFORMATION can read.
-// Cwd is left empty. Processes whose start time cannot be read are omitted
-// so a later PID reuse cannot inherit their identity.
+// DefaultProcessLister has no allowlist, so it does not snapshot or open
+// any process. Discovery of specific PIDs goes through listDefaultAllowlisted.
 func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return listWindowsSnapshot(nil)
+	return nil, nil
 }
 
 func listDefaultAllowlisted(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	allow := make(map[uint32]bool, len(pids))
+	allow := make(map[int]bool, len(pids))
 	for _, pid := range pids {
 		if pid > 0 {
-			allow[uint32(pid)] = true
+			allow[pid] = true
 		}
+	}
+	if len(allow) == 0 {
+		return nil, nil
 	}
 	return listWindowsSnapshot(allow)
 }
 
-func defaultExitChecker() func(int) (int, bool) {
-	return observeWindowsExit
+func defaultBoundExitChecker() func(pid int, started time.Time) (int, bool) {
+	return observeWindowsExitFor
 }
 
 // ResolveProcessCwd has no PROCESS_QUERY_LIMITED_INFORMATION result on Windows.
@@ -72,7 +73,7 @@ func ObservedStartTime(pid int) (time.Time, bool) {
 	if pid <= 0 {
 		return time.Time{}, false
 	}
-	h, err := openQuery(uint32(pid))
+	h, err := openProcessQuery(uint32(pid))
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -86,7 +87,7 @@ func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	h, err := openQuery(uint32(pid))
+	h, err := openProcessQuery(uint32(pid))
 	if err != nil {
 		return false
 	}
@@ -99,7 +100,7 @@ func observeWindowsExit(pid int) (int, bool) {
 	if pid <= 0 {
 		return 0, false
 	}
-	h, err := openQuery(uint32(pid))
+	h, err := openProcessQuery(uint32(pid))
 	if err != nil {
 		return 0, false
 	}
@@ -109,7 +110,36 @@ func observeWindowsExit(pid int) (int, bool) {
 	return obs.Code, obs.Known
 }
 
-func listWindowsSnapshot(allow map[uint32]bool) ([]ProcessInfo, error) {
+// observeWindowsExitFor reads the creation time and the exit code on one
+// query handle. A code is returned only when that start time is the attached
+// process. Open failure, an unreadable start, or a different start returns
+// unknown and does not report the new process's code.
+func observeWindowsExitFor(pid int, started time.Time) (int, bool) {
+	attached := ProcessIdentity{PID: pid, Start: started}
+	if pid <= 0 || started.IsZero() {
+		obs := BoundExit(attached, ProcessIdentity{PID: pid}, false, false, ExitObservation{})
+		return obs.Code, obs.Known
+	}
+	h, err := openProcessQuery(uint32(pid))
+	if err != nil {
+		obs := BoundExit(attached, ProcessIdentity{PID: pid}, false, false, ExitObservation{})
+		return obs.Code, obs.Known
+	}
+	defer windows.CloseHandle(h)
+	created, startOK := creationTime(h)
+	observed := ProcessIdentity{PID: pid}
+	if startOK {
+		observed.Start = created
+	}
+	alive, code, exitOK := waitExit(h)
+	obs := BoundExit(attached, observed, true, alive, ExitObservation{Code: code, Known: exitOK && !alive})
+	return obs.Code, obs.Known
+}
+
+func listWindowsSnapshot(allow map[int]bool) ([]ProcessInfo, error) {
+	if len(allow) == 0 {
+		return nil, nil
+	}
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -129,7 +159,7 @@ func listWindowsSnapshot(allow map[uint32]bool) ([]ProcessInfo, error) {
 	var out []ProcessInfo
 	for {
 		pid := entry.ProcessID
-		if pid > 0 && (allow == nil || allow[pid]) {
+		if AllowOpen(allow, int(pid)) {
 			if info, ok := inspectWindowsProcess(pid, entry.ParentProcessID, windows.UTF16ToString(entry.ExeFile[:])); ok {
 				out = append(out, info)
 			}
@@ -146,7 +176,7 @@ func listWindowsSnapshot(allow map[uint32]bool) ([]ProcessInfo, error) {
 }
 
 func inspectWindowsProcess(pid, ppid uint32, exeName string) (ProcessInfo, bool) {
-	h, err := openQuery(pid)
+	h, err := openProcessQuery(pid)
 	if err != nil {
 		return ProcessInfo{}, false
 	}
@@ -175,6 +205,10 @@ func inspectWindowsProcess(pid, ppid uint32, exeName string) (ProcessInfo, bool)
 func openQuery(pid uint32) (windows.Handle, error) {
 	return windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|processSynchronize, false, pid)
 }
+
+// openProcessQuery is the production OpenProcess call.
+// A Windows test may replace it to prove which PIDs would be opened.
+var openProcessQuery = openQuery
 
 func creationTime(h windows.Handle) (time.Time, bool) {
 	var created, exited, kernel, user windows.Filetime

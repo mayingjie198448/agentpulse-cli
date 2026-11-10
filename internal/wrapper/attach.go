@@ -544,13 +544,16 @@ func waitOwnedLog(ctx context.Context, pid int, logDir string, nameOK func(strin
 
 // AttachManagerConfig configures the bare process attach manager.
 type AttachManagerConfig struct {
-	MachineID              string
-	MQTTClient             paho.Client
-	Agents                 []config.AgentConfig
-	ScanInterval           time.Duration
-	ProcessLister          ProcessLister
-	IsProcessAlive         func(pid int) bool
-	ProcessExitChecker     func(pid int) (exitCode int, ok bool)
+	MachineID          string
+	MQTTClient         paho.Client
+	Agents             []config.AgentConfig
+	ScanInterval       time.Duration
+	ProcessLister      ProcessLister
+	IsProcessAlive     func(pid int) bool
+	ProcessExitChecker func(pid int) (exitCode int, ok bool)
+	// BoundExitChecker reads identity and exit on one query.
+	// It is the Windows default. An injected ProcessExitChecker stays authoritative.
+	BoundExitChecker       func(pid int, started time.Time) (exitCode int, known bool)
 	ReliableSuccessChecker func(pid int) bool
 	PIDAllowlist           []int
 	PIDFilter              func(pid int) bool
@@ -607,8 +610,8 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 	if cfg.IsProcessAlive == nil {
 		cfg.IsProcessAlive = IsProcessAlive
 	}
-	if cfg.ProcessExitChecker == nil {
-		cfg.ProcessExitChecker = defaultExitChecker()
+	if cfg.ProcessExitChecker == nil && cfg.BoundExitChecker == nil {
+		cfg.BoundExitChecker = defaultBoundExitChecker()
 	}
 	if cfg.Agents == nil {
 		cfg.Agents = config.DefaultAgents()
@@ -919,13 +922,14 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 	for {
 		select {
 		case <-ctx.Done():
-			m.finalizeJob(aj, true, false)
+			m.finalizeJob(aj, true)
 			return
 		case <-ticker.C:
 			if !m.cfg.IsProcessAlive(aj.pid) {
-				// Allow brief window for log tailer to flush trailing output
+				// Allow brief window for log tailer to flush trailing output.
+				// The exit code is read after this wait, on one later query.
 				time.Sleep(100 * time.Millisecond)
-				m.finalizeJob(aj, false, processReused(aj.pid, aj.startTime))
+				m.finalizeJob(aj, false)
 				return
 			}
 			// Periodic refresh of job update timestamp
@@ -937,7 +941,7 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 	}
 }
 
-func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted, reused bool) {
+func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted bool) {
 	aj.mu.Lock()
 	finishTime := time.Now().UTC()
 	aj.job.UpdatedAt = finishTime
@@ -945,14 +949,20 @@ func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted, reused bool) {
 
 	m.mu.Lock()
 	exitChecker := m.cfg.ProcessExitChecker
+	bound := m.cfg.BoundExitChecker
 	successChecker := m.cfg.ReliableSuccessChecker
 	m.mu.Unlock()
 
 	var exitCode int
 	var exitCodeKnown bool
-	// A reused PID belongs to a different process. Its exit code is not this job's.
-	if !interrupted && !reused && exitChecker != nil {
-		exitCode, exitCodeKnown = exitChecker(aj.pid)
+	if !interrupted && exitChecker != nil {
+		// Injected checker. Proven reuse skips it. An unproven observation
+		// does not invent a Windows exit code here; the checker is the seam.
+		if !processReused(aj.pid, aj.startTime) {
+			exitCode, exitCodeKnown = exitChecker(aj.pid)
+		}
+	} else if !interrupted && bound != nil {
+		exitCode, exitCodeKnown = bound(aj.pid, aj.startTime)
 	}
 
 	hasReliableSuccess := false

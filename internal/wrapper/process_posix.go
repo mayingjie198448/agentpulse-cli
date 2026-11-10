@@ -26,7 +26,7 @@ func listDefaultAllowlisted(ctx context.Context, pids []int) ([]ProcessInfo, err
 	return listWithPS(ctx, pids)
 }
 
-func defaultExitChecker() func(int) (int, bool) {
+func defaultBoundExitChecker() func(pid int, started time.Time) (int, bool) {
 	return nil
 }
 

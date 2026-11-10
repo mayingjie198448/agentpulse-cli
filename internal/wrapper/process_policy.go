@@ -38,6 +38,29 @@ func ObserveExit(reused, alive bool, probed ExitObservation) ExitObservation {
 	return probed
 }
 
+// AllowOpen reports whether pid may be opened.
+// A nil or empty allowlist opens nothing. PIDs outside the map are refused.
+func AllowOpen(allow map[int]bool, pid int) bool {
+	if pid <= 0 || len(allow) == 0 {
+		return false
+	}
+	return allow[pid]
+}
+
+// BoundExit reports a code only when one query proved the attached identity
+// and the process has exited. A failed open, an unreadable start time, or a
+// different start time drops the code. Unknown is not treated as a match.
+func BoundExit(attached, observed ProcessIdentity, opened, alive bool, probed ExitObservation) ExitObservation {
+	if !opened {
+		return ExitObservation{}
+	}
+	same, known := SameProcess(attached, observed)
+	if !known || !same {
+		return ExitObservation{}
+	}
+	return ObserveExit(false, alive, probed)
+}
+
 // AcceptCWD returns path only when the platform read it.
 // An unread or empty result stays empty; it is not replaced with a guess.
 func AcceptCWD(path string, read bool) string {
@@ -48,7 +71,8 @@ func AcceptCWD(path string, read bool) string {
 }
 
 // processReused reports that pid is now a different process than started.
-// A missing observation does not count as reuse.
+// False does not prove it is the same process. The Windows attach path
+// does not use this result to accept an exit code.
 func processReused(pid int, started time.Time) bool {
 	observed, ok := ObservedStartTime(pid)
 	if !ok {
