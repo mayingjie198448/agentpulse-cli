@@ -36,4 +36,13 @@ func TestDarwinNativeFixture(t *testing.T) {
 	if !strings.Contains(report, "catalog_darwin_mach_securityd_keychain=BLOCKED") {
 		t.Fatalf("keychain catalog flipped unexpectedly:\n%s", report)
 	}
+	if !strings.Contains(report, "dir_link_escape_denied=true") {
+		t.Fatalf("report missing directory link escape denial:\n%s", report)
+	}
+	if !strings.Contains(report, "outside_target_retained=true") {
+		t.Fatalf("report missing outside target retention:\n%s", report)
+	}
+	if !strings.Contains(report, "outside_target_identity_retained=true") {
+		t.Fatalf("report missing outside target identity retention:\n%s", report)
+	}
 }

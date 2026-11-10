@@ -35,26 +35,11 @@ func createRunRoot(opts createOpts) (RunRecord, error) {
 	if base == "" {
 		base = "/private/tmp/agentpulse-runs"
 	}
-	if canon, err := filepath.EvalSymlinks(base); err == nil && canon != "" {
-		base = canon
-	}
-	if err := os.MkdirAll(base, 0700); err != nil {
-		return RunRecord{}, err
-	}
-	baseFD, err := openDirNoFollow(base)
+	baseFD, _, err := createSafeDarwinDir(base, protectedHomes(opts.RealHome))
 	if err != nil {
-		return RunRecord{}, fmt.Errorf("%w: run base: %v", ErrRefused, err)
+		return RunRecord{}, err
 	}
 	defer unix.Close(baseFD)
-	basePath, err := fdPath(baseFD)
-	if err != nil {
-		return RunRecord{}, err
-	}
-	for _, home := range protectedHomes(opts.RealHome) {
-		if withinPath(home, basePath) {
-			return RunRecord{}, fmt.Errorf("%w: run base is inside a protected home", ErrRefused)
-		}
-	}
 
 	runID, err := randomHex(16)
 	if err != nil {
@@ -147,21 +132,11 @@ func createRunRoot(opts createOpts) (RunRecord, error) {
 	if regDir == "" {
 		regDir = "/private/tmp/agentpulse-run-registry"
 	}
-	if canon, err := filepath.EvalSymlinks(regDir); err == nil && canon != "" {
-		regDir = canon
-	}
-	if err := os.MkdirAll(regDir, 0700); err != nil {
+	regFD, regPath, err := createSafeDarwinDir(regDir, protectedHomes(opts.RealHome))
+	if err != nil {
 		return RunRecord{}, err
 	}
-	regFD, err := openDirNoFollow(regDir)
-	if err != nil {
-		return RunRecord{}, fmt.Errorf("%w: registry: %v", ErrRefused, err)
-	}
-	regPath, err := fdPath(regFD)
 	unix.Close(regFD)
-	if err != nil {
-		return RunRecord{}, err
-	}
 	if withinPath(rootPath, regPath) || regPath == rootPath {
 		return RunRecord{}, fmt.Errorf("%w: registry must stay outside the run root", ErrRefused)
 	}
@@ -182,13 +157,7 @@ func createSyntheticSentinel(base string) (string, error) {
 			dir = filepath.Join(parent, "agentpulse-sentinels")
 		}
 	}
-	if canon, err := filepath.EvalSymlinks(dir); err == nil && canon != "" {
-		dir = canon
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	dirFD, err := openDirNoFollow(dir)
+	dirFD, kpath, err := createSafeDarwinDir(dir, protectedHomes(""))
 	if err != nil {
 		return "", err
 	}
@@ -207,11 +176,81 @@ func createSyntheticSentinel(base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	kpath, err := fdPath(dirFD)
-	if err != nil {
-		return "", err
-	}
 	return kpath + "/" + name, nil
+}
+
+func createSafeDarwinDir(target string, homes []string) (int, string, error) {
+	statFn := func(path string) (bool, bool, error) {
+		fd, err := openDirNoFollow(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return false, false, nil
+			}
+			return false, false, err
+		}
+		defer unix.Close(fd)
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return false, true, err
+		}
+		kpath, err := fdPath(fd)
+		if err != nil {
+			return false, true, err
+		}
+		for _, home := range homes {
+			if strings.TrimSpace(home) != "" && withinPath(home, kpath) {
+				return false, true, fmt.Errorf("%w: ancestor %q is inside protected home %q", ErrRefused, kpath, home)
+			}
+		}
+		return st.Mode&unix.S_IFMT == unix.S_IFDIR, true, nil
+	}
+
+	plan, err := planDarwinSafeDir(target, homes, statFn)
+	if err != nil {
+		return -1, "", err
+	}
+
+	currFD, err := openDirNoFollow(plan.ExistingAncestor)
+	if err != nil {
+		return -1, "", fmt.Errorf("%w: failed to open existing ancestor %s: %v", ErrRefused, plan.ExistingAncestor, err)
+	}
+	ancPath, err := fdPath(currFD)
+	if err != nil {
+		unix.Close(currFD)
+		return -1, "", err
+	}
+	for _, home := range homes {
+		if strings.TrimSpace(home) != "" && withinPath(home, ancPath) {
+			unix.Close(currFD)
+			return -1, "", fmt.Errorf("%w: ancestor descriptor in protected home", ErrRefused)
+		}
+	}
+
+	for _, seg := range plan.MissingSegments {
+		if err := unix.Mkdirat(currFD, seg, 0700); err != nil {
+			unix.Close(currFD)
+			return -1, "", fmt.Errorf("%w: handle-relative mkdirat failed for %s: %v", ErrRefused, seg, err)
+		}
+		nextFD, err := unix.Openat(currFD, seg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(currFD)
+		if err != nil {
+			return -1, "", fmt.Errorf("%w: handle-relative openat failed for %s: %v", ErrRefused, seg, err)
+		}
+		currFD = nextFD
+	}
+
+	finalPath, err := fdPath(currFD)
+	if err != nil {
+		unix.Close(currFD)
+		return -1, "", err
+	}
+	for _, home := range homes {
+		if strings.TrimSpace(home) != "" && withinPath(home, finalPath) {
+			unix.Close(currFD)
+			return -1, "", fmt.Errorf("%w: final directory in protected home", ErrRefused)
+		}
+	}
+	return currFD, finalPath, nil
 }
 
 func ensureExistingSentinel(path string) error {

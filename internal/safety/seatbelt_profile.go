@@ -5,10 +5,11 @@ import (
 	"strings"
 )
 
-// DarwinSeatbeltProfile is the unevaluated Darwin profile for a run root.
-// It is not a verification result. darwinBackend.Available stays BLOCKED
-// until a Darwin process shows an existing sentinel denied and a project
-// write inside the root succeeding, including a securityd Mach lookup denial.
+// DarwinSeatbeltProfile generates the Seatbelt profile for a run root.
+// Generating the profile is not a verification result. darwinBackend.Available
+// checks /usr/bin/sandbox-exec presence and execution bit, while runtime
+// confinement requires the child probe to verify write isolation.
+// Mach/securityd IPC and keychain confidentiality remain unverified and blocked.
 func DarwinSeatbeltProfile(root string) (string, error) {
 	if err := darwinPathShapeError(root); err != nil {
 		return "", err

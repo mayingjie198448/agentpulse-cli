@@ -102,6 +102,29 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 		fmt.Fprintf(&b, "result=BLOCKED\nreason=%s\n", err.Error())
 		return b.String(), err
 	}
+	var darwinLinkPlan DarwinFixtureLinkPlan
+	var darwinTargetIdent DarwinTargetIdentity
+	darwinTargetPayloadContent := []byte("outside-target-v1\n")
+	if runtime.GOOS == "darwin" {
+		plan, err := planDarwinFixtureLink(base, prepared.Root)
+		if err != nil {
+			return b.String(), fmt.Errorf("fixture link plan failed: %w", err)
+		}
+		darwinLinkPlan = plan
+		if err := os.MkdirAll(darwinLinkPlan.ExternalTargetDir, 0700); err != nil {
+			return b.String(), fmt.Errorf("failed to create fixture external target: %w", err)
+		}
+		if err := os.WriteFile(darwinLinkPlan.ExternalPayload, darwinTargetPayloadContent, 0600); err != nil {
+			return b.String(), fmt.Errorf("failed to write fixture external payload: %w", err)
+		}
+		if ident, err := getDarwinFileIdentity(darwinLinkPlan.ExternalPayload); err == nil {
+			darwinTargetIdent = ident
+		}
+		if err := os.Symlink(darwinLinkPlan.ExternalTargetDir, darwinLinkPlan.LinkInWork); err != nil {
+			return b.String(), fmt.Errorf("failed to create synthetic in-root symlink: %w", err)
+		}
+		prepared.Cmd.Args = append(prepared.Cmd.Args, "--escape", darwinLinkPlan.EscapeThroughLink)
+	}
 	noteManifest(&b, req.RegistryDir, prepared.rec)
 	fmt.Fprintf(&b, "profile_hash=%s\n", prepared.audit.ProfileHash)
 	fmt.Fprintf(&b, "run_root=%s\n", prepared.Root)
@@ -142,6 +165,18 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 			return b.String(), fmt.Errorf("protected file changed: %s", rel)
 		}
 	}
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(string(escape), "path="+darwinLinkPlan.EscapeThroughLink) || !strings.Contains(string(escape), "write=eperm") {
+			fmt.Fprintf(&b, "result=FAIL\nreason=directory_link_escape_not_denied\nescape=%s\n", escape)
+			return b.String(), fmt.Errorf("directory link escape was not denied")
+		}
+		payloadAfterRun, err := os.ReadFile(darwinLinkPlan.ExternalPayload)
+		if err != nil || string(payloadAfterRun) != string(darwinTargetPayloadContent) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_modified_during_run\n")
+			return b.String(), fmt.Errorf("outside target modified during run")
+		}
+		fmt.Fprintf(&b, "dir_link_escape_denied=true\n")
+	}
 	cout, cerr := CleanupRun(prepared.RunID, CleanupOptions{RegistryDir: req.RegistryDir, AuditPath: audit, RealHome: fake})
 	auditBody, _ := os.ReadFile(audit)
 	if strings.Contains(string(auditBody), "s3cr3t-mqtt-password") || !strings.Contains(string(auditBody), "[REDACTED]") {
@@ -159,6 +194,26 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	if _, err := os.Stat(audit); err != nil {
 		fmt.Fprintf(&b, "result=FAIL\naudit_removed=true\n")
 		return b.String(), fmt.Errorf("audit was inside the cleaned root")
+	}
+	if runtime.GOOS == "darwin" {
+		if _, err := os.Lstat(darwinLinkPlan.LinkInWork); !os.IsNotExist(err) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=symlink_not_cleaned\n")
+			return b.String(), fmt.Errorf("symlink was not removed by cleanup")
+		}
+		payloadAfterClean, err := os.ReadFile(darwinLinkPlan.ExternalPayload)
+		if err != nil || string(payloadAfterClean) != string(darwinTargetPayloadContent) {
+			fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_modified_after_cleanup\n")
+			return b.String(), fmt.Errorf("outside target modified after cleanup")
+		}
+		afterIdent, err := getDarwinFileIdentity(darwinLinkPlan.ExternalPayload)
+		if err == nil && darwinTargetIdent.Dev != 0 {
+			if afterIdent.Dev != darwinTargetIdent.Dev || afterIdent.Ino != darwinTargetIdent.Ino {
+				fmt.Fprintf(&b, "result=FAIL\nreason=outside_target_identity_changed\n")
+				return b.String(), fmt.Errorf("outside target identity changed")
+			}
+		}
+		fmt.Fprintf(&b, "outside_target_retained=true\n")
+		fmt.Fprintf(&b, "outside_target_identity_retained=true\n")
 	}
 	fmt.Fprintf(&b, "result=PASS\n")
 	fmt.Fprintf(&b, "native_windows_catalog=%s\n", NativeVerification()["windows_appcontainer_native_fixture"])

@@ -94,14 +94,10 @@ func deleteOwned(rec RunRecord, homes []string) (CleanupOutcome, error) {
 		out.Reason = "unlink of empty run root failed; root retained"
 		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
 	}
-	if rec.RegistryPath != "" {
-		_ = os.Remove(rec.RegistryPath)
-	}
-	out.Result = "deleted"
-	out.Targets = []string{rec.Root}
-	out.Reason = ""
-	return out, nil
+	return handleDarwinRegistryRemoval(rec.RegistryPath, rec.Root, darwinRegistryRemoveFn)
 }
+
+var darwinRegistryRemoveFn = os.Remove
 
 func forbidIdentity(dev, ino uint64, homes []string) error {
 	rootFD, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)

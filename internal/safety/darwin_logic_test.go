@@ -2,6 +2,8 @@ package safety
 
 import (
 	"errors"
+	"os"
+	"path"
 	"strings"
 	"syscall"
 	"testing"
@@ -64,37 +66,149 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 }
 
 func TestDarwinPathNormalizationContract(t *testing.T) {
-	// Canonical path requirements
-	if err := validateDarwinCanonicalPath("/private/tmp/agentpulse-runs/run1"); err != nil {
-		t.Fatalf("valid canonical path rejected: %v", err)
-	}
-	if err := validateDarwinCanonicalPath("/tmp/agentpulse-runs/run1"); err == nil {
-		t.Fatal("non-canonical /tmp path should be rejected")
-	}
-	if err := validateDarwinCanonicalPath("/var/agentpulse-runs/run1"); err == nil {
-		t.Fatal("non-canonical /var path should be rejected")
-	}
-	if err := validateDarwinCanonicalPath("/private/tmp/run(test)"); err == nil {
-		t.Fatal("path with '(' should be rejected")
-	}
+	t.Run("CanonicalPaths", func(t *testing.T) {
+		if err := validateDarwinCanonicalPath("/private/tmp/agentpulse-runs/run1"); err != nil {
+			t.Fatalf("valid canonical path rejected: %v", err)
+		}
+		if err := validateDarwinCanonicalPath("/tmp/agentpulse-runs/run1"); err == nil {
+			t.Fatal("non-canonical /tmp path should be rejected")
+		}
+		if err := validateDarwinCanonicalPath("/var/agentpulse-runs/run1"); err == nil {
+			t.Fatal("non-canonical /var path should be rejected")
+		}
+		if err := validateDarwinCanonicalPath("/private/tmp/run(test)"); err == nil {
+			t.Fatal("path with '(' should be rejected")
+		}
+	})
 
-	// Sentinel within root must be detectable
-	root := "/private/tmp/agentpulse-runs/run1"
-	insideSentinel := "/private/tmp/agentpulse-runs/run1/work/sentinel"
-	outsideSentinel := "/private/tmp/agentpulse-sentinels/sentinel1"
+	t.Run("SentinelDetection", func(t *testing.T) {
+		root := "/private/tmp/agentpulse-runs/run1"
+		insideSentinel := "/private/tmp/agentpulse-runs/run1/work/sentinel"
+		outsideSentinel := "/private/tmp/agentpulse-sentinels/sentinel1"
 
-	if !withinPath(root, insideSentinel) {
-		t.Fatal("inside sentinel was not detected as within root")
-	}
-	if withinPath(root, outsideSentinel) {
-		t.Fatal("outside sentinel was falsely detected as within root")
-	}
+		if !withinPath(root, insideSentinel) {
+			t.Fatal("inside sentinel was not detected as within root")
+		}
+		if withinPath(root, outsideSentinel) {
+			t.Fatal("outside sentinel was falsely detected as within root")
+		}
 
-	// Protected home protection
-	fakeHome := "/Users/testuser"
-	if !withinPath(fakeHome, "/Users/testuser/.ssh/id_ed25519") {
-		t.Fatal("home asset not detected as within protected home")
-	}
+		fakeHome := "/Users/testuser"
+		if !withinPath(fakeHome, "/Users/testuser/.ssh/id_ed25519") {
+			t.Fatal("home asset not detected as within protected home")
+		}
+	})
+
+	t.Run("ProtectedHomePlannerRejectsBeforeMutation", func(t *testing.T) {
+		fakeHomes := []string{"/Users/alice", "/Users/bob"}
+		statDir := func(path string) (bool, bool, error) {
+			return true, true, nil
+		}
+		target := "/Users/alice/runs/newdir"
+		_, err := planDarwinSafeDir(target, fakeHomes, statDir)
+		if err == nil {
+			t.Fatal("expected planDarwinSafeDir to reject target inside protected home")
+		}
+		if !errors.Is(err, ErrRefused) {
+			t.Fatalf("expected ErrRefused, got %v", err)
+		}
+	})
+
+	t.Run("ExistingAncestorResolutionAndProtection", func(t *testing.T) {
+		fakeHomes := []string{"/Users/alice"}
+		statDir := func(path string) (bool, bool, error) {
+			if path == "/Users/alice" {
+				return true, true, nil
+			}
+			return false, false, nil
+		}
+		_, err := planDarwinSafeDir("/Users/alice/sub1/sub2", fakeHomes, statDir)
+		if err == nil {
+			t.Fatal("expected rejection when ancestor is in protected home")
+		}
+		if !errors.Is(err, ErrRefused) {
+			t.Fatalf("expected ErrRefused, got %v", err)
+		}
+	})
+
+	t.Run("InvalidTargetRefusedBeforeMutation", func(t *testing.T) {
+		statDir := func(path string) (bool, bool, error) {
+			return true, true, nil
+		}
+		for _, bad := range []string{
+			"/private/tmp/bad\"dir",
+			"/private/tmp/bad(dir)",
+			"/tmp/runs",
+			"/",
+			"",
+			"relative/path",
+		} {
+			_, err := planDarwinSafeDir(bad, []string{"/Users/alice"}, statDir)
+			if err == nil {
+				t.Fatalf("expected rejection for invalid target %q", bad)
+			}
+			if !errors.Is(err, ErrRefused) && !errors.Is(err, ErrCleanupBlocked) {
+				t.Fatalf("expected refusal error for %q, got %v", bad, err)
+			}
+		}
+	})
+
+	t.Run("OwnedTempPlanSuccessWithMutations", func(t *testing.T) {
+		statDir := func(path string) (bool, bool, error) {
+			if path == "/private/tmp" {
+				return true, true, nil
+			}
+			return false, false, nil
+		}
+		target := "/private/tmp/agentpulse-runs/run123"
+		plan, err := planDarwinSafeDir(target, []string{"/Users/alice"}, statDir)
+		if err != nil {
+			t.Fatalf("unexpected plan error: %v", err)
+		}
+		if plan.ExistingAncestor != "/private/tmp" {
+			t.Fatalf("expected ExistingAncestor '/private/tmp', got %q", plan.ExistingAncestor)
+		}
+		if len(plan.MissingSegments) != 2 || plan.MissingSegments[0] != "agentpulse-runs" || plan.MissingSegments[1] != "run123" {
+			t.Fatalf("unexpected missing segments: %v", plan.MissingSegments)
+		}
+
+		var mutations []string
+		mutator := func(parent, seg string) error {
+			mutations = append(mutations, path.Join(parent, seg))
+			return nil
+		}
+		if err := executeDarwinSafeDirPlan(plan, mutator); err != nil {
+			t.Fatalf("unexpected execute error: %v", err)
+		}
+		if len(mutations) != 2 {
+			t.Fatalf("expected 2 mutations, got %d", len(mutations))
+		}
+		if path.Clean(mutations[0]) != path.Clean("/private/tmp/agentpulse-runs") {
+			t.Errorf("mutation 0 want /private/tmp/agentpulse-runs, got %q", mutations[0])
+		}
+		if path.Clean(mutations[1]) != path.Clean("/private/tmp/agentpulse-runs/run123") {
+			t.Errorf("mutation 1 want /private/tmp/agentpulse-runs/run123, got %q", mutations[1])
+		}
+	})
+
+	t.Run("ProvesZeroMutationsOnRejection", func(t *testing.T) {
+		var mutations []string
+		mutator := func(parent, seg string) error {
+			mutations = append(mutations, path.Join(parent, seg))
+			return nil
+		}
+		statDir := func(path string) (bool, bool, error) {
+			return true, true, nil
+		}
+		plan, err := planDarwinSafeDir("/Users/victim/.ssh", []string{"/Users/victim"}, statDir)
+		if err == nil {
+			_ = executeDarwinSafeDirPlan(plan, mutator)
+			t.Fatal("expected plan failure for protected path")
+		}
+		if len(mutations) != 0 {
+			t.Fatalf("expected zero mutations on rejection, got %d (%v)", len(mutations), mutations)
+		}
+	})
 }
 
 func TestDarwinLaunchArgvContract(t *testing.T) {
@@ -142,57 +256,258 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 	afterSame := []byte("sentinel-v1\n")
 	afterTampered := []byte("hacked\n")
 
-	// Happy path: all operations denied with EPERM, content unchanged
-	err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, syscall.EPERM, before, afterSame)
-	if err != nil {
-		t.Fatalf("unexpected probe failure on EPERM denials: %v", err)
-	}
+	t.Run("SentinelProbeEPERM", func(t *testing.T) {
+		err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, syscall.EPERM, before, afterSame)
+		if err != nil {
+			t.Fatalf("unexpected probe failure on EPERM denials: %v", err)
+		}
+	})
 
-	// Happy path: EACCES denial
-	err = checkDarwinSentinelProbe(sentinel, syscall.EACCES, syscall.EACCES, syscall.EACCES, before, afterSame)
-	if err != nil {
-		t.Fatalf("unexpected probe failure on EACCES denials: %v", err)
-	}
+	t.Run("SentinelProbeEACCES", func(t *testing.T) {
+		err := checkDarwinSentinelProbe(sentinel, syscall.EACCES, syscall.EACCES, syscall.EACCES, before, afterSame)
+		if err != nil {
+			t.Fatalf("unexpected probe failure on EACCES denials: %v", err)
+		}
+	})
 
-	// Unhappy path: write was permitted (nil error)
-	if err := checkDarwinSentinelProbe(sentinel, nil, syscall.EPERM, syscall.EPERM, before, afterSame); err == nil {
-		t.Fatal("probe must fail if write was not denied")
-	}
+	t.Run("SentinelProbeUnhappy", func(t *testing.T) {
+		if err := checkDarwinSentinelProbe(sentinel, nil, syscall.EPERM, syscall.EPERM, before, afterSame); err == nil {
+			t.Fatal("probe must fail if write was not denied")
+		}
+		if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, nil, syscall.EPERM, before, afterSame); err == nil {
+			t.Fatal("probe must fail if remove was not denied")
+		}
+		if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, nil, before, afterSame); err == nil {
+			t.Fatal("probe must fail if sibling creation was not denied")
+		}
+		if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, syscall.EPERM, before, afterTampered); err == nil {
+			t.Fatal("probe must fail if sentinel content changed")
+		}
+	})
 
-	// Unhappy path: remove was permitted (nil error)
-	if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, nil, syscall.EPERM, before, afterSame); err == nil {
-		t.Fatal("probe must fail if remove was not denied")
-	}
+	t.Run("FixtureLinkPlanValidation", func(t *testing.T) {
+		base := "/private/tmp/fixture-base"
+		root := "/private/tmp/fixture-base/runs/run1"
+		plan, err := planDarwinFixtureLink(base, root)
+		if err != nil {
+			t.Fatalf("unexpected error planning fixture link: %v", err)
+		}
+		if !withinPath(base, plan.ExternalTargetDir) {
+			t.Fatalf("expected external target in base, got %q", plan.ExternalTargetDir)
+		}
+		if withinPath(root, plan.ExternalTargetDir) {
+			t.Fatalf("external target %q illegally inside run root %q", plan.ExternalTargetDir, root)
+		}
+		if !withinPath(root, plan.LinkInWork) {
+			t.Fatalf("link %q must be inside run root %q", plan.LinkInWork, root)
+		}
+	})
 
-	// Unhappy path: sibling creation was permitted (nil error)
-	if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, nil, before, afterSame); err == nil {
-		t.Fatal("probe must fail if sibling creation was not denied")
-	}
+	t.Run("FixtureLinkEscapeDenialAndTargetRetention", func(t *testing.T) {
+		plan := DarwinFixtureLinkPlan{
+			RunRoot:           "/private/tmp/base/runs/run1",
+			ExternalTargetDir: "/private/tmp/base/synthetic-external-target",
+			ExternalPayload:   "/private/tmp/base/synthetic-external-target/target.txt",
+			LinkInWork:        "/private/tmp/base/runs/run1/work/dir-link-escape",
+			EscapeThroughLink: "/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt",
+		}
+		escapeOutput := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=eperm\nremove=eperm\n"
+		beforeIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
+		afterIdent := DarwinTargetIdentity{Dev: 100, Ino: 500}
+		payload := []byte("outside-target-v1\n")
 
-	// Unhappy path: content was changed
-	if err := checkDarwinSentinelProbe(sentinel, syscall.EPERM, syscall.EPERM, syscall.EPERM, before, afterTampered); err == nil {
-		t.Fatal("probe must fail if sentinel content changed")
-	}
+		// Happy path: link denied, outside target retained and identical, root and link reclaimed
+		err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, payload, false, false, true)
+		if err != nil {
+			t.Fatalf("unexpected verification error on valid fixture outcome: %v", err)
+		}
+
+		// Negative: write through link permitted
+		badEscape := "path=/private/tmp/base/runs/run1/work/dir-link-escape/escape-attempt.txt\nwrite=nil\n"
+		if err := verifyDarwinFixtureLinkEscape(badEscape, plan, beforeIdent, afterIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when link write was not denied")
+		}
+
+		// Negative: target destroyed
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, payload, false, false, false); err == nil {
+			t.Fatal("expected error when outside target was destroyed")
+		}
+
+		// Negative: target payload modified
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, []byte("tampered\n"), false, false, true); err == nil {
+			t.Fatal("expected error when outside target payload was modified")
+		}
+
+		// Negative: target inode changed
+		badIdent := DarwinTargetIdentity{Dev: 100, Ino: 999}
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, badIdent, payload, false, false, true); err == nil {
+			t.Fatal("expected error when outside target inode changed")
+		}
+
+		// Negative: run root not reclaimed
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, payload, true, false, true); err == nil {
+			t.Fatal("expected error when run root was not reclaimed")
+		}
+
+		// Negative: symlink not reclaimed
+		if err := verifyDarwinFixtureLinkEscape(escapeOutput, plan, beforeIdent, afterIdent, payload, false, true, true); err == nil {
+			t.Fatal("expected error when symlink was not reclaimed")
+		}
+	})
 }
 
 func TestDarwinConfirmPipeContract(t *testing.T) {
-	// Positive OK confirmation
-	ok, reason, err := parseDarwinConfirmMessage("OK\n")
-	if !ok || reason != "OK" || err != nil {
-		t.Fatalf("parseDarwinConfirmMessage(OK) failed: ok=%v reason=%s err=%v", ok, reason, err)
-	}
+	t.Run("ParsePositive", func(t *testing.T) {
+		ok, reason, err := parseDarwinConfirmMessage("OK\n")
+		if !ok || reason != "OK" || err != nil {
+			t.Fatalf("parseDarwinConfirmMessage(OK) failed: ok=%v reason=%s err=%v", ok, reason, err)
+		}
+	})
 
-	// Negative FAIL confirmation
-	ok, reason, err = parseDarwinConfirmMessage("FAIL root_identity\n")
-	if ok || reason != "root_identity" || err == nil {
-		t.Fatalf("parseDarwinConfirmMessage(FAIL) unexpected: ok=%v reason=%s err=%v", ok, reason, err)
-	}
+	t.Run("ParseNegative", func(t *testing.T) {
+		ok, reason, err := parseDarwinConfirmMessage("FAIL root_identity\n")
+		if ok || reason != "root_identity" || err == nil {
+			t.Fatalf("parseDarwinConfirmMessage(FAIL) unexpected: ok=%v reason=%s err=%v", ok, reason, err)
+		}
+	})
 
-	// Truncated/closed pipe
-	ok, reason, err = parseDarwinConfirmMessage("")
-	if ok || !strings.Contains(reason, "closed confirm pipe") || err == nil {
-		t.Fatalf("parseDarwinConfirmMessage('') unexpected: ok=%v reason=%s err=%v", ok, reason, err)
-	}
+	t.Run("ParseTruncated", func(t *testing.T) {
+		ok, reason, err := parseDarwinConfirmMessage("")
+		if ok || !strings.Contains(reason, "closed confirm pipe") || err == nil {
+			t.Fatalf("parseDarwinConfirmMessage('') unexpected: ok=%v reason=%s err=%v", ok, reason, err)
+		}
+	})
+
+	t.Run("ReexecEPIPE", func(t *testing.T) {
+		execCalls := 0
+		seam := darwinConfirmExecSeam{
+			Write: func(fd int, b []byte) (int, error) {
+				return 0, syscall.EPIPE
+			},
+			Close: func(fd int) error {
+				return nil
+			},
+			Exec: func(argv0 string, argv []string, env []string) error {
+				execCalls++
+				return nil
+			},
+		}
+		err := darwinConfirmAndExec(3, []string{"/bin/echo", "hi"}, []string{}, seam)
+		if err == nil {
+			t.Fatal("expected error on EPIPE write failure, got nil")
+		}
+		if !errors.Is(err, ErrRefused) || !errors.Is(err, syscall.EPIPE) {
+			t.Fatalf("expected ErrRefused and EPIPE, got %v", err)
+		}
+		if execCalls != 0 {
+			t.Fatalf("exec called %d times on write failure; expected 0", execCalls)
+		}
+	})
+
+	t.Run("ReexecShortWrite", func(t *testing.T) {
+		execCalls := 0
+		seam := darwinConfirmExecSeam{
+			Write: func(fd int, b []byte) (int, error) {
+				return 1, nil // short write (1 < 3)
+			},
+			Close: func(fd int) error {
+				return nil
+			},
+			Exec: func(argv0 string, argv []string, env []string) error {
+				execCalls++
+				return nil
+			},
+		}
+		err := darwinConfirmAndExec(3, []string{"/bin/echo", "hi"}, []string{}, seam)
+		if err == nil {
+			t.Fatal("expected error on short write, got nil")
+		}
+		if !errors.Is(err, ErrRefused) {
+			t.Fatalf("expected ErrRefused on short write, got %v", err)
+		}
+		if execCalls != 0 {
+			t.Fatalf("exec called %d times on short write; expected 0", execCalls)
+		}
+	})
+
+	t.Run("ReexecCloseError", func(t *testing.T) {
+		execCalls := 0
+		seam := darwinConfirmExecSeam{
+			Write: func(fd int, b []byte) (int, error) {
+				return len(b), nil
+			},
+			Close: func(fd int) error {
+				return syscall.EBADF
+			},
+			Exec: func(argv0 string, argv []string, env []string) error {
+				execCalls++
+				return nil
+			},
+		}
+		err := darwinConfirmAndExec(3, []string{"/bin/echo", "hi"}, []string{}, seam)
+		if err == nil {
+			t.Fatal("expected error on close failure, got nil")
+		}
+		if !errors.Is(err, ErrRefused) || !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("expected ErrRefused and EBADF on close failure, got %v", err)
+		}
+		if execCalls != 0 {
+			t.Fatalf("exec called %d times on close failure; expected 0", execCalls)
+		}
+	})
+
+	t.Run("ReexecSuccess", func(t *testing.T) {
+		execCalls := 0
+		var gotArgv0 string
+		var gotArgv []string
+		seam := darwinConfirmExecSeam{
+			Write: func(fd int, b []byte) (int, error) {
+				return len(b), nil
+			},
+			Close: func(fd int) error {
+				return nil
+			},
+			Exec: func(argv0 string, argv []string, env []string) error {
+				execCalls++
+				gotArgv0 = argv0
+				gotArgv = argv
+				return nil
+			},
+		}
+		err := darwinConfirmAndExec(3, []string{"/bin/echo", "hello"}, []string{"FOO=bar"}, seam)
+		if err != nil {
+			t.Fatalf("unexpected error on complete success: %v", err)
+		}
+		if execCalls != 1 {
+			t.Fatalf("expected exec called exactly once, got %d", execCalls)
+		}
+		if gotArgv0 != "/bin/echo" || len(gotArgv) != 2 || gotArgv[1] != "hello" {
+			t.Fatalf("unexpected exec argv: %s %v", gotArgv0, gotArgv)
+		}
+	})
+
+	t.Run("ReexecEmptyUser", func(t *testing.T) {
+		execCalls := 0
+		seam := darwinConfirmExecSeam{
+			Write: func(fd int, b []byte) (int, error) {
+				return len(b), nil
+			},
+			Close: func(fd int) error {
+				return nil
+			},
+			Exec: func(argv0 string, argv []string, env []string) error {
+				execCalls++
+				return nil
+			},
+		}
+		err := darwinConfirmAndExec(3, []string{}, []string{}, seam)
+		if err == nil {
+			t.Fatal("expected error on empty user command, got nil")
+		}
+		if execCalls != 0 {
+			t.Fatalf("exec called on empty command: %d", execCalls)
+		}
+	})
 }
 
 func TestDarwinCleanupMarkerContract(t *testing.T) {
@@ -212,26 +527,97 @@ func TestDarwinCleanupMarkerContract(t *testing.T) {
 		Ino:   200,
 	}
 
-	if err := validateDarwinCleanupMarker(validMarker, rec, 100, 200); err != nil {
-		t.Fatalf("valid marker rejected: %v", err)
-	}
+	t.Run("MarkerValidation", func(t *testing.T) {
+		if err := validateDarwinCleanupMarker(validMarker, rec, 100, 200); err != nil {
+			t.Fatalf("valid marker rejected: %v", err)
+		}
 
-	// Mismatched run ID
-	badRunID := validMarker
-	badRunID.RunID = "fedcba9876543210fedcba9876543210"
-	if err := validateDarwinCleanupMarker(badRunID, rec, 100, 200); err == nil || !errors.Is(err, ErrCleanupBlocked) {
-		t.Fatalf("expected ErrCleanupBlocked for run ID mismatch, got %v", err)
-	}
+		// Mismatched run ID
+		badRunID := validMarker
+		badRunID.RunID = "fedcba9876543210fedcba9876543210"
+		if err := validateDarwinCleanupMarker(badRunID, rec, 100, 200); err == nil || !errors.Is(err, ErrCleanupBlocked) {
+			t.Fatalf("expected ErrCleanupBlocked for run ID mismatch, got %v", err)
+		}
 
-	// Mismatched nonce
-	badNonce := validMarker
-	badNonce.Nonce = "wrongnonce"
-	if err := validateDarwinCleanupMarker(badNonce, rec, 100, 200); err == nil || !errors.Is(err, ErrCleanupBlocked) {
-		t.Fatalf("expected ErrCleanupBlocked for nonce mismatch, got %v", err)
-	}
+		// Mismatched nonce
+		badNonce := validMarker
+		badNonce.Nonce = "wrongnonce"
+		if err := validateDarwinCleanupMarker(badNonce, rec, 100, 200); err == nil || !errors.Is(err, ErrCleanupBlocked) {
+			t.Fatalf("expected ErrCleanupBlocked for nonce mismatch, got %v", err)
+		}
 
-	// Mismatched Ino
-	if err := validateDarwinCleanupMarker(validMarker, rec, 100, 999); err == nil || !errors.Is(err, ErrCleanupBlocked) {
-		t.Fatalf("expected ErrCleanupBlocked for inode mismatch, got %v", err)
-	}
+		// Mismatched Ino
+		if err := validateDarwinCleanupMarker(validMarker, rec, 100, 999); err == nil || !errors.Is(err, ErrCleanupBlocked) {
+			t.Fatalf("expected ErrCleanupBlocked for inode mismatch, got %v", err)
+		}
+	})
+
+	t.Run("RegistryRemovalSuccess", func(t *testing.T) {
+		removeCalls := 0
+		removeFn := func(path string) error {
+			removeCalls++
+			if path != "/private/tmp/registry/run1.json" {
+				t.Fatalf("unexpected remove path: %s", path)
+			}
+			return nil
+		}
+		out, err := handleDarwinRegistryRemoval("/private/tmp/registry/run1.json", "/private/tmp/runs/run1", removeFn)
+		if err != nil {
+			t.Fatalf("unexpected error on successful removal: %v", err)
+		}
+		if out.Result != "deleted" {
+			t.Fatalf("expected Result 'deleted', got %q", out.Result)
+		}
+		if len(out.Targets) != 1 || out.Targets[0] != "/private/tmp/runs/run1" {
+			t.Fatalf("unexpected targets: %v", out.Targets)
+		}
+		if removeCalls != 1 {
+			t.Fatalf("expected 1 remove call, got %d", removeCalls)
+		}
+	})
+
+	t.Run("RegistryRemovalNotExist", func(t *testing.T) {
+		removeFn := func(path string) error {
+			return os.ErrNotExist
+		}
+		out, err := handleDarwinRegistryRemoval("/private/tmp/registry/run1.json", "/private/tmp/runs/run1", removeFn)
+		if err != nil {
+			t.Fatalf("unexpected error when registry already not exist: %v", err)
+		}
+		if out.Result != "deleted" {
+			t.Fatalf("expected Result 'deleted', got %q", out.Result)
+		}
+	})
+
+	t.Run("RegistryRemovalEmpty", func(t *testing.T) {
+		out, err := handleDarwinRegistryRemoval("", "/private/tmp/runs/run1", nil)
+		if err != nil {
+			t.Fatalf("unexpected error for empty registry path: %v", err)
+		}
+		if out.Result != "deleted" {
+			t.Fatalf("expected Result 'deleted', got %q", out.Result)
+		}
+	})
+
+	t.Run("RegistryRemovalPermissionDeniedPartialState", func(t *testing.T) {
+		removeFn := func(path string) error {
+			return os.ErrPermission
+		}
+		out, err := handleDarwinRegistryRemoval("/private/tmp/registry/run1.json", "/private/tmp/runs/run1", removeFn)
+		if err == nil {
+			t.Fatal("expected error on permission denied registry removal, got nil")
+		}
+		if !errors.Is(err, ErrCleanupBlocked) || !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected wrapped ErrCleanupBlocked and os.ErrPermission, got %v", err)
+		}
+		if out.Result != "partial" {
+			t.Fatalf("expected honest partial result 'partial', got %q", out.Result)
+		}
+		if !strings.Contains(out.Reason, "root removed, registry retained") {
+			t.Fatalf("expected reason stating root removed, registry retained, got %q", out.Reason)
+		}
+		if len(out.Targets) != 1 || out.Targets[0] != "/private/tmp/runs/run1" {
+			t.Fatalf("expected root retained in targets list: %v", out.Targets)
+		}
+	})
 }

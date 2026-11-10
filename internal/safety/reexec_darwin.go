@@ -118,9 +118,11 @@ func failVerify(confirm int, reason string) {
 }
 
 func confirmAndExec(cfg reexecCfg) error {
-	_, _ = unix.Write(3, []byte("OK\n"))
-	_ = unix.Close(3)
-	return unix.Exec(cfg.user[0], cfg.user, os.Environ())
+	return darwinConfirmAndExec(3, cfg.user, os.Environ(), darwinConfirmExecSeam{
+		Write: unix.Write,
+		Close: unix.Close,
+		Exec:  unix.Exec,
+	})
 }
 
 func closeExtraFDs(keep int) error {
