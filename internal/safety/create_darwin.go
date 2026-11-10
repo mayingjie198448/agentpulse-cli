@@ -170,30 +170,10 @@ func createSyntheticSentinel(base string) (string, error) {
 		return "", err
 	}
 	name = "sentinel-" + name
-	fd, err := unix.Openat(dirFD, name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	// Same exclusive FD chain as createDarwinExclusiveSentinel. The directory
+	// FD's kernel path is the parent; a failed F_GETPATH must not join strings.
+	sentinelPath, _, _, err := createExclusiveSentinelFD(currentDarwinExclusiveOS(), kpath, name, []byte("sentinel-v1\n"))
 	if err != nil {
-		return "", err
-	}
-	defer unix.Close(fd)
-	if err := writeFD(fd, []byte("sentinel-v1\n")); err != nil {
-		return "", err
-	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return "", fmt.Errorf("%w: stat synthetic sentinel: %v", ErrSentinelUnusable, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return "", fmt.Errorf("%w: synthetic sentinel is not a regular file", ErrSentinelUnusable)
-	}
-	dev, ino := ident(st)
-	if dev == 0 || ino == 0 {
-		return "", fmt.Errorf("%w: synthetic sentinel has zero device or inode", ErrSentinelUnusable)
-	}
-	sentinelPath, err := fdPath(fd)
-	if err != nil {
-		sentinelPath = kpath + "/" + name
-	}
-	if err := registerPendingDarwinSyntheticProbe(sentinelPath, dev, ino); err != nil {
 		return "", err
 	}
 	return sentinelPath, nil
