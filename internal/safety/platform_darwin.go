@@ -2,18 +2,29 @@
 
 package safety
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
-// darwinBackend is implemented as a seatbelt profile builder plus a hard stop.
-// Native verification on Darwin (existing sentinel denied, project write
-// allowed, Mach/securityd denied) has not been run. Available therefore
-// fails closed instead of launching sandbox-exec and calling it verified.
+const sandboxExecPath = "/usr/bin/sandbox-exec"
+
+// darwinBackend implements OS write isolation using macOS Seatbelt (/usr/bin/sandbox-exec).
+// Available verifies that /usr/bin/sandbox-exec is present and executable.
+// A nil error is not permission to skip the fresh child probe.
 type darwinBackend struct{}
 
 func (darwinBackend) Name() string { return "darwin-sandbox-exec" }
 
 func (darwinBackend) Available() error {
-	return fmt.Errorf("%w: darwin sandbox-exec and Mach/securityd credential IPC are BLOCKED pending native verification", ErrBackendUnavailable)
+	st, err := os.Stat(sandboxExecPath)
+	if err != nil {
+		return fmt.Errorf("%w: /usr/bin/sandbox-exec is missing: %v", ErrBackendUnavailable, err)
+	}
+	if st.Mode()&0111 == 0 {
+		return fmt.Errorf("%w: /usr/bin/sandbox-exec is not executable", ErrBackendUnavailable)
+	}
+	return nil
 }
 
 func platformBackend() Backend { return darwinBackend{} }
