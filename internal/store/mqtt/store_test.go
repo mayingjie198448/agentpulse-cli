@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1274,37 +1275,39 @@ func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_Success(t *testing.T) {
 		t.Fatalf("Refresh returned unexpected error: %v", err)
 	}
 
-	// 1. Verify live store contains both machines and both jobs
+	// Live cache must be exactly these ids. A same-sized substitute does not count.
 	machines, err := st.ListMachines(ctx)
-	if err != nil || len(machines) != 2 {
-		t.Fatalf("expected 2 machines after refresh, got %+v", machines)
+	if err != nil {
+		t.Fatalf("ListMachines: %v", err)
+	}
+	if got, want := idList(machineIDs(machines)), []string{"mach-1", "mach-2"}; !sameStrings(got, want) {
+		t.Fatalf("machines = %v, want %v", got, want)
 	}
 
 	jobs, err := st.ListJobs(ctx)
-	if err != nil || len(jobs) != 2 {
-		t.Fatalf("expected 2 jobs after refresh, got %+v", jobs)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if got, want := idList(jobIDs(jobs)), []string{"job-1", "job-new"}; !sameStrings(got, want) {
+		t.Fatalf("jobs = %v, want %v", got, want)
+	}
+	j1 := jobByID(jobs, "job-1")
+	if j1.MachineID != "mach-1" || j1.Title != "Job 1" || j1.Status != model.StatusRunning || j1.Progress != 95 {
+		t.Fatalf("job-1 = %+v, want mach-1 running Job 1 progress 95", j1)
+	}
+	jNew := jobByID(jobs, "job-new")
+	if jNew.MachineID != "mach-1" || jNew.Title != "Job New" || jNew.Status != model.StatusRunning || jNew.Progress != 0 {
+		t.Fatalf("job-new = %+v, want mach-1 running Job New progress 0", jNew)
 	}
 
-	var j1 *model.Job
-	for i := range jobs {
-		if jobs[i].ID == "job-1" {
-			j1 = &jobs[i]
-		}
-	}
-	if j1 == nil || j1.Progress != 95 {
-		t.Fatalf("expected job-1 to have progress 95 from real-time update, got: %+v", j1)
-	}
-
-	// 2. Verify logs for job-1 preserved the real-time log entry
 	logs, err := st.GetLogs(ctx, "job-1", 10)
-	if err != nil || len(logs) == 0 {
-		t.Fatalf("expected logs for job-1 to contain real-time log, got: %+v (err: %v)", logs, err)
+	if err != nil {
+		t.Fatalf("GetLogs: %v", err)
 	}
-	if !strings.Contains(logs[len(logs)-1].Message, "realtime progress checkpoint") {
-		t.Fatalf("expected log entry to contain message, got: %+v", logs[len(logs)-1])
+	if len(logs) != 1 || logs[0].JobID != "job-1" || logs[0].Message != "realtime progress checkpoint" {
+		t.Fatalf("job-1 logs = %+v, want one exact realtime progress checkpoint", logs)
 	}
 
-	// 3. Verify subscriber received real-time events
 	receivedEvents := make([]model.Event, 0)
 	drainDone := false
 	for !drainDone {
@@ -1321,26 +1324,63 @@ func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_Success(t *testing.T) {
 	hasLog := false
 	for _, ev := range receivedEvents {
 		if ev.Type == model.EventJobUpdated && ev.Job != nil {
-			if ev.Job.ID == "job-1" && ev.Job.Progress == 95 {
+			if ev.Job.ID == "job-1" && ev.Job.MachineID == "mach-1" && ev.Job.Progress == 95 {
 				hasJ1Update = true
 			}
-			if ev.Job.ID == "job-new" {
+			if ev.Job.ID == "job-new" && ev.Job.MachineID == "mach-1" && ev.Job.Progress == 0 {
 				hasJNew = true
 			}
 		}
-		if ev.Type == model.EventLogAdded && ev.Log != nil && ev.Log.JobID == "job-1" {
+		if ev.Type == model.EventLogAdded && ev.Log != nil && ev.Log.JobID == "job-1" && ev.Log.Message == "realtime progress checkpoint" {
 			hasLog = true
 		}
 	}
-	if !hasJ1Update {
-		t.Errorf("expected subscriber to receive EventJobUpdated for job-1 (progress 95)")
+	if !hasJ1Update || !hasJNew || !hasLog {
+		t.Fatalf("subscriber missing realtime events: job-1 progress 95=%v job-new=%v log=%v events=%+v", hasJ1Update, hasJNew, hasLog, receivedEvents)
 	}
-	if !hasJNew {
-		t.Errorf("expected subscriber to receive EventJobUpdated for job-new")
+}
+
+func machineIDs(list []model.Machine) []string {
+	ids := make([]string, len(list))
+	for i := range list {
+		ids[i] = list[i].ID
 	}
-	if !hasLog {
-		t.Errorf("expected subscriber to receive EventLogAdded for job-1 log")
+	return ids
+}
+
+func jobIDs(list []model.Job) []string {
+	ids := make([]string, len(list))
+	for i := range list {
+		ids[i] = list[i].ID
 	}
+	return ids
+}
+
+func jobByID(list []model.Job, id string) model.Job {
+	for i := range list {
+		if list[i].ID == id {
+			return list[i]
+		}
+	}
+	return model.Job{}
+}
+
+func idList(ids []string) []string {
+	out := append([]string(nil), ids...)
+	sort.Strings(out)
+	return out
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestMQTTStore_Refresh_ConcurrentRealtimeMessages_FailedRefresh(t *testing.T) {
