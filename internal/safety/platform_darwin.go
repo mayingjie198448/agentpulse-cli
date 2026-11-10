@@ -3,8 +3,12 @@
 package safety
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 const sandboxExecPath = "/usr/bin/sandbox-exec"
@@ -28,3 +32,38 @@ func (darwinBackend) Available() error {
 }
 
 func platformBackend() Backend { return darwinBackend{} }
+
+func defaultDarwinImageInspector(exePath string) (canonicalPath string, dev, ino uint64, isReg bool, sha256Hex string, err error) {
+	fd, st, err := openFileNoFollow(exePath)
+	if err != nil {
+		return "", 0, 0, false, "", err
+	}
+	defer unix.Close(fd)
+
+	isReg = (st.Mode & unix.S_IFMT) == unix.S_IFREG
+	dev, ino = ident(st)
+	canon, err := fdPath(fd)
+	if err != nil {
+		return "", 0, 0, false, "", err
+	}
+
+	h := sha256.New()
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := unix.Read(fd, buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if rerr != nil {
+			if rerr == unix.EINTR {
+				continue
+			}
+			return "", 0, 0, false, "", rerr
+		}
+		if n == 0 {
+			break
+		}
+	}
+	hashHex := hex.EncodeToString(h.Sum(nil))
+	return canon, dev, ino, isReg, hashHex, nil
+}

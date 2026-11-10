@@ -174,19 +174,24 @@ func createSyntheticSentinel(base string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	err = writeFD(fd, []byte("sentinel-v1\n"))
-	unix.Close(fd)
-	if err != nil {
+	defer unix.Close(fd)
+	if err := writeFD(fd, []byte("sentinel-v1\n")); err != nil {
 		return "", err
 	}
-	sentinelPath := kpath + "/" + name
 	var st unix.Stat_t
-	if err := unix.Lstat(sentinelPath, &st); err != nil {
+	if err := unix.Fstat(fd, &st); err != nil {
 		return "", fmt.Errorf("%w: stat synthetic sentinel: %v", ErrSentinelUnusable, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return "", fmt.Errorf("%w: synthetic sentinel is not a regular file", ErrSentinelUnusable)
 	}
 	dev, ino := ident(st)
 	if dev == 0 || ino == 0 {
 		return "", fmt.Errorf("%w: synthetic sentinel has zero device or inode", ErrSentinelUnusable)
+	}
+	sentinelPath, err := fdPath(fd)
+	if err != nil {
+		sentinelPath = kpath + "/" + name
 	}
 	if err := registerPendingDarwinSyntheticProbe(sentinelPath, dev, ino); err != nil {
 		return "", err

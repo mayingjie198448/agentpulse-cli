@@ -16,3 +16,7 @@ func (unsupportedBackend) Available() error {
 }
 
 func platformBackend() Backend { return unsupportedBackend{} }
+
+func defaultDarwinImageInspector(exePath string) (canonicalPath string, dev, ino uint64, isReg bool, sha256Hex string, err error) {
+	return "", 0, 0, false, "", fmt.Errorf("%w: darwin image inspector unavailable on this platform", ErrRefused)
+}

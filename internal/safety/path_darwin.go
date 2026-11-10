@@ -56,19 +56,22 @@ func openFileNoFollow(path string) (int, unix.Stat_t, error) {
 		return -1, unix.Stat_t{}, err
 	}
 	defer unix.Close(dir)
-	var st unix.Stat_t
-	if err := unix.Fstatat(dir, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return -1, unix.Stat_t{}, err
-	}
-	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
-		return -1, unix.Stat_t{}, fmt.Errorf("%w: sentinel is a symlink", ErrSentinelUnusable)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return -1, unix.Stat_t{}, fmt.Errorf("%w: sentinel is not a regular file", ErrSentinelUnusable)
-	}
 	fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, unix.Stat_t{}, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return -1, unix.Stat_t{}, err
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		unix.Close(fd)
+		return -1, unix.Stat_t{}, fmt.Errorf("%w: sentinel is a symlink", ErrSentinelUnusable)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return -1, unix.Stat_t{}, fmt.Errorf("%w: sentinel is not a regular file", ErrSentinelUnusable)
 	}
 	return fd, st, nil
 }

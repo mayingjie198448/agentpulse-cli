@@ -75,20 +75,12 @@ func RunNativeFixture(ctx context.Context) (string, error) {
 	}
 	sentinel := filepath.Join(fake, ".ssh", "id_ed25519")
 	if runtime.GOOS == "darwin" {
-		sentinel = filepath.Join(base, "synthetic-sentinel.txt")
-		if err := os.WriteFile(sentinel, []byte("sentinel-v1\n"), 0600); err != nil {
-			return b.String(), err
+		rawSentinel := filepath.Join(base, "synthetic-sentinel.txt")
+		canon, _, _, err := createDarwinExclusiveSentinel(rawSentinel, []byte("sentinel-v1\n"))
+		if err != nil {
+			return b.String(), fmt.Errorf("failed to create exclusive darwin sentinel: %w", err)
 		}
-		sIdent, sErr := getDarwinFileIdentity(sentinel)
-		if sErr != nil {
-			return b.String(), fmt.Errorf("failed to get darwin sentinel identity: %w", sErr)
-		}
-		if sIdent.Dev == 0 || sIdent.Ino == 0 {
-			return b.String(), fmt.Errorf("%w: synthetic sentinel has zero device or inode", ErrSentinelUnusable)
-		}
-		if err := registerPendingDarwinSyntheticProbe(sentinel, sIdent.Dev, sIdent.Ino); err != nil {
-			return b.String(), err
-		}
+		sentinel = canon
 	}
 	audit := filepath.Join(base, "audit.jsonl")
 	exe, err := os.Executable()

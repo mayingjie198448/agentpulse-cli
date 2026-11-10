@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -93,7 +94,7 @@ func TestDarwinSeatbeltProfilePolicyContract(t *testing.T) {
 
 	// Allowed readable literal: validated executable image
 	validExe := "/usr/bin/agentpulse"
-	if _, err := mintDarwinImageProof("run1", root, validExe, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); err != nil {
+	if _, err := mintDarwinImageProof("run1", root, validExe, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 10, 20); err != nil {
 		t.Fatalf("unexpected error minting image proof: %v", err)
 	}
 	profWithExe, err := DarwinSeatbeltProfile(root, validExe)
@@ -581,6 +582,11 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		clearDarwinRegistries()
 		defer clearDarwinRegistries()
 
+		restoreInspector := setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", nil
+		})
+		defer restoreInspector()
+
 		rec := RunRecord{
 			RunID:       "run1234567890abcdef1234567890ab",
 			Root:        "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
@@ -650,6 +656,11 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		clearDarwinRegistries()
 		defer clearDarwinRegistries()
 
+		restoreInspector := setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", nil
+		})
+		defer restoreInspector()
+
 		rec := RunRecord{
 			RunID:       "run1234567890abcdef1234567890ab",
 			Root:        "/private/tmp/agentpulse-runs/run1234567890abcdef1234567890ab",
@@ -701,6 +712,11 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 	t.Run("SyntheticOwnershipIdentityBinding", func(t *testing.T) {
 		clearDarwinRegistries()
 		defer clearDarwinRegistries()
+
+		restoreInspector := setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", nil
+		})
+		defer restoreInspector()
 
 		rec := RunRecord{
 			RunID:       "run1234567890abcdef1234567890ab",
@@ -783,6 +799,37 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 			t.Fatalf("stale proof granted permission to different run: %v", readsOtherRun)
 		}
 
+		// Negative 8: Empty Root in record must NOT act as wildcard (must fail closed)
+		recNoRoot := rec
+		recNoRoot.Root = ""
+		if _, err := resolveDarwinAllowedReads(recNoRoot, selfExe, homes); err == nil {
+			t.Fatal("empty Root in record must fail closed")
+		}
+
+		// Negative 9: Target executable image must not be blindly minted; unverified image must fail closed
+		recWrongExe := rec
+		recWrongExe.ExeSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+		if _, err := resolveDarwinAllowedReads(recWrongExe, selfExe, homes); err == nil {
+			t.Fatal("expected resolveDarwinAllowedReads to fail closed on unverified/mismatched image hash")
+		}
+
+		// Negative 10: Mismatched Root between record and proof must fail closed
+		recBadRoot := rec
+		recBadRoot.Root = "/private/tmp/agentpulse-runs/different-root-directory"
+		readsBadRoot, err := resolveDarwinAllowedReads(recBadRoot, selfExe, homes)
+		if err == nil && len(readsBadRoot) > 1 {
+			t.Fatalf("mismatched Root granted sentinel read permission: %v", readsBadRoot)
+		}
+
+		// Negative 11: Sentinel replaced after exclusive creation (mismatched dev/ino)
+		swappedSentinel := "/private/tmp/agentpulse-sentinels/sentinel-swapped1"
+		if err := registerPendingDarwinSyntheticProbe(swappedSentinel, 500, 600); err != nil {
+			t.Fatalf("registerPendingDarwinSyntheticProbe failed: %v", err)
+		}
+		if err := bindDarwinSyntheticProbe(rec.RunID, rec.Root, rec.Nonce, swappedSentinel, 500, 999); err == nil {
+			t.Fatal("expected bindDarwinSyntheticProbe to reject replaced sentinel identity")
+		}
+
 		// Positive & exclusive provenance transition: pending creation -> one-run bind
 		pendingSentinel := "/private/tmp/agentpulse-sentinels/sentinel-pending1"
 		if err := registerPendingDarwinSyntheticProbe(pendingSentinel, 300, 400); err != nil {
@@ -814,6 +861,173 @@ func TestDarwinSentinelProbeContract(t *testing.T) {
 		secondReads, err := resolveDarwinAllowedReads(recSecondRun, selfExe, homes)
 		if err != nil || len(secondReads) != 1 || secondReads[0] != selfExe {
 			t.Fatalf("second run illegally obtained read permission for consumed sentinel: %v", secondReads)
+		}
+	})
+
+	t.Run("ImageSourceProofInspectionAndBindingContract", func(t *testing.T) {
+		clearDarwinRegistries()
+		defer clearDarwinRegistries()
+
+		rec := RunRecord{
+			RunID:     "run-img-1234567890abcdef12345678",
+			Root:      "/private/tmp/agentpulse-runs/run-img-1234567890abcdef12345678",
+			Nonce:     "nonce-img-1234567890abcdef123456",
+			ExeSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		}
+		selfExe := "/usr/bin/agentpulse"
+		homes := []string{"/Users/alice"}
+
+		// Positive verification: valid regular file, dev/ino, canonical path, and matching hash
+		restore := setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, rec.ExeSHA256, nil
+		})
+		defer restore()
+
+		reads, err := resolveDarwinAllowedReads(rec, selfExe, homes)
+		if err != nil {
+			t.Fatalf("expected positive resolveDarwinAllowedReads to succeed: %v", err)
+		}
+		if len(reads) != 1 || reads[0] != selfExe {
+			t.Fatalf("unexpected allowed reads: %v", reads)
+		}
+		if !isVerifiedDarwinImage(selfExe, rec.Root) {
+			t.Fatalf("expected selfExe to be registered as verified Darwin image for root %s", rec.Root)
+		}
+
+		// Boundary failure 1: OS lookup / inspect error fails closed
+		setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return "", 0, 0, false, "", fmt.Errorf("file not found")
+		})
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected inspect error to fail closed")
+		}
+
+		// Boundary failure 2: non-regular file (e.g. directory / FIFO) fails closed
+		setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, false, rec.ExeSHA256, nil
+		})
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected non-regular file to fail closed")
+		}
+
+		// Boundary failure 3: zero device or inode fails closed
+		setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 0, 0, true, rec.ExeSHA256, nil
+		})
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected zero dev/ino to fail closed")
+		}
+
+		// Boundary failure 4: canonical path inside protected home fails closed
+		setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return "/Users/alice/bin/agentpulse", 10, 20, true, rec.ExeSHA256, nil
+		})
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected canonical path inside protected home to fail closed")
+		}
+
+		// Boundary failure 5: hash mismatch vs rec.ExeSHA256 fails closed
+		setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, "badhash111111111111111111111111111111111111111111111111111111111", nil
+		})
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected hash mismatch to fail closed")
+		}
+
+		// Boundary failure 6: nil inspector callback fails closed
+		setDarwinImageInspector(nil)
+		if _, err := resolveDarwinAllowedReads(rec, selfExe, homes); err == nil {
+			t.Fatal("expected nil inspector to fail closed")
+		}
+	})
+
+	t.Run("AtomicTwoConsumerProbeRaceContract", func(t *testing.T) {
+		clearDarwinRegistries()
+		defer clearDarwinRegistries()
+
+		restore := setDarwinImageInspector(func(exePath string) (string, uint64, uint64, bool, string, error) {
+			return path.Clean(exePath), 10, 20, true, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", nil
+		})
+		defer restore()
+
+		sentPath := "/private/tmp/agentpulse-sentinels/sentinel-race1"
+		if err := registerPendingDarwinSyntheticProbe(sentPath, 111, 222); err != nil {
+			t.Fatalf("registerPendingDarwinSyntheticProbe failed: %v", err)
+		}
+
+		recA := RunRecord{
+			RunID:       "run-race-aaaa11112222333344445555",
+			Root:        "/private/tmp/agentpulse-runs/run-race-aaaa11112222333344445555",
+			Nonce:       "nonce-race-aaaa111122223333444455",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			Sentinel:    sentPath,
+			SentinelDev: 111,
+			SentinelIno: 222,
+		}
+		recB := RunRecord{
+			RunID:       "run-race-bbbb11112222333344445555",
+			Root:        "/private/tmp/agentpulse-runs/run-race-bbbb11112222333344445555",
+			Nonce:       "nonce-race-bbbb111122223333444455",
+			ExeSHA256:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			Sentinel:    sentPath,
+			SentinelDev: 111,
+			SentinelIno: 222,
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = bindDarwinSyntheticProbe(recA.RunID, recA.Root, recA.Nonce, recA.Sentinel, recA.SentinelDev, recA.SentinelIno)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = bindDarwinSyntheticProbe(recB.RunID, recB.Root, recB.Nonce, recB.Sentinel, recB.SentinelDev, recB.SentinelIno)
+		}()
+		wg.Wait()
+
+		readsA, errResA := resolveDarwinAllowedReads(recA, "/usr/bin/agentpulse", nil)
+		readsB, errResB := resolveDarwinAllowedReads(recB, "/usr/bin/agentpulse", nil)
+		if errResA != nil || errResB != nil {
+			t.Fatalf("unexpected resolver error: errResA=%v errResB=%v", errResA, errResB)
+		}
+
+		winnerA := len(readsA) == 2
+		winnerB := len(readsB) == 2
+
+		// Exactly one winner must receive the probe grant!
+		if winnerA == winnerB {
+			t.Fatalf("race contract violation: expected exactly one winner, got winnerA=%v winnerB=%v", winnerA, winnerB)
+		}
+
+		// Stale proof from consumed probe cannot be used by a third run
+		recC := recA
+		recC.RunID = "run-race-cccc11112222333344445555"
+		recC.Nonce = "nonce-race-cccc111122223333444455"
+		readsC, errC := resolveDarwinAllowedReads(recC, "/usr/bin/agentpulse", nil)
+		if errC != nil || len(readsC) != 1 {
+			t.Fatalf("third run illegally obtained read permission for consumed sentinel: %v", readsC)
+		}
+
+		// Permanently burned on failed binding validation
+		burnedSent := "/private/tmp/agentpulse-sentinels/sentinel-burned1"
+		if err := registerPendingDarwinSyntheticProbe(burnedSent, 333, 444); err != nil {
+			t.Fatalf("register failed: %v", err)
+		}
+		// Attempt bind with mismatched Dev -> must fail
+		if err := bindDarwinSyntheticProbe(recA.RunID, recA.Root, recA.Nonce, burnedSent, 999, 444); err == nil {
+			t.Fatal("expected mismatched Dev to fail")
+		}
+		// Subsequent attempt even with correct Dev must fail because probe was consumed/burned
+		if err := bindDarwinSyntheticProbe(recA.RunID, recA.Root, recA.Nonce, burnedSent, 333, 444); err != nil {
+			t.Fatalf("unexpected error on already consumed probe: %v", err)
+		}
+		readsBurned, _ := resolveDarwinAllowedReads(RunRecord{
+			RunID: recA.RunID, Root: recA.Root, Nonce: recA.Nonce,
+			ExeSHA256: recA.ExeSHA256, Sentinel: burnedSent, SentinelDev: 333, SentinelIno: 444,
+		}, "/usr/bin/agentpulse", nil)
+		if len(readsBurned) != 1 {
+			t.Fatalf("burned probe illegally granted read permission: %v", readsBurned)
 		}
 	})
 }
