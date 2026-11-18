@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,21 +25,22 @@ import (
 )
 
 func main() {
-	execute := flag.Bool("execute", false, "run the chain in a private temp root")
+	execute := flag.Bool("execute", false, "run the chain in an exclusive root")
 	cliPath := flag.String("cli", "", "path to the agentpulse binary")
 	helperPath := flag.String("helper", "", "path to the agentpulse-test-helper binary")
 	evidencePath := flag.String("evidence", "", "path for the JSON evidence file")
+	rootPath := flag.String("root", "", "exclusive root directory for e2e run (must be under exclusive workspace)")
 	flag.Parse()
 
 	if !*execute {
 		fmt.Println(plan)
 		os.Exit(0)
 	}
-	if *cliPath == "" || *helperPath == "" || *evidencePath == "" {
-		fmt.Fprintln(os.Stderr, "--execute requires --cli, --helper, and --evidence")
+	if *cliPath == "" || *helperPath == "" || *evidencePath == "" || *rootPath == "" {
+		fmt.Fprintln(os.Stderr, "--execute requires --cli, --helper, --evidence, and --root")
 		os.Exit(2)
 	}
-	report, err := run(*cliPath, *helperPath)
+	report, err := run(*cliPath, *helperPath, *rootPath)
 	raw, mErr := json.MarshalIndent(report, "", "  ")
 	if mErr == nil {
 		_ = os.WriteFile(*evidencePath, append(raw, '\n'), 0o600)
@@ -54,17 +57,22 @@ broker: in-process MQTT 3.1.1, bind 127.0.0.1:0, no username, no service, no fir
 listen: agentpulse listen --config <root> --mqtt-url tcp://127.0.0.1:<port> --machine e2e-node --no-attach --max-concurrent-jobs 1 --status-file <root>/status.json
 dispatch: agentpulse dispatch --config <root> --mqtt-url <url> --machine e2e-node --job-id <id> --cwd <work> --repo synth/repo --project synth --force --wait --wait-timeout 20 --follow --env AGENTPULSE_TEST_ARGV_OUT=<file> -- <helper> stream <0|7>
 helper: stdout helper-stdout-1 / progress 25 / progress 80 / password=synthetic-secret; stderr helper-stderr-1; exit 0 then 7
-stop: SIGINT to the listen process this driver started
+stop: clean signal/interrupt to the listen process this driver started
 isolation: no --dangerously-skip-permissions, no AppContainer loopback exemption; non-danger child stays not_isolated
 `
 
 type evidence struct {
 	BrokerURL    string   `json:"broker_url"`
 	BrokerAddr   string   `json:"broker_addr"`
+	BrokerPort   int      `json:"broker_port"`
 	Root         string   `json:"root"`
 	RootRemoved  bool     `json:"root_removed"`
 	ListenerPID  int      `json:"listener_pid"`
 	ListenerExit int      `json:"listener_exit"`
+	ExitObserved bool     `json:"exit_observed"`
+	PIDs         []int    `json:"pids"`
+	Stdout       string   `json:"stdout"`
+	Stderr       string   `json:"stderr"`
 	Commands     []string `json:"commands"`
 	OK           jobProof `json:"exit_0"`
 	Fail         jobProof `json:"exit_7"`
@@ -94,7 +102,7 @@ type collector struct {
 	machine []model.Machine
 }
 
-func run(cliPath, helperPath string) (*evidence, error) {
+func run(cliPath, helperPath, root string) (*evidence, error) {
 	cliPath, err := filepath.Abs(cliPath)
 	if err != nil {
 		return nil, err
@@ -103,12 +111,17 @@ func run(cliPath, helperPath string) (*evidence, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.MkdirTemp("", "agentpulse-e2e-")
+	root, err = filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+
 	ev := &evidence{
-		Root: root,
+		Root:        root,
+		RootRemoved: false,
 		Permissions: []string{
 			"broker bind 127.0.0.1 ephemeral only",
 			"no service install, firewall, ACL, or route change",
@@ -126,11 +139,6 @@ func run(cliPath, helperPath string) (*evidence, error) {
 		}
 		if broker != nil {
 			_ = broker.Close()
-		}
-		if ev.Failures == nil && ev.ListenerExit == 0 {
-			if rmErr := os.RemoveAll(root); rmErr == nil {
-				ev.RootRemoved = true
-			}
 		}
 	}()
 
@@ -158,6 +166,11 @@ func run(cliPath, helperPath string) (*evidence, error) {
 		ev.Failures = append(ev.Failures, "broker is not 127.0.0.1")
 		return ev, fmt.Errorf("broker addr %s", ev.BrokerAddr)
 	}
+	if _, portStr, pErr := net.SplitHostPort(ev.BrokerAddr); pErr == nil {
+		if p, pErr2 := strconv.Atoi(portStr); pErr2 == nil {
+			ev.BrokerPort = p
+		}
+	}
 
 	cfgPath := filepath.Join(home, ".config", "agentpulse", "config.yaml")
 	cfgText := fmt.Sprintf("version: 1\nrev: 1\nmachine_id: e2e-node\nmax_concurrent_jobs: 1\nbroker:\n  url: %s\nagents:\n  - id: synth\n    path: %q\n    alias: [synth]\n    custom: true\n", ev.BrokerURL, helperPath)
@@ -183,8 +196,14 @@ func run(cliPath, helperPath string) (*evidence, error) {
 		"TMPDIR=" + tmp,
 		"TMP=" + tmp,
 		"TEMP=" + tmp,
-		"PATH=",
 	}
+	if v := os.Getenv("SystemRoot"); v != "" {
+		env = append(env, "SystemRoot="+v)
+	}
+	if v := os.Getenv("PATH"); v != "" {
+		env = append(env, "PATH="+v)
+	}
+
 	statusFile := filepath.Join(root, "status.json")
 	listenArgs := []string{
 		"listen",
@@ -203,10 +222,12 @@ func run(cliPath, helperPath string) (*evidence, error) {
 	listener.Dir = work
 	listener.Stdout = stdout
 	listener.Stderr = stderr
+	setupListenerSysProcAttr(listener)
 	if err := listener.Start(); err != nil {
 		return ev, err
 	}
 	ev.ListenerPID = listener.Process.Pid
+	ev.PIDs = append(ev.PIDs, ev.ListenerPID)
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -230,30 +251,50 @@ func run(cliPath, helperPath string) (*evidence, error) {
 	checkJob(ev, "exit_0", ev.OK, 0, "done")
 	checkJob(ev, "exit_7", ev.Fail, 7, "failed")
 
-	_ = listener.Process.Signal(os.Interrupt)
+	_ = stopListener(listener)
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- listener.Wait() }()
 	select {
 	case err := <-waitDone:
+		ev.ExitObserved = true
 		if err == nil {
 			ev.ListenerExit = 0
 		} else if ee, ok := err.(*exec.ExitError); ok {
 			ev.ListenerExit = ee.ExitCode()
+			if isCleanListenerExit(ev.ListenerExit) {
+				ev.ListenerExit = 0
+			}
 		} else {
 			ev.ListenerExit = 1
 			ev.Failures = append(ev.Failures, "listener wait: "+err.Error())
 		}
 	case <-time.After(5 * time.Second):
 		_ = listener.Process.Kill()
+		ev.ExitObserved = true
 		ev.ListenerExit = -1
-		ev.Failures = append(ev.Failures, "listener did not exit after SIGINT")
+		ev.Failures = append(ev.Failures, "listener did not exit after stop signal")
 	}
 	listener = nil
+
+	// Archive stdout/stderr logs into root
+	stdoutFile := filepath.Join(root, "listener.stdout.log")
+	stderrFile := filepath.Join(root, "listener.stderr.log")
+	_ = os.WriteFile(stdoutFile, []byte(stdout.String()), 0o600)
+	_ = os.WriteFile(stderrFile, []byte(stderr.String()), 0o600)
+	ev.Stdout = stdoutFile
+	ev.Stderr = stderrFile
+
+	// Verify all known PIDs are reclaimed
+	for _, pid := range ev.PIDs {
+		if pid > 0 && isProcessAlive(pid) {
+			ev.Failures = append(ev.Failures, fmt.Sprintf("PID %d is still alive", pid))
+		}
+	}
 
 	if len(ev.Failures) > 0 {
 		return ev, fmt.Errorf("%s", strings.Join(ev.Failures, "; "))
 	}
-	ev.Checks = append(ev.Checks, "broker 127.0.0.1", "listen subscribed", "exit 0 done", "exit 7 failed", "redaction", "ended_at", "argv")
+	ev.Checks = append(ev.Checks, "broker 127.0.0.1", "listen subscribed", "exit 0 done", "exit 7 failed", "redaction", "ended_at", "argv", "pids reclaimed")
 	return ev, nil
 }
 
@@ -381,7 +422,7 @@ func observe(url string, col *collector) paho.Client {
 	opts.SetDefaultPublishHandler(handler)
 	c := paho.NewClient(opts)
 	token := c.Connect()
-	if !token.WaitTimeout(5*time.Second) || token.Error() != nil {
+	if !token.WaitTimeout(5 * time.Second) || token.Error() != nil {
 		return c
 	}
 	topics := []string{
