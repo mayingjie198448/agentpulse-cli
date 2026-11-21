@@ -50,6 +50,10 @@ type Config struct {
 	JobID             string
 	Engine            model.EngineType // "agy" or "opencode"
 	Title             string
+	Repo              string
+	Project           string
+	Prompt            string
+	RequestedBy       string
 	Command           string
 	Args              []string
 	Cwd               string
@@ -65,15 +69,19 @@ type Config struct {
 	// ExplicitDanger opts this launch into skip-permissions mode.
 	// The daemon default is false. Opt-in still runs only inside verified
 	// OS write isolation; a failure does not retry without that isolation.
-	ExplicitDanger    bool
-	AuditPath         string
-	RealHome          string
-	SentinelPath      string
-	IsolationBackend  safety.Backend
+	ExplicitDanger   bool
+	AuditPath        string
+	RealHome         string
+	SentinelPath     string
+	IsolationBackend safety.Backend
+	// BaseEnviron, when non-nil, replaces os.Environ() before credential filtering.
+	// Nil keeps the production default: inherit the parent environment.
+	BaseEnviron       []string
 	KeepMachineOnline bool
 	StartedAt         time.Time
 	OnMQTTConnected   func()
 	OnExecute         func(cmdStr string)
+	OnProcessStart    func(pid int)
 }
 
 // Wrapper is the thin local process managing local agent execution, local status writing,
@@ -88,6 +96,11 @@ type Wrapper struct {
 	seq        int64
 	mqttClient paho.Client
 	ownsMQTT   bool
+
+	authFailed atomic.Bool
+	authErrMu  sync.Mutex
+	authErrMsg string
+	procCancel context.CancelFunc
 
 	heartbeatRunning bool
 	stopHeartbeat    chan struct{}
@@ -122,8 +135,29 @@ func New(cfg Config) (*Wrapper, error) {
 		cfg.JobID = generateJobID(cfg.Engine)
 	}
 
+	if cfg.Prompt == "" {
+		cfg.Prompt = ExtractPrompt(cfg.Args)
+	}
+	if cfg.Prompt != "" {
+		cfg.Prompt = SanitizePrompt(cfg.Prompt, DefaultMaxPromptLength)
+	}
+
 	if cfg.Title == "" {
-		cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		if cfg.Prompt != "" {
+			cfg.Title = SanitizePrompt(cfg.Prompt, 60)
+		} else {
+			cfg.Title = inferTitle(cfg.Args, cfg.Command)
+		}
+	} else {
+		cfg.Title = SanitizeTitle(cfg.Title, 100)
+	}
+
+	if cfg.Repo == "" && cfg.Project == "" {
+		cfg.Repo, cfg.Project = InferRepoAndProject(cfg.Cwd)
+	} else if cfg.Repo == "" {
+		cfg.Repo = cfg.Project
+	} else if cfg.Project == "" {
+		cfg.Project = cfg.Repo
 	}
 
 	if cfg.Command == "" && len(cfg.Args) > 0 {
@@ -153,16 +187,20 @@ func New(cfg Config) (*Wrapper, error) {
 	}
 
 	job := model.Job{
-		ID:        cfg.JobID,
-		MachineID: cfg.MachineID,
-		Engine:    cfg.Engine,
-		Status:    model.StatusRunning,
-		Progress:  0.0,
-		Cwd:       cfg.Cwd,
-		Command:   cfg.Command,
-		Title:     cfg.Title,
-		StartedAt: now,
-		UpdatedAt: now,
+		ID:          cfg.JobID,
+		MachineID:   cfg.MachineID,
+		Engine:      cfg.Engine,
+		Status:      model.StatusRunning,
+		Progress:    0.0,
+		Cwd:         cfg.Cwd,
+		Command:     SanitizeCommand(cfg.Command),
+		Title:       SanitizeTitle(cfg.Title, 100),
+		Repo:        cfg.Repo,
+		Project:     cfg.Project,
+		Prompt:      cfg.Prompt,
+		RequestedBy: cfg.RequestedBy,
+		StartedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	w := &Wrapper{
@@ -190,6 +228,19 @@ func (w *Wrapper) Job() model.Job {
 	return w.job
 }
 
+// PID returns the OS process ID of the running child process, or 0 if not running.
+func (w *Wrapper) PID() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pid
+}
+
+// Config returns a copy of the wrapper's configuration.
+// Callers use it to confirm child argv was not rewritten by redaction.
+func (w *Wrapper) Config() Config {
+	return w.cfg
+}
+
 // Run executes the wrapped process or stub, writes local status, and publishes MQTT telemetry.
 func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 	// Write initial local status snapshot (status: running, online: true, job_count: 1)
@@ -203,10 +254,11 @@ func (w *Wrapper) Run(ctx context.Context) (runErr error) {
 		w.mu.Lock()
 		finishTime := time.Now().UTC()
 		w.job.UpdatedAt = finishTime
+		w.job.EndedAt = finishTime
 		w.job.DurationStr = finishTime.Sub(w.job.StartedAt).Round(time.Second).String()
 		if runErr != nil {
 			w.job.Status = model.StatusFailed
-			w.job.Error = runErr.Error()
+			w.job.Error = RedactSecrets(runErr.Error())
 		} else {
 			w.job.Status = model.StatusDone
 			w.job.Progress = 100.0
@@ -397,6 +449,15 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 		return fmt.Errorf("command binary %q not found: %w", bin, err)
 	}
 
+	// Auth-failure cancel stops the child context. The child itself is still
+	// created only by safety.Prepare below; this does not restore a bare exec.
+	procCtx, procCancel := context.WithCancel(ctx)
+	defer procCancel()
+
+	w.mu.Lock()
+	w.procCancel = procCancel
+	w.mu.Unlock()
+
 	stdoutWriter := newLineWriter(func(line string) {
 		w.handleOutputLine(line, false)
 	}, w.cfg.MirrorStdout)
@@ -406,14 +467,18 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 	}, w.cfg.MirrorStderr)
 
 	// Every real child, including MQTT listener jobs and wrap, starts here.
-	cmdEnv := config.FilterChildProcessEnv(os.Environ())
+	parentEnv := os.Environ()
+	if w.cfg.BaseEnviron != nil {
+		parentEnv = w.cfg.BaseEnviron
+	}
+	cmdEnv := config.FilterChildProcessEnv(parentEnv)
 	if len(w.cfg.Env) > 0 {
 		for k, v := range w.cfg.Env {
 			cmdEnv = append(cmdEnv, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
 	cmdEnv = config.FilterChildProcessEnv(cmdEnv)
-	prepared, err := safety.Prepare(ctx, safety.Request{
+	prepared, err := safety.Prepare(procCtx, safety.Request{
 		Argv:           w.cfg.Args,
 		ExplicitDanger: w.cfg.ExplicitDanger,
 		Environ:        cmdEnv,
@@ -436,13 +501,29 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 	}
 
 	w.mu.Lock()
+	// PID comes from safety.Prepare's started child, not a pre-isolation exec.Cmd.
+	// OnProcessStart still records dispatch PIDs so bare attach does not claim them.
 	w.pid = prepared.Pid()
+	if w.pid > 0 && w.cfg.OnProcessStart != nil {
+		w.cfg.OnProcessStart(w.pid)
+	}
 	w.mu.Unlock()
 	_ = w.writeStatusFile()
 
 	_, err = prepared.Wait()
 	stdoutWriter.Flush()
 	stderrWriter.Flush()
+
+	if w.authFailed.Load() {
+		w.authErrMu.Lock()
+		msg := w.authErrMsg
+		w.authErrMu.Unlock()
+		if msg == "" {
+			msg = "Agent CLI 未登录认证 (检测到未登录状态，请先在目标节点运行 'agy' 登录)"
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
 	return err
 }
 
@@ -474,9 +555,91 @@ func (w *Wrapper) runStub(ctx context.Context) error {
 	return nil
 }
 
+// IsUnauthenticatedOutput detects output emitted when an agent CLI (e.g. agy) is unauthenticated
+// or blocked waiting for interactive OAuth approval in a non-interactive session.
+// Informational notices (such as using file-based token storage) and ordinary model/code outputs
+// are carefully distinguished to avoid false-positive kills.
+func IsUnauthenticatedOutput(line string) (bool, string) {
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+
+	// Explicitly ignore benign informational token storage notices
+	if strings.Contains(lower, "using file-based token storage") {
+		return false, ""
+	}
+
+	// 1. Antigravity specific unauthenticated errors
+	if strings.Contains(lower, "not logged into antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到 'Not logged into Antigravity'，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 2. Token source retrieval failure
+	if strings.Contains(lower, "error getting token source") || strings.Contains(lower, "failed to get token source") {
+		return true, "Agent CLI 未登录认证 (检测到 'error getting token source'，凭据源不可用，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 3. Headless non-interactive session cannot complete login
+	if strings.Contains(lower, "not logged in and no controlling terminal") {
+		return true, "Agent CLI 未登录认证 (检测到非交互终端无法完成登录，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 4. Interactive OAuth prompts blocking the process waiting for user input
+	if strings.Contains(lower, "paste the authorization code") ||
+		strings.Contains(lower, "copy the code displayed in the browser and paste it below") {
+		return true, "Agent CLI 未登录认证 (等待网页授权输入，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+	if strings.HasPrefix(lower, "waiting for authentication") ||
+		strings.Contains(lower, "waiting for authentication...") ||
+		strings.Contains(lower, "waiting for authentication (") {
+		return true, "Agent CLI 未登录认证 (等待网页授权，非交互式派发无法完成网页授权，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 5. Explicit sign-in prompts for agy
+	if strings.Contains(lower, "please sign in to view available models") ||
+		strings.Contains(lower, "please sign in to antigravity") ||
+		strings.Contains(lower, "sign in to antigravity") {
+		return true, "Agent CLI 未登录认证 (检测到需登录提示，请先在目标节点运行 'agy' 登录)"
+	}
+
+	// 6. Tightened "authentication required" prompt with URL / visit directive
+	if strings.Contains(lower, "authentication required") &&
+		(strings.Contains(lower, "visit the url") ||
+			strings.Contains(lower, "please visit") ||
+			strings.Contains(lower, "browser") ||
+			strings.Contains(lower, "antigravity")) {
+		return true, "Agent CLI 未登录认证 (检测到 'Authentication required'，请先在目标节点运行 'agy' 登录)"
+	}
+
+	return false, ""
+}
+
+func (w *Wrapper) handleAuthFailure(errMsg string) {
+	if w.authFailed.CompareAndSwap(false, true) {
+		w.authErrMu.Lock()
+		w.authErrMsg = errMsg
+		w.authErrMu.Unlock()
+
+		w.publishLog(model.LevelError, fmt.Sprintf("[agentpulse] 快速失败: %s", errMsg))
+
+		w.mu.Lock()
+		cancel := w.procCancel
+		w.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+	}
+}
+
 // handleOutputLine processes a single line emitted by the agent process.
 func (w *Wrapper) handleOutputLine(line string, isStderr bool) {
 	if strings.TrimSpace(line) == "" {
+		return
+	}
+
+	// Fail fast on unauthenticated / interactive OAuth prompts
+	if isUnauth, reason := IsUnauthenticatedOutput(line); isUnauth {
+		w.handleAuthFailure(reason)
 		return
 	}
 
@@ -532,6 +695,8 @@ func (w *Wrapper) publishJobStatus() {
 	j := w.job
 	w.mu.Unlock()
 
+	j = SanitizeJob(j)
+
 	topic := fmt.Sprintf("agentpulse/v1/machines/%s/jobs/%s/status", j.MachineID, j.ID)
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -568,7 +733,7 @@ func (w *Wrapper) publishLog(level model.LogLevel, message string) {
 		MachineID: machID,
 		Engine:    engine,
 		Level:     level,
-		Message:   TruncateLogMessage(message),
+		Message:   TruncateLogMessage(RedactSecrets(message)),
 		Seq:       seq,
 	}
 
@@ -586,7 +751,7 @@ func (w *Wrapper) publishAlert() {
 		return
 	}
 	w.mu.Lock()
-	j := w.job
+	j := SanitizeJob(w.job)
 	m := w.machine
 	w.mu.Unlock()
 
@@ -595,11 +760,16 @@ func (w *Wrapper) publishAlert() {
 		"machine_id":   m.ID,
 		"engine":       string(j.Engine),
 		"status":       string(j.Status),
+		"command":      j.Command,
 		"title":        j.Title,
+		"repo":         j.Repo,
+		"project":      j.Project,
+		"prompt":       j.Prompt,
 		"cwd":          j.Cwd,
 		"duration_str": j.DurationStr,
 		"started_at":   j.StartedAt.Format(time.RFC3339),
 		"finished_at":  j.UpdatedAt.Format(time.RFC3339),
+		"requested_by": j.RequestedBy,
 		"error":        j.Error,
 	}
 
@@ -623,7 +793,7 @@ func (w *Wrapper) writeStatusFile() error {
 	w.mu.Lock()
 	st := LocalStatus{
 		Machine:   w.machine,
-		Job:       w.job,
+		Job:       SanitizeJob(w.job),
 		PID:       w.pid,
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -841,20 +1011,17 @@ func GenerateCommandID() string {
 func InferTitle(args []string, command string) string {
 	for i, arg := range args {
 		if (arg == "-p" || arg == "--prompt" || arg == "--task") && i+1 < len(args) {
-			return args[i+1]
+			return SanitizeTitle(args[i+1], 60)
 		}
 		if strings.HasPrefix(arg, "--prompt=") {
-			return strings.TrimPrefix(arg, "--prompt=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--prompt="), 60)
 		}
 		if strings.HasPrefix(arg, "--task=") {
-			return strings.TrimPrefix(arg, "--task=")
+			return SanitizeTitle(strings.TrimPrefix(arg, "--task="), 60)
 		}
 	}
 	if command != "" {
-		if len(command) > 60 {
-			return command[:57] + "..."
-		}
-		return command
+		return SanitizeTitle(command, 60)
 	}
 	return "Agent pulse job"
 }
@@ -884,11 +1051,18 @@ func DetectLocalIP() string {
 	return "127.0.0.1"
 }
 
+// localIPDetector is DetectLocalIP unless a test replaces it.
+// Production calls still reach the UDP probe.
+var localIPDetector = DetectLocalIP
+
 func detectLocalIP() string {
-	return DetectLocalIP()
+	return localIPDetector()
 }
 
 // BuildCommandArgs normalizes command and arguments into an argument list for execution.
+// It removes any bare "--" argument that immediately follows the command binary
+// (e.g. "agy -- -p ..." -> ["agy", "-p", ...]), preventing engine CLIs from treating flags
+// as unexpected positional arguments.
 func BuildCommandArgs(command string, args []string) []string {
 	var parts []string
 	if strings.TrimSpace(command) != "" {
@@ -896,6 +1070,9 @@ func BuildCommandArgs(command string, args []string) []string {
 	}
 	if len(args) > 0 {
 		parts = append(parts, args...)
+	}
+	for len(parts) >= 2 && parts[1] == "--" {
+		parts = append(parts[:1], parts[2:]...)
 	}
 	return parts
 }

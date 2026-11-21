@@ -35,27 +35,47 @@ type RunRecord struct {
 	SentinelDev   uint64 `json:"sentinel_dev"`
 	SentinelIno   uint64 `json:"sentinel_ino"`
 	CreatedUnix   int64  `json:"created_unix"`
-	RegistryPath  string `json:"-"`
-	MarkerPath    string `json:"-"`
-	RegistryDir   string `json:"-"`
+	// ProfileName and PackageSID identify a Windows AppContainer profile.
+	// They are not secrets. Cleanup deletes that profile only.
+	ProfileName  string `json:"profile_name,omitempty"`
+	PackageSID   string `json:"package_sid,omitempty"`
+	ExePath      string `json:"exe_path,omitempty"`
+	RegistryPath string `json:"-"`
+	MarkerPath   string `json:"-"`
+	RegistryDir  string `json:"-"`
+}
+
+// createOpts is the input for one owned run root.
+type createOpts struct {
+	BaseDir     string
+	RegistryDir string
+	RealHome    string
+	Sentinel    string
+	ExeHash     string
+	ExePath     string
+	// Ownership is set only by mintCreation after this process creates the directory.
+	Ownership *CreationRecord
 }
 
 type profileIdentity struct {
-	RunID       string
-	ABI         int
-	AccessFS    uint64
-	Scoped      uint64
-	Root        string
-	Dev         uint64
-	Ino         uint64
-	Sentinel    string
-	SentinelDev uint64
-	SentinelIno uint64
+	RunID           string
+	ABI             int
+	AccessFS        uint64
+	Scoped          uint64
+	Root            string
+	Dev             uint64
+	Ino             uint64
+	Sentinel        string
+	SentinelDev     uint64
+	SentinelIno     uint64
+	ProfileName     string
+	PackageSID      string
+	CapabilityCount int
 }
 
 func profileHash(p profileIdentity) string {
-	s := fmt.Sprintf("v1\nrun=%s\nabi=%d\naccess_fs=%#x\nscoped=%#x\nroot=%s\ndev=%d\nino=%d\nsentinel=%s\nsentinel_dev=%d\nsentinel_ino=%d\nno_new_privs=1\n",
-		p.RunID, p.ABI, p.AccessFS, p.Scoped, p.Root, p.Dev, p.Ino, p.Sentinel, p.SentinelDev, p.SentinelIno)
+	s := fmt.Sprintf("v1\nrun=%s\nabi=%d\naccess_fs=%#x\nscoped=%#x\nroot=%s\ndev=%d\nino=%d\nsentinel=%s\nsentinel_dev=%d\nsentinel_ino=%d\nno_new_privs=1\nprofile=%s\npackage_sid=%s\ncaps=%d\n",
+		p.RunID, p.ABI, p.AccessFS, p.Scoped, p.Root, p.Dev, p.Ino, p.Sentinel, p.SentinelDev, p.SentinelIno, p.ProfileName, p.PackageSID, p.CapabilityCount)
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
@@ -157,13 +177,18 @@ func pathShapeError(path string) error {
 		return fmt.Errorf("%w: relative path", ErrCleanupBlocked)
 	}
 	clean := filepath.Clean(path)
-	if clean == "/" || clean == "." || clean == ".." {
+	vol := filepath.VolumeName(clean)
+	if clean == "/" || clean == `\` || clean == "." || clean == ".." || (vol != "" && (clean == vol || clean == vol+`\` || clean == vol+`/`)) {
 		return fmt.Errorf("%w: refuse %s", ErrCleanupBlocked, clean)
 	}
-	for _, part := range strings.Split(strings.TrimPrefix(clean, "/"), "/") {
+	for _, part := range splitPath(clean) {
 		if part == "" || part == "." || part == ".." {
 			return fmt.Errorf("%w: refuse component %q", ErrCleanupBlocked, part)
 		}
 	}
 	return nil
+}
+
+func splitPath(path string) []string {
+	return strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
 }

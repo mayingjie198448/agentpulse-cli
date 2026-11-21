@@ -51,3 +51,24 @@ func (m *Model) ConfirmDeleteForTest() bool {
 func (m *Model) DeleteErrorForTest() string {
 	return m.deleteError
 }
+
+// RefreshErrorForTest returns the current refresh error message for test assertions.
+func (m *Model) RefreshErrorForTest() string {
+	return m.refreshError
+}
+
+// GroupingForTest returns the current grouping mode for test assertions.
+func (m *Model) GroupingForTest() JobGrouping {
+	return m.grouping
+}
+
+// SetGroupingForTest sets the grouping mode for test assertions.
+func (m *Model) SetGroupingForTest(g JobGrouping) {
+	m.grouping = g
+	m.applyGrouping()
+}
+
+// SetJobsForTest sets the internal jobs slice for test fixtures.
+func (m *Model) SetJobsForTest(jobs []model.Job) {
+	m.jobs = jobs
+}

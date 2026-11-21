@@ -37,10 +37,37 @@ type ListenerConfig struct {
 	Quiet                      bool
 	Stdout                     io.Writer
 	Stderr                     io.Writer
+	MaxConcurrentJobs          int
 	OnMQTTConnected            func()
 	OnListening                func(topic string)
 	OnJobStart                 func(job model.Job)
 	OnJobComplete              func(job model.Job, err error)
+	// OnChildStart, when set, receives the child pid after Start returns.
+	// Nil does not change production launch or dispatch-pid tracking.
+	OnChildStart func(pid int)
+	// UseAgentConfigFile selects AgentConfigFile for executeJob.
+	// Production leaves it false and still calls LoadConfig("") (the default path).
+	UseAgentConfigFile bool
+	AgentConfigFile    string
+	// BaseEnviron, when non-nil, is passed to each child instead of os.Environ().
+	// Nil keeps production inheritance. The filter still removes broker secrets.
+	BaseEnviron []string
+
+	// Bare agent process attach options
+	DisableBareAttach      bool
+	AttachScanInterval     time.Duration
+	Agents                 []config.AgentConfig
+	ProcessLister          ProcessLister
+	IsProcessAlive         func(pid int) bool
+	ProcessExitChecker     func(pid int) (exitCode int, ok bool)
+	ReliableSuccessChecker func(pid int) bool
+	PIDAllowlist           []int
+	PIDFilter              func(pid int) bool
+	AgyLogDir              string
+	AgyBrainDir            string
+	OpenCodeLogDir         string
+	StartTimeResolver      func(pid int) time.Time
+	CwdResolver            func(pid int) string
 }
 
 var jobIDRegex = regexp.MustCompile(`"job_id"\s*:\s*"([^"]+)"`)
@@ -93,14 +120,16 @@ func (d *commandDeduplicator) SeenOrAdd(commandID string) bool {
 }
 
 // Listener is the background daemon that listens for dispatch commands over MQTT,
-// manages node heartbeats and LWT, and executes jobs serially via thin wrapper runs.
+// manages node heartbeats and LWT, and executes jobs concurrently up to MaxConcurrentJobs.
 //
 // Concurrency design:
-// Jobs are queued and executed serially (one job at a time) to prevent resource contention
-// and conflicting workspace file mutations across autonomous agent invocations.
+// By default MaxConcurrentJobs is 1 for backwards compatibility. When configured > 1,
+// multiple jobs can execute concurrently in isolated worker goroutines. Additional incoming
+// jobs remain in QUEUED status in the dispatch buffer until a concurrency slot becomes available.
 type Listener struct {
 	cfg        ListenerConfig
 	mu         sync.Mutex
+	logMu      sync.Mutex
 	machine    model.Machine
 	mqttClient paho.Client
 	ownsMQTT   bool
@@ -108,12 +137,16 @@ type Listener struct {
 	stopped    atomic.Bool
 	stopCh     chan struct{}
 
-	executingJob atomic.Bool
-	dedup        *commandDeduplicator
+	runningJobs atomic.Int32
+	dedup       *commandDeduplicator
 
 	heartbeatRunning bool
 	stopHeartbeat    chan struct{}
 	heartbeatDone    chan struct{}
+
+	attachMgr    *AttachManager
+	pidsMu       sync.Mutex
+	dispatchPIDs map[int]bool
 }
 
 // NewListener initializes a new Listener instance.
@@ -132,6 +165,9 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	if cfg.StatusFile == "" {
 		cfg.StatusFile = DefaultStatusFile
 	}
+	if cfg.MaxConcurrentJobs <= 0 {
+		cfg.MaxConcurrentJobs = 1
+	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
 	}
@@ -146,11 +182,11 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		Online:        true,
 		LastHeartbeat: now,
 		Platform:      fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		IP:            DetectLocalIP(),
+		IP:            detectLocalIP(),
 		JobCount:      0,
 	}
 
-	return &Listener{
+	l := &Listener{
 		cfg:           cfg,
 		machine:       machine,
 		dispatchCh:    make(chan model.DispatchCommand, 64),
@@ -158,14 +194,93 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		stopHeartbeat: make(chan struct{}),
 		heartbeatDone: make(chan struct{}),
 		dedup:         newCommandDeduplicator(15 * time.Minute),
-	}, nil
+		dispatchPIDs:  make(map[int]bool),
+	}
+
+	// An empty allowlist must not start the default full-table lister.
+	// Injected ProcessLister remains the caller's seam. Windows still has no
+	// native process backend; this gate does not add one.
+	if !cfg.DisableBareAttach && cfg.ProcessLister == nil && !listenerHasExplicitAllowlist(cfg) {
+		cfg.DisableBareAttach = true
+	}
+
+	if !cfg.DisableBareAttach {
+		agents := cfg.Agents
+		if len(agents) == 0 {
+			if fileCfg, err := config.LoadConfig(""); err == nil && len(fileCfg.Agents) > 0 {
+				agents = fileCfg.Agents
+			} else {
+				agents = config.DefaultAgents()
+			}
+		}
+
+		attachCfg := AttachManagerConfig{
+			MachineID:              cfg.MachineID,
+			Agents:                 agents,
+			ScanInterval:           cfg.AttachScanInterval,
+			ProcessLister:          cfg.ProcessLister,
+			IsProcessAlive:         cfg.IsProcessAlive,
+			ProcessExitChecker:     cfg.ProcessExitChecker,
+			ReliableSuccessChecker: cfg.ReliableSuccessChecker,
+			PIDAllowlist:           cfg.PIDAllowlist,
+			PIDFilter:              cfg.PIDFilter,
+			AgyLogDir:              cfg.AgyLogDir,
+			AgyBrainDir:            cfg.AgyBrainDir,
+			OpenCodeLogDir:         cfg.OpenCodeLogDir,
+			StatusFile:             cfg.StatusFile,
+			Quiet:                  cfg.Quiet,
+			Stdout:                 cfg.Stdout,
+			Stderr:                 cfg.Stderr,
+			StartTimeResolver:      cfg.StartTimeResolver,
+			CwdResolver:            cfg.CwdResolver,
+			IsDispatchPID: func(pid int) bool {
+				l.pidsMu.Lock()
+				defer l.pidsMu.Unlock()
+				return l.dispatchPIDs[pid]
+			},
+			OnJobCountChange: func() {
+				l.mu.Lock()
+				l.machine.JobCount = l.currentJobCount()
+				l.mu.Unlock()
+				l.publishMachineStatus()
+			},
+		}
+		l.attachMgr = NewAttachManager(attachCfg)
+	}
+
+	return l, nil
 }
 
-// currentJobCount returns the number of currently running jobs (0 or 1) + jobs queued in dispatchCh.
+// listenerHasExplicitAllowlist reports a caller-named PID set from config or
+// AGENTPULSE_ATTACH_PID_ALLOWLIST. An empty result must not become a global scan.
+func listenerHasExplicitAllowlist(cfg ListenerConfig) bool {
+	for _, pid := range cfg.PIDAllowlist {
+		if pid > 0 {
+			return true
+		}
+	}
+	envPIDs := strings.TrimSpace(os.Getenv("AGENTPULSE_ATTACH_PID_ALLOWLIST"))
+	if envPIDs == "" {
+		return false
+	}
+	for _, pid := range ParsePIDAllowlist(envPIDs) {
+		if pid > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// AttachManager returns the listener's bare process attach manager instance, if enabled.
+func (l *Listener) AttachManager() *AttachManager {
+	return l.attachMgr
+}
+
+// currentJobCount returns queued dispatch jobs, the worker-pool running count, and bare attached jobs.
 func (l *Listener) currentJobCount() int {
-	count := len(l.dispatchCh)
-	if l.executingJob.Load() {
-		count++
+	count := len(l.dispatchCh) + int(l.runningJobs.Load())
+	if l.attachMgr != nil {
+		count += l.attachMgr.ActiveCount()
 	}
 	return count
 }
@@ -186,18 +301,37 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 			cmdStr = cmdStr + " " + strings.Join(cmd.Args, " ")
 		}
 	}
-	job := model.Job{
-		ID:        cmd.JobID,
-		MachineID: l.cfg.MachineID,
-		Engine:    cmd.Engine,
-		Status:    model.StatusQueued,
-		Progress:  0.0,
-		Cwd:       cmd.Cwd,
-		Command:   cmdStr,
-		Title:     cmd.Title,
-		StartedAt: now,
-		UpdatedAt: now,
+	title := cmd.Title
+	if title == "" && cmdStr != "" {
+		title = InferTitle(cmd.Args, cmdStr)
 	}
+	repo := cmd.Repo
+	project := cmd.Project
+	if repo == "" && project == "" && cmd.Cwd != "" {
+		repo, project = InferRepoAndProject(cmd.Cwd)
+	} else if repo == "" {
+		repo = project
+	} else if project == "" {
+		project = repo
+	}
+
+	job := model.Job{
+		ID:          cmd.JobID,
+		MachineID:   l.cfg.MachineID,
+		Engine:      cmd.Engine,
+		Status:      model.StatusQueued,
+		Progress:    0.0,
+		Cwd:         cmd.Cwd,
+		Command:     cmdStr,
+		Title:       title,
+		Repo:        repo,
+		Project:     project,
+		Prompt:      cmd.Prompt,
+		RequestedBy: cmd.RequestedBy,
+		StartedAt:   now,
+		UpdatedAt:   now,
+	}
+	job = SanitizeJob(job)
 	topic := mqtt.JobStatusTopic(l.cfg.MachineID, cmd.JobID)
 	data, err := json.Marshal(job)
 	if err != nil {
@@ -207,26 +341,54 @@ func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
 	token.WaitTimeout(2 * time.Second)
 }
 
-func (l *Listener) publishJobFailed(jobID string, engine model.EngineType, cwd, command, title, errMsg string) {
-	if l.mqttClient == nil || !l.mqttClient.IsConnected() || jobID == "" {
+func (l *Listener) publishJobFailed(cmd model.DispatchCommand, errMsg string) {
+	if l.mqttClient == nil || !l.mqttClient.IsConnected() || cmd.JobID == "" {
 		return
 	}
 	now := time.Now().UTC()
+	cmdStr := strings.TrimSpace(cmd.Command)
+	if len(cmd.Args) > 0 {
+		if cmdStr == "" {
+			cmdStr = strings.Join(cmd.Args, " ")
+		} else {
+			cmdStr = cmdStr + " " + strings.Join(cmd.Args, " ")
+		}
+	}
+	title := cmd.Title
+	if title == "" && cmdStr != "" {
+		title = InferTitle(cmd.Args, cmdStr)
+	}
+	repo := cmd.Repo
+	project := cmd.Project
+	if repo == "" && project == "" && cmd.Cwd != "" {
+		repo, project = InferRepoAndProject(cmd.Cwd)
+	} else if repo == "" {
+		repo = project
+	} else if project == "" {
+		project = repo
+	}
+
 	job := model.Job{
-		ID:          jobID,
+		ID:          cmd.JobID,
 		MachineID:   l.cfg.MachineID,
-		Engine:      engine,
+		Engine:      cmd.Engine,
 		Status:      model.StatusFailed,
 		Progress:    0.0,
-		Cwd:         cwd,
-		Command:     command,
+		Cwd:         cmd.Cwd,
+		Command:     cmdStr,
 		Title:       title,
+		Repo:        repo,
+		Project:     project,
+		Prompt:      cmd.Prompt,
+		RequestedBy: cmd.RequestedBy,
 		StartedAt:   now,
 		UpdatedAt:   now,
+		EndedAt:     now,
 		DurationStr: "0s",
 		Error:       errMsg,
 	}
-	topic := mqtt.JobStatusTopic(l.cfg.MachineID, jobID)
+	job = SanitizeJob(job)
+	topic := mqtt.JobStatusTopic(l.cfg.MachineID, cmd.JobID)
 	data, err := json.Marshal(job)
 	if err != nil {
 		return
@@ -278,6 +440,10 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 	}
 
 	defer func() {
+		if l.attachMgr != nil {
+			l.attachMgr.Stop()
+		}
+
 		l.stopHeartbeatLoop()
 
 		// Publish final offline status
@@ -298,6 +464,11 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 	// Publish initial online status
 	l.publishMachineStatus()
 
+	if l.attachMgr != nil {
+		l.attachMgr.SetMQTTClient(l.mqttClient)
+		l.attachMgr.Start(ctx)
+	}
+
 	// Start periodic heartbeat loop
 	l.startHeartbeatLoop()
 
@@ -315,24 +486,32 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 		l.cfg.OnListening(dispatchTopic)
 	}
 
-	// Worker loop: process incoming dispatch commands serially
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-l.stopCh:
-				return
-			case cmd, ok := <-l.dispatchCh:
-				if !ok {
+	// Worker pool: process incoming dispatch commands concurrently up to MaxConcurrentJobs
+	concurrency := l.cfg.MaxConcurrentJobs
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case <-l.stopCh:
+					return
+				case cmd, ok := <-l.dispatchCh:
+					if !ok {
+						return
+					}
+					l.executeJob(ctx, cmd)
 				}
-				l.executeJob(ctx, cmd)
 			}
-		}
-	}()
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -342,7 +521,7 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 	}
 
 	l.stopped.Store(true)
-	<-workerDone
+	workerWg.Wait()
 
 	return runErr
 }
@@ -351,6 +530,9 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 func (l *Listener) Stop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.attachMgr != nil {
+		l.attachMgr.Stop()
+	}
 	select {
 	case <-l.stopCh:
 	default:
@@ -432,7 +614,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		l.logError(fmt.Sprintf("[agentpulse listener] rejected malformed dispatch payload: %v", err))
 		jobID := extractJobIDFromPayload(msg.Payload())
 		if jobID != "" {
-			l.publishJobFailed(jobID, "", "", "", "", fmt.Sprintf("rejected malformed dispatch payload: %v", err))
+			l.publishJobFailed(model.DispatchCommand{JobID: jobID}, fmt.Sprintf("rejected malformed dispatch payload: %v", err))
 		}
 		return
 	}
@@ -442,7 +624,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		errMsg := "rejected invalid dispatch: command is empty"
 		l.logError("[agentpulse listener] " + errMsg)
 		if cmd.JobID != "" {
-			l.publishJobFailed(cmd.JobID, cmd.Engine, cmd.Cwd, "", cmd.Title, errMsg)
+			l.publishJobFailed(cmd, errMsg)
 		}
 		return
 	}
@@ -478,7 +660,7 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 		errMsg := fmt.Sprintf("rejected dispatch: serial execution queue is full (64) for command %s", cmd.CommandID)
 		l.logError(fmt.Sprintf("[agentpulse listener] %s", errMsg))
 		if cmd.JobID != "" {
-			l.publishJobFailed(cmd.JobID, cmd.Engine, cmd.Cwd, cmd.Command, cmd.Title, errMsg)
+			l.publishJobFailed(cmd, errMsg)
 		}
 	}
 }
@@ -486,8 +668,15 @@ func (l *Listener) handleDispatchMessage(_ paho.Client, msg paho.Message) {
 // executeJob executes a single dispatch command via wrapper.Run.
 func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	args := BuildCommandArgs(cmd.Command, cmd.Args)
-	if len(args) > 0 {
-		fileCfg, _ := config.LoadConfig("")
+	// Stub never executes the command, so it must not read the user config
+	// file to rewrite that argv. The non-stub path still resolves the binary
+	// and still reaches safety.Prepare inside wrapper.Run.
+	if len(args) > 0 && !l.cfg.Stub {
+		cfgPath := ""
+		if l.cfg.UseAgentConfigFile {
+			cfgPath = l.cfg.AgentConfigFile
+		}
+		fileCfg, _ := config.LoadConfig(cfgPath)
 		resolved := config.ResolveAgentBinary(fileCfg, args[0])
 		if resolved != "" {
 			args[0] = resolved
@@ -516,8 +705,7 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		jobCtx = timeoutCtx
 	}
 
-	l.executingJob.Store(true)
-	defer l.executingJob.Store(false)
+	l.runningJobs.Add(1)
 
 	// Update machine job count (running + queued)
 	l.mu.Lock()
@@ -537,9 +725,14 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 		JobID:             cmd.JobID,
 		Engine:            cmd.Engine,
 		Title:             cmd.Title,
+		Repo:              cmd.Repo,
+		Project:           cmd.Project,
+		Prompt:            cmd.Prompt,
+		RequestedBy:       cmd.RequestedBy,
 		Args:              args,
 		Cwd:               cmd.Cwd,
 		Env:               cmd.Env,
+		BaseEnviron:       l.cfg.BaseEnviron,
 		StatusFile:        l.cfg.StatusFile,
 		HeartbeatInterval: l.cfg.HeartbeatInterval,
 		MQTTClient:        l.mqttClient,
@@ -559,12 +752,22 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 				l.log(fmt.Sprintf("[agentpulse listener] executing: %s", cmdStr))
 			}
 		},
+		OnProcessStart: func(pid int) {
+			l.pidsMu.Lock()
+			l.dispatchPIDs[pid] = true
+			l.pidsMu.Unlock()
+			if l.cfg.OnChildStart != nil {
+				l.cfg.OnChildStart(pid)
+			}
+		},
 	})
 	if err != nil {
 		l.logError(fmt.Sprintf("[agentpulse listener] failed to initialize wrapper for job %s: %v", cmd.JobID, err))
-		l.executingJob.Store(false)
+		l.publishJobFailed(cmd, fmt.Sprintf("failed to initialize wrapper: %v", err))
+		l.runningJobs.Add(-1)
 		l.mu.Lock()
 		l.machine.JobCount = l.currentJobCount()
+		l.machine.LastHeartbeat = time.Now().UTC()
 		l.mu.Unlock()
 		l.publishMachineStatus()
 		return
@@ -576,17 +779,21 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 
 	runErr := w.Run(jobCtx)
 
-	if l.cfg.OnJobComplete != nil {
-		l.cfg.OnJobComplete(w.Job(), runErr)
+	if pid := w.PID(); pid > 0 {
+		l.pidsMu.Lock()
+		delete(l.dispatchPIDs, pid)
+		l.pidsMu.Unlock()
 	}
-
-	// Update machine job count based on remaining queue
-	l.executingJob.Store(false)
+	l.runningJobs.Add(-1)
 	l.mu.Lock()
 	l.machine.JobCount = l.currentJobCount()
 	l.machine.LastHeartbeat = time.Now().UTC()
 	l.mu.Unlock()
 	l.publishMachineStatus()
+
+	if l.cfg.OnJobComplete != nil {
+		l.cfg.OnJobComplete(w.Job(), runErr)
+	}
 
 	if !l.cfg.Quiet {
 		if runErr == nil {
@@ -670,12 +877,16 @@ func (l *Listener) publishMachineStatus() {
 
 func (l *Listener) log(msg string) {
 	if l.cfg.Stdout != nil {
+		l.logMu.Lock()
+		defer l.logMu.Unlock()
 		fmt.Fprintln(l.cfg.Stdout, msg)
 	}
 }
 
 func (l *Listener) logError(msg string) {
 	if l.cfg.Stderr != nil {
+		l.logMu.Lock()
+		defer l.logMu.Unlock()
 		fmt.Fprintln(l.cfg.Stderr, msg)
 	}
 }

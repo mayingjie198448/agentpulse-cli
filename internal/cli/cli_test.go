@@ -2,18 +2,37 @@ package cli_test
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/spf13/cobra"
 )
 
+func TestMain(m *testing.M) {
+	tmpHome, err := os.MkdirTemp("", "agentpulse-cli-test-home-*")
+	if err == nil {
+		_ = os.Setenv("HOME", tmpHome)
+		_ = os.Setenv("USERPROFILE", tmpHome)
+		_ = os.Setenv("XDG_CONFIG_HOME", tmpHome)
+		_ = os.Setenv("APPDATA", filepath.Join(tmpHome, "AppData", "Roaming"))
+		_ = os.Setenv("LOCALAPPDATA", filepath.Join(tmpHome, "AppData", "Local"))
+		defer os.RemoveAll(tmpHome)
+	}
+	os.Exit(m.Run())
+}
+
 func TestRootCommands(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	tests := []struct {
 		name      string
 		args      []string
@@ -158,6 +177,112 @@ func TestDoctorCommand_Output(t *testing.T) {
 		out := buf.String()
 		if !strings.Contains(out, "[-] test-disabled") {
 			t.Errorf("expected disabled agent marker '[-] test-disabled', got: %s", out)
+		}
+	})
+}
+
+func TestDoctorCommand_ExplicitPath_Regressions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping shell script mock test on windows")
+	}
+
+	createMockScript := func(t *testing.T, content string) string {
+		tmpDir := t.TempDir()
+		scriptPath := filepath.Join(tmpDir, "mock-agy")
+		script := fmt.Sprintf("#!/bin/sh\n%s\n", content)
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write mock script: %v", err)
+		}
+		return scriptPath
+	}
+
+	runDoctorWithAgentPath := func(t *testing.T, binPath string) string {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "config.yaml")
+		cfg := &config.Config{
+			Version:   1,
+			MachineID: "test-doctor-node",
+			Broker: config.BrokerConfig{
+				URL: "tcp://127.0.0.1:18833",
+			},
+			Agents: []config.AgentConfig{
+				{
+					ID:    "agy",
+					Alias: []string{"agy"},
+					Path:  binPath,
+				},
+			},
+		}
+		_ = config.SaveConfig(cfgPath, cfg)
+
+		cmd := cli.NewRootCmd()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"doctor", "--config", cfgPath})
+
+		_ = cmd.Execute()
+		return buf.String()
+	}
+
+	t.Run("explicit path unauthenticated shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "Please sign in to view available models"; exit 1`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for unauthenticated explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for unauthenticated explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path error exit shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "connection reset by peer"; exit 2`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for error explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for error explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path timeout shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `sleep 1; exit 0`)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		// Also verify via ProbeAgentContext that timeout status is generated
+		st := config.ProbeAgentContext(ctx, config.AgentConfig{
+			ID:   "agy",
+			Path: bin,
+		})
+		if st.Ok {
+			t.Errorf("ProbeAgentContext must return Ok=false on timeout, got Ok=true")
+		}
+		if !strings.Contains(st.Detail, "超时") {
+			t.Errorf("expected detail mentioning 超时, got %q", st.Detail)
+		}
+	})
+
+	t.Run("explicit path unknown two-word output shows [✗] and not [✓]", func(t *testing.T) {
+		bin := createMockScript(t, `echo "service temporarily unavailable"; exit 0`)
+		out := runDoctorWithAgentPath(t, bin)
+		if strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must NOT show [✓] agy for unknown two-word explicit path, got:\n%s", out)
+		}
+		if !strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must show [✗] agy for unknown two-word explicit path, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit path valid model list shows [✓] agy", func(t *testing.T) {
+		bin := createMockScript(t, `echo "gemini-3.8-flash-high Gemini 3.8 Flash (High)"; exit 0`)
+		out := runDoctorWithAgentPath(t, bin)
+		if !strings.Contains(out, "[✓] agy") {
+			t.Errorf("doctor must show [✓] agy for valid model explicit path, got:\n%s", out)
+		}
+		if strings.Contains(out, "[✗] agy") {
+			t.Errorf("doctor must NOT show [✗] agy for valid model explicit path, got:\n%s", out)
 		}
 	})
 }
@@ -1089,6 +1214,7 @@ func TestRootCommand_050ProductBoundaries(t *testing.T) {
 }
 
 func TestJobsCommand_RequiresBroker(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	for _, args := range [][]string{{"jobs"}, {"jobs", "--json"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			cmd := cli.NewRootCmd()
@@ -1271,6 +1397,116 @@ func TestJobsDeleteCommand_StructureAndHelp(t *testing.T) {
 	for _, expected := range []string{"delete <job-id>", "清除该任务的保留状态", "--force", "-y"} {
 		if !strings.Contains(helpOut, expected) {
 			t.Errorf("expected help output to contain %q, got:\n%s", expected, helpOut)
+		}
+	}
+}
+
+func TestAutostartCommand_CLI(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"autostart", "status"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("failed to execute autostart status: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "AgentPulse 开机自启常驻状态") {
+		t.Errorf("expected autostart header, got:\n%s", out)
+	}
+	if !strings.Contains(out, "LaunchAgent") {
+		t.Errorf("expected LaunchAgent mention, got:\n%s", out)
+	}
+
+	// Test config autostart status
+	buf.Reset()
+	cmd = cli.NewRootCmd()
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"config", "autostart", "status"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("failed to execute config autostart status: %v", err)
+	}
+	if !strings.Contains(buf.String(), "AgentPulse 开机自启常驻状态") {
+		t.Errorf("expected config autostart status output, got:\n%s", buf.String())
+	}
+}
+
+func TestDoctorCommand_AutostartDisplay(t *testing.T) {
+	cleanup := autostart.SetTestOverrides(t.TempDir(), t.TempDir(), func(name string, args ...string) *exec.Cmd {
+		return exec.Command("true")
+	})
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+	confPath := filepath.Join(tmpDir, "config.yaml")
+
+	cfg := &config.Config{
+		Version:   1,
+		MachineID: "doctor-box",
+		Autostart: true,
+	}
+	if err := config.SaveConfig(confPath, cfg); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	cmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"doctor", "--config", confPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("doctor failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "开机自启 (LaunchAgent)") {
+		t.Errorf("expected doctor output to show autostart status, got:\n%s", out)
+	}
+}
+
+func TestJobsCommand_FlagsAndHelp(t *testing.T) {
+	rootCmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"jobs", "--help"})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("failed to execute jobs --help: %v", err)
+	}
+
+	out := buf.String()
+	for _, expected := range []string{"--group-by", "--json", "项目/仓库名", "状态", "开始时间"} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("expected jobs --help to contain %q, got:\n%s", expected, out)
+		}
+	}
+}
+
+func TestDispatchCommand_ExtendedFlags(t *testing.T) {
+	rootCmd := cli.NewRootCmd()
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"dispatch", "--help"})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("failed to execute dispatch --help: %v", err)
+	}
+
+	out := buf.String()
+	for _, expected := range []string{"--repo", "--project", "--prompt", "-p"} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("expected dispatch --help to contain flag %q, got:\n%s", expected, out)
 		}
 	}
 }

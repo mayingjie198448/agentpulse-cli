@@ -1,8 +1,11 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package safety
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func verifyAndProbe(cfg reexecCfg) error {
 	return fmt.Errorf("landlock_failed")

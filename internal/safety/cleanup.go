@@ -1,6 +1,7 @@
 package safety
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -23,8 +24,18 @@ type CleanupOptions struct {
 // The target path is read from the registry this process wrote at creation.
 // HOME and USERPROFILE are not consulted.
 func CleanupRun(runID string, opts CleanupOptions) (CleanupOutcome, error) {
+	if !runIDRe.MatchString(runID) {
+		out := CleanupOutcome{Result: "BLOCKED", Reason: "run id is not a recorded identifier"}
+		_ = AppendAudit(opts.AuditPath, cleanupAudit(RunRecord{}, out, opts.RealHome))
+		return out, fmt.Errorf("%w: %s", ErrCleanupBlocked, out.Reason)
+	}
 	rec, err := loadRegistry(opts.RegistryDir, runID)
 	if err != nil {
+		if man, merr := loadManifest(opts.RegistryDir, runID); merr == nil {
+			out, rerr := manifestRecovery(man)
+			_ = AppendAudit(opts.AuditPath, cleanupAudit(RunRecord{RunID: man.RunID, Root: man.Root, ProfileName: man.ProfileName, Home: ""}, out, opts.RealHome))
+			return out, rerr
+		}
 		out := CleanupOutcome{Result: "BLOCKED", Reason: err.Error()}
 		_ = AppendAudit(opts.AuditPath, cleanupAudit(rec, out, opts.RealHome))
 		return out, err
