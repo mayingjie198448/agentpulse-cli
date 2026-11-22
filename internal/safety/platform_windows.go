@@ -4,15 +4,20 @@ package safety
 
 import "fmt"
 
-// windowsBackend refuses danger and confined launches.
-// Redirecting HOME, USERPROFILE, APPDATA, or TEMP is not OS write isolation.
-// Junction and reparse cleanup is BLOCKED on this platform.
-type windowsBackend struct{}
+// appContainerBackend is a LowBox AppContainer with zero capabilities.
+// Available only means the documented userenv/kernel32 entry points load.
+// It does not mean a native fixture has passed. Cross-compiling this package
+// is not a Windows pass. Prepare still refuses before the user command if
+// profile creation or the fresh sentinel probe fails.
+type appContainerBackend struct{}
 
-func (windowsBackend) Name() string { return "windows-unavailable" }
+func (appContainerBackend) Name() string { return "windows-appcontainer" }
 
-func (windowsBackend) Available() error {
-	return fmt.Errorf("%w: Windows write isolation and reparse-point cleanup are BLOCKED", ErrBackendUnavailable)
+func (appContainerBackend) Available() error {
+	if err := appContainerProcs(); err != nil {
+		return fmt.Errorf("%w: %s", ErrBackendUnavailable, err)
+	}
+	return nil
 }
 
-func platformBackend() Backend { return windowsBackend{} }
+func platformBackend() Backend { return appContainerBackend{} }

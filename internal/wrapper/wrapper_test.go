@@ -2,6 +2,7 @@ package wrapper_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1033,5 +1034,495 @@ func TestListener_MachineIdentityDefaults(t *testing.T) {
 	}
 	if l2.Machine().ID != "worker-node-beta" {
 		t.Errorf("expected sanitized ID 'worker-node-beta', got %q", l2.Machine().ID)
+	}
+}
+
+func TestBuildCommandArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		command  string
+		args     []string
+		expected []string
+	}{
+		{
+			name:     "bare -- following binary is stripped",
+			command:  "agy",
+			args:     []string{"--", "-p", "hello world"},
+			expected: []string{"agy", "-p", "hello world"},
+		},
+		{
+			name:     "bare -- in command string is stripped",
+			command:  "agy -- -p",
+			args:     []string{"hello"},
+			expected: []string{"agy", "-p", "hello"},
+		},
+		{
+			name:     "no bare -- untouched",
+			command:  "agy",
+			args:     []string{"-p", "hello"},
+			expected: []string{"agy", "-p", "hello"},
+		},
+		{
+			name:     "git checkout with -- untouched",
+			command:  "git",
+			args:     []string{"checkout", "--", "main"},
+			expected: []string{"git", "checkout", "--", "main"},
+		},
+		{
+			name:     "empty command with args",
+			command:  "",
+			args:     []string{"agy", "--", "-p", "test"},
+			expected: []string{"agy", "-p", "test"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wrapper.BuildCommandArgs(tt.command, tt.args)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("length mismatch: got %v, expected %v", got, tt.expected)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("item %d mismatch: got %q, expected %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIsUnauthenticatedOutput(t *testing.T) {
+	unauthLines := []string{
+		"Singleflight refresh failed: error getting token source: You are not logged into Antigravity.",
+		"Please sign in to view available models",
+		"Authentication required. Please visit the URL to log in",
+		"Waiting for authentication...",
+		"Waiting for authentication (timeout 60s)...",
+		"Paste the authorization code here and press Enter",
+		"Then paste the authorization code, or the full URL of the page you land on, and press Enter:",
+		"Print mode: not logged in and no controlling terminal; cannot complete interactive login",
+		"you are not logged into Antigravity",
+	}
+
+	for _, line := range unauthLines {
+		isUnauth, reason := wrapper.IsUnauthenticatedOutput(line)
+		if !isUnauth {
+			t.Errorf("expected %q to be detected as unauthenticated", line)
+		}
+		if !strings.Contains(reason, "未登录") {
+			t.Errorf("expected Chinese reason containing '未登录', got %q", reason)
+		}
+	}
+
+	// Normal informational notices and common model text that must NOT trigger auth failure
+	normalLines := []string{
+		"Starting language server process with pid 12345",
+		"Language server version: 1.5.1",
+		"gemini-3.8-flash-high Gemini 3.8 Flash (High)",
+		"Executing tool: git status",
+		"Using file-based token storage because SSH session detected",
+		"Using file-based token storage because a keyring timeout was recorded within the last 10m",
+		"HTTP 401: Authentication required",
+		"// Note: authentication required for this route",
+		"Please sign in to our web portal to manage subscription",
+		"<button onClick={login}>Please sign in</button>",
+		"you are not logged into the external database",
+		"State: waiting for authentication response from server",
+	}
+
+	for _, line := range normalLines {
+		isUnauth, reason := wrapper.IsUnauthenticatedOutput(line)
+		if isUnauth {
+			t.Errorf("expected %q to NOT be detected as unauthenticated, got reason: %s", line, reason)
+		}
+	}
+}
+
+func TestWrapper_AuthFailure_FastFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	// Simulate a process that prints an unauthenticated error and then would sleep 5s
+	// The wrapper should immediately kill the process and fail fast.
+	start := time.Now()
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "test-mac",
+		StatusFile: statusFile,
+		Args:       reviewedHelperArgv(t, "auth-failure"),
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	runErr := w.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if runErr == nil {
+		t.Fatalf("expected error due to auth failure, got nil")
+	}
+	if !strings.Contains(runErr.Error(), "未登录认证") {
+		t.Errorf("expected error containing '未登录认证', got: %v", runErr)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("expected fail-fast (well under 3s), took %v", elapsed)
+	}
+	if w.Job().Status != model.StatusFailed {
+		t.Errorf("expected job status %s, got %s", model.StatusFailed, w.Job().Status)
+	}
+}
+
+func TestWrapper_StorageNotice_DoesNotFail(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	// Storage notice should NOT trigger fast failure or error out
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:  "test-mac",
+		StatusFile: statusFile,
+		Args:       reviewedHelperArgv(t, "storage-notice"),
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	runErr := w.Run(context.Background())
+	if runErr != nil {
+		t.Fatalf("expected storage notice to succeed, got error: %v", runErr)
+	}
+	if w.Job().Status != model.StatusDone {
+		t.Errorf("expected job status %s, got %s", model.StatusDone, w.Job().Status)
+	}
+}
+
+func TestSanitizePrompt_SecretRedaction(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "empty prompt",
+			input:    "",
+			maxLen:   256,
+			expected: "",
+		},
+		{
+			name:     "clean prompt without secrets",
+			input:    "Refactor database connection pool and verify unit tests",
+			maxLen:   256,
+			expected: "Refactor database connection pool and verify unit tests",
+		},
+		{
+			name:     "redact openai api key",
+			input:    "Use sk-abcdef1234567890abcdef1234567890 for testing completion",
+			maxLen:   256,
+			expected: "Use sk-[REDACTED] for testing completion",
+		},
+		{
+			name:     "redact anthropic api key",
+			input:    "Config with ant-abcdef1234567890abcdef1234567890 model",
+			maxLen:   256,
+			expected: "Config with ant-[REDACTED] model",
+		},
+		{
+			name:     "redact github token",
+			input:    "Clone with ghp_1234567890abcdef1234567890abcdef123456",
+			maxLen:   256,
+			expected: "Clone with [REDACTED_TOKEN]",
+		},
+		{
+			name:     "redact bearer token",
+			input:    "Send header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.test.sig to api",
+			maxLen:   256,
+			expected: "Send header Authorization: Bearer [REDACTED] to api",
+		},
+		{
+			name:     "redact key-value password and secret",
+			input:    "Run migration with password=SuperSecretPass123! and token:mySecretTokenVal",
+			maxLen:   256,
+			expected: "Run migration with password=[REDACTED] and token:[REDACTED]",
+		},
+		{
+			name:     "redact embedded url credentials",
+			input:    "Fetch repo from https://admin:mySecretPass@github.com/org/repo.git",
+			maxLen:   256,
+			expected: "Fetch repo from https://admin:[REDACTED]@github.com/org/repo.git",
+		},
+		{
+			name:     "redact private key block",
+			input:    "Key is -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY----- done",
+			maxLen:   256,
+			expected: "Key is [PRIVATE_KEY_REDACTED] done",
+		},
+		{
+			name:     "enforce max length truncation",
+			input:    "This is a very long prompt task description that exceeds the maximum length limit configured for MQTT retained payload",
+			maxLen:   40,
+			expected: "This is a very long prompt task descr...",
+		},
+		{
+			name:     "normalize multiple newlines and spaces",
+			input:    "Line 1\n\n\n   Line 2\t\tLine 3",
+			maxLen:   256,
+			expected: "Line 1 Line 2 Line 3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapper.SanitizePrompt(tc.input, tc.maxLen)
+			if got != tc.expected {
+				t.Errorf("SanitizePrompt(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestExtractPrompt(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected string
+	}{
+		{
+			name:     "no prompt flag",
+			args:     []string{"run", "--verbose"},
+			expected: "",
+		},
+		{
+			name:     "short flag -p",
+			args:     []string{"run", "-p", "Optimize auth cache"},
+			expected: "Optimize auth cache",
+		},
+		{
+			name:     "long flag --prompt",
+			args:     []string{"run", "--prompt", "Build release artifacts"},
+			expected: "Build release artifacts",
+		},
+		{
+			name:     "long flag with equals --prompt=...",
+			args:     []string{"run", "--prompt=Fix flaky test"},
+			expected: "Fix flaky test",
+		},
+		{
+			name:     "task flag --task",
+			args:     []string{"run", "--task", "Update docs"},
+			expected: "Update docs",
+		},
+		{
+			name:     "task flag with equals --task=...",
+			args:     []string{"run", "--task=Update schema"},
+			expected: "Update schema",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapper.ExtractPrompt(tc.args)
+			if got != tc.expected {
+				t.Errorf("ExtractPrompt(%v) = %q, want %q", tc.args, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestInferRepoAndProject(t *testing.T) {
+	// Inside current workspace, which is a git repo
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to getwd: %v", err)
+	}
+
+	repo, proj := wrapper.InferRepoAndProject(cwd)
+	if proj == "" {
+		t.Errorf("expected non-empty project inferred from cwd %q", cwd)
+	}
+	if repo == "" {
+		t.Errorf("expected non-empty repo inferred from cwd %q", cwd)
+	}
+
+	// For a non-git temporary folder
+	tmpDir := t.TempDir()
+	subDir := filepath.Join(tmpDir, "my-test-proj")
+	_ = os.MkdirAll(subDir, 0755)
+
+	repo2, proj2 := wrapper.InferRepoAndProject(subDir)
+	if proj2 != "my-test-proj" {
+		t.Errorf("expected project 'my-test-proj', got %q", proj2)
+	}
+	if repo2 != "my-test-proj" {
+		t.Errorf("expected repo 'my-test-proj', got %q", repo2)
+	}
+}
+
+func TestWrapper_ExtendedFieldsInStatusAndAlert(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	tmpDir := t.TempDir()
+	statusFile := filepath.Join(tmpDir, "status.json")
+
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:   "box-node-1",
+		JobID:       "job-fields-01",
+		Engine:      model.EngineAgy,
+		Title:       "Deploy Auth Proxy",
+		Repo:        "org/auth-proxy",
+		Project:     "auth-proxy",
+		Prompt:      "Deploy auth proxy with sk-1234567890abcdef1234567890 key",
+		RequestedBy: "dev@workstation",
+		StatusFile:  statusFile,
+		MQTTClient:  mockClient,
+		Stub:        true,
+		Quiet:       true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	// Verify sanitized prompt in job
+	if strings.Contains(w.Job().Prompt, "sk-1234567890") {
+		t.Errorf("prompt was not sanitized, contains raw key: %q", w.Job().Prompt)
+	}
+	if !strings.Contains(w.Job().Prompt, "sk-[REDACTED]") {
+		t.Errorf("prompt missing redacted placeholder: %q", w.Job().Prompt)
+	}
+	if w.Job().Repo != "org/auth-proxy" || w.Job().Project != "auth-proxy" {
+		t.Errorf("unexpected repo/project: repo=%q proj=%q", w.Job().Repo, w.Job().Project)
+	}
+	if w.Job().RequestedBy != "dev@workstation" {
+		t.Errorf("unexpected requested_by: %q", w.Job().RequestedBy)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("w.Run failed: %v", err)
+	}
+
+	// Verify EndedAt populated
+	if w.Job().EndedAt.IsZero() {
+		t.Errorf("expected non-zero EndedAt on completed job")
+	}
+
+	// Verify published alert contains extended fields
+	var alertMap map[string]interface{}
+	for _, m := range mockClient.GetPublished() {
+		if m.Topic == "agentpulse/v1/notifications/alerts" {
+			_ = json.Unmarshal(m.Payload, &alertMap)
+		}
+	}
+	if alertMap == nil {
+		t.Fatalf("expected alert publication")
+	}
+	if alertMap["repo"] != "org/auth-proxy" || alertMap["project"] != "auth-proxy" {
+		t.Errorf("unexpected alert repo/project: %+v", alertMap)
+	}
+	if alertMap["requested_by"] != "dev@workstation" {
+		t.Errorf("unexpected alert requested_by: %+v", alertMap)
+	}
+	if alertMap["finished_at"] == "" {
+		t.Errorf("expected finished_at in alert payload")
+	}
+}
+
+func TestSecretsRedactedAcrossAllBoundaries(t *testing.T) {
+	fakeOpenAI := "sk-TESTFAKE1234567890abcdef1234567890"
+	fakeGitHub := "ghp_TESTFAKE1234567890abcdef1234567890abcdef"
+	fakeKVPass := "password=SuperFakeSecret987654321"
+
+	mockClient := newMockMQTTClient()
+	w, err := wrapper.New(wrapper.Config{
+		MachineID:   "sec-node-1",
+		MachineName: "sec-node-1",
+		JobID:       "job-sec-001",
+		Engine:      model.EngineAgy,
+		Title:       fmt.Sprintf("Run task with token %s", fakeGitHub),
+		Repo:        "org/sec-repo",
+		Project:     "sec-repo",
+		Prompt:      fmt.Sprintf("Use %s and %s for query", fakeOpenAI, fakeKVPass),
+		Args:        []string{"agy", "run", "--prompt", fmt.Sprintf("Use %s", fakeOpenAI), "--key", fakeOpenAI},
+		Command:     fmt.Sprintf("agy run --prompt 'Use %s' --api-key=%s", fakeOpenAI, fakeOpenAI),
+		RequestedBy: "dev@workstation",
+		MQTTClient:  mockClient,
+		Stub:        true,
+		Quiet:       true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	// 1. Verify Job model metadata is sanitized
+	j := w.Job()
+	if strings.Contains(j.Command, "sk-TESTFAKE") || strings.Contains(j.Command, fakeOpenAI) {
+		t.Errorf("Job.Command contains raw fake key: %q", j.Command)
+	}
+	if strings.Contains(j.Title, "ghp_TESTFAKE") || strings.Contains(j.Title, fakeGitHub) {
+		t.Errorf("Job.Title contains raw fake token: %q", j.Title)
+	}
+	if strings.Contains(j.Prompt, "sk-TESTFAKE") || strings.Contains(j.Prompt, fakeOpenAI) || strings.Contains(j.Prompt, "SuperFakeSecret") {
+		t.Errorf("Job.Prompt contains raw fake key: %q", j.Prompt)
+	}
+
+	// 2. Verify child process execution args are PRESERVED (actual argv not corrupted)
+	if len(w.Config().Args) < 6 || w.Config().Args[5] != fakeOpenAI {
+		t.Errorf("child process argv was modified; actual execution args must remain intact, got: %v", w.Config().Args)
+	}
+
+	// 3. Run job and inspect running and completed status publications
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Run(ctx); err != nil {
+		t.Fatalf("w.Run failed: %v", err)
+	}
+
+	// 4. Assert all published MQTT payloads (job status and alerts) are completely clean of synthetic fake keys
+	published := mockClient.GetPublished()
+	if len(published) == 0 {
+		t.Fatalf("expected MQTT publications")
+	}
+
+	for _, p := range published {
+		payloadStr := string(p.Payload)
+		if strings.Contains(payloadStr, "sk-TESTFAKE") {
+			t.Errorf("MQTT published payload on topic %s contains fake OpenAI key:\n%s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "ghp_TESTFAKE") {
+			t.Errorf("MQTT published payload on topic %s contains fake GitHub token:\n%s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "SuperFakeSecret") {
+			t.Errorf("MQTT published payload on topic %s contains fake password:\n%s", p.Topic, payloadStr)
+		}
+	}
+
+	// 5. Verify failed status redaction
+	mockClientFail := newMockMQTTClient()
+	wFail, err := wrapper.New(wrapper.Config{
+		MachineID:  "sec-node-fail",
+		JobID:      "job-sec-fail-001",
+		Engine:     model.EngineAgy,
+		Title:      fmt.Sprintf("Failed task %s", fakeGitHub),
+		Prompt:     fmt.Sprintf("Prompt %s", fakeOpenAI),
+		Command:    fmt.Sprintf("agy fail --secret=%s", fakeOpenAI),
+		MQTTClient: mockClientFail,
+		Stub:       false,
+		Args:       []string{"/nonexistent/binary/for/failure", "--key", fakeOpenAI},
+		Quiet:      true,
+	})
+	if err != nil {
+		t.Fatalf("wrapper.New failed: %v", err)
+	}
+
+	_ = wFail.Run(ctx) // Expected to fail
+
+	for _, p := range mockClientFail.GetPublished() {
+		payloadStr := string(p.Payload)
+		if strings.Contains(payloadStr, "sk-TESTFAKE") {
+			t.Errorf("failed job MQTT payload on %s contains fake key: %s", p.Topic, payloadStr)
+		}
+		if strings.Contains(payloadStr, "ghp_TESTFAKE") {
+			t.Errorf("failed job MQTT payload on %s contains fake token: %s", p.Topic, payloadStr)
+		}
 	}
 }

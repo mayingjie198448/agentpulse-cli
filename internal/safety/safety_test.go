@@ -1,16 +1,16 @@
+//go:build linux
+
 package safety
 
 import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,9 +19,7 @@ const workerArg = "--agentpulse-safety-worker"
 
 func TestMain(m *testing.M) {
 	MaybeHandleInternal(os.Args)
-	if len(os.Args) > 1 && os.Args[1] == workerArg {
-		os.Exit(workerMain(os.Args[2:]))
-	}
+	MaybeFixtureWorker(os.Args)
 	os.Exit(m.Run())
 }
 
@@ -735,6 +733,33 @@ func builtWithRace() bool {
 	return false
 }
 
+func TestNativeFixtureEntrypoint(t *testing.T) {
+	report, err := RunNativeFixture(context.Background())
+	if err != nil {
+		skipPositiveLandlockIfRaceENOTSUP(t, err)
+		t.Fatal(err)
+	}
+	if !strings.Contains(report, "result=PASS") || !strings.Contains(report, "launches_agent=false") {
+		t.Fatalf("fixture report:\n%s", report)
+	}
+	if !strings.Contains(report, "BLOCKED_UNTIL_OPS_EXECUTES") {
+		t.Fatalf("fixture treated cross-compile as Windows pass:\n%s", report)
+	}
+	if strings.Contains(report, "s3cr3t") {
+		t.Fatalf("fixture report leaked a secret:\n%s", report)
+	}
+}
+
+func TestWindowsCatalogStaysBlocked(t *testing.T) {
+	got := NativeVerification()["windows_appcontainer_native_fixture"]
+	if !strings.Contains(got, "BLOCKED_UNTIL_OPS_EXECUTES") {
+		t.Fatalf("catalog = %q", got)
+	}
+	if got == "PASS" || strings.Contains(got, "verified") {
+		t.Fatal("catalog claims a Windows native pass")
+	}
+}
+
 func homeLine(status string) string {
 	for _, line := range strings.Split(status, "\n") {
 		if strings.HasPrefix(line, "home=") {
@@ -742,86 +767,4 @@ func homeLine(status string) string {
 		}
 	}
 	return ""
-}
-
-func workerMain(args []string) int {
-	exitCode := 0
-	projectRel := filepath.Join("project", "result.txt")
-	var escape string
-	for i := 0; i < len(args); i++ {
-		if i+1 >= len(args) {
-			return 2
-		}
-		switch args[i] {
-		case "--project-out":
-			i++
-			projectRel = args[i]
-		case "--escape":
-			i++
-			escape = args[i]
-		case "--exit":
-			i++
-			n, err := strconv.Atoi(args[i])
-			if err != nil {
-				return 2
-			}
-			exitCode = n
-		default:
-			return 2
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(projectRel), 0700); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir %v\n", err)
-		return 51
-	}
-	if err := os.WriteFile(projectRel, []byte("wrote-ok\n"), 0600); err != nil {
-		fmt.Fprintf(os.Stderr, "write project %v\n", err)
-		return 51
-	}
-	noNew := "0"
-	if body, err := os.ReadFile("/proc/self/status"); err == nil {
-		for _, line := range strings.Split(string(body), "\n") {
-			if strings.HasPrefix(line, "NoNewPrivs:") {
-				noNew = strings.TrimSpace(strings.TrimPrefix(line, "NoNewPrivs:"))
-			}
-		}
-	}
-	var status strings.Builder
-	fmt.Fprintf(&status, "no_new_privs=%s\n", noNew)
-	fmt.Fprintf(&status, "home=%s\n", os.Getenv("HOME"))
-	if _, ok := os.LookupEnv("SSH_AUTH_SOCK"); ok {
-		status.WriteString("ssh_auth_sock_set=true\n")
-	} else {
-		status.WriteString("ssh_auth_sock_set=false\n")
-	}
-	if os.Getenv("MQTT_PASSWORD") != "" {
-		status.WriteString("mqtt_password_set=true\n")
-	} else {
-		status.WriteString("mqtt_password_set=false\n")
-	}
-	if err := os.WriteFile("status.txt", []byte(status.String()), 0600); err != nil {
-		return 52
-	}
-	if escape != "" {
-		writeErr := os.WriteFile(escape, []byte("hacked"), 0600)
-		removeErr := os.Remove(escape)
-		msg := fmt.Sprintf("write=%s\nremove=%s\n", errnoName(writeErr), errnoName(removeErr))
-		if err := os.WriteFile("escape.txt", []byte(msg), 0600); err != nil {
-			return 53
-		}
-	}
-	return exitCode
-}
-
-func errnoName(err error) string {
-	if err == nil {
-		return "nil"
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return "enoent"
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return "eperm"
-	}
-	return "other:" + err.Error()
 }

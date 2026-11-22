@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
@@ -14,12 +16,20 @@ import (
 	"github.com/mayingjie198448/agentpulse-cli/internal/tui"
 )
 
+// ansiPattern matches CSI and OSC sequences lipgloss may embed in View.
+var ansiPattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))`)
+
+func stripViewANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
+}
+
 // fakeStore is local test data. It is not wired to any CLI flag.
 type fakeStore struct {
 	machines     []model.Machine
 	jobs         []model.Job
 	logs         map[string][]model.LogEntry
 	disconnected bool
+	refreshErr   error
 }
 
 var _ store.Store = (*fakeStore)(nil)
@@ -91,6 +101,10 @@ func (f *fakeStore) Subscribe(context.Context) (<-chan model.Event, error) {
 
 func (f *fakeStore) IsConnected() bool {
 	return !f.disconnected
+}
+
+func (f *fakeStore) Refresh(context.Context) error {
+	return f.refreshErr
 }
 
 func (f *fakeStore) Close() error { return nil }
@@ -775,3 +789,582 @@ func TestTUIModel_DeleteJobFlow(t *testing.T) {
 	}
 }
 
+func TestTUIModel_MachinesPrimaryLabelMachineID(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{
+				ID:     "mac-mini",
+				Name:   "hostname-mini",
+				Online: true,
+			},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	v := tm.View()
+	line := machineLabelLine(t, stripViewANSI(v), "mac-mini", "hostname-mini")
+	const secondary = "(hostname-mini)"
+	primaryAt := strings.Index(line, "mac-mini")
+	secondaryAt := strings.Index(line, secondary)
+	if primaryAt < 0 || secondaryAt < 0 || primaryAt > secondaryAt {
+		t.Fatalf("machine line must show id before parenthetical hostname, got %q", line)
+	}
+	if strings.Contains(line, "(mac-mini)") {
+		t.Fatalf("id was rendered as the parenthetical secondary, got %q", line)
+	}
+	if strings.Index(line, "hostname-mini") != secondaryAt+1 {
+		t.Fatalf("hostname must appear only as the parenthetical secondary, got %q", line)
+	}
+}
+
+// machineLabelLine returns the single View line that carries this machine's
+// id and hostname. Labels split across other rows do not count.
+func machineLabelLine(t *testing.T, plain, id, hostname string) string {
+	t.Helper()
+	var hits []string
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, id) || strings.Contains(line, hostname) {
+			hits = append(hits, line)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected one view line with the machine labels, got %d: %#v", len(hits), hits)
+	}
+	if !strings.Contains(hits[0], id) || !strings.Contains(hits[0], hostname) {
+		t.Fatalf("machine labels were not on the same line: %q", hits[0])
+	}
+	return hits[0]
+}
+
+func TestTUIModel_ExplicitRefresh(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+			{ID: "node-stale", Name: "node-stale", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-1", MachineID: "node-1", Status: model.StatusRunning, Title: "Job 1"},
+			{ID: "job-stale", MachineID: "node-stale", Status: model.StatusDone, Title: "Job Stale"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-1":     {{JobID: "job-1", Message: "log 1"}},
+			"job-stale": {{JobID: "job-stale", Message: "log stale"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Check footer includes 'r' and '刷新'
+	view := tm.View()
+	if !strings.Contains(view, "r") || !strings.Contains(view, "刷新") {
+		t.Fatalf("expected footer to show 'r 刷新', got:\n%s", view)
+	}
+
+	// Simulate external state change (node-stale dropped, new node announced)
+	st.machines = []model.Machine{
+		{ID: "node-1", Name: "node-1", Online: true},
+		{ID: "node-new", Name: "node-new", Online: true},
+	}
+	st.jobs = []model.Job{
+		{ID: "job-1", MachineID: "node-1", Status: model.StatusRunning, Title: "Job 1"},
+	}
+
+	// Trigger manual refresh via 'r' key
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatalf("expected 'r' key to produce a tea.Cmd for refresh")
+	}
+
+	// Execute cmd
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("expected refresh cmd to return a message")
+	}
+
+	// Deliver refreshDoneMsg
+	tm, _ = tm.Update(msg)
+
+	mRefreshed := tm.(*tui.Model)
+	if len(mRefreshed.MachinesForTest()) != 2 {
+		t.Fatalf("expected 2 machines after refresh, got %d", len(mRefreshed.MachinesForTest()))
+	}
+	machIDs := make(map[string]bool)
+	for _, mach := range mRefreshed.MachinesForTest() {
+		machIDs[mach.ID] = true
+	}
+	if !machIDs["node-1"] || !machIDs["node-new"] || machIDs["node-stale"] {
+		t.Fatalf("expected node-stale to be cleared and node-new present, got %+v", machIDs)
+	}
+
+	if len(mRefreshed.JobsForTest()) != 1 || mRefreshed.JobsForTest()[0].ID != "job-1" {
+		t.Fatalf("expected job-stale to be dropped after refresh, got %+v", mRefreshed.JobsForTest())
+	}
+}
+
+const (
+	refreshFailureText = "刷新失败: MQTT subscription timeout"
+	// At the fixture width, lipgloss wraps the footer. This help phrase stays
+	// on the same row as the full failure text; later phrases wrap below it.
+	refreshFailureFooterHelp = "选择任务"
+)
+
+func TestTUIModel_RefreshFailure(t *testing.T) {
+	for _, key := range []rune{'r', 'R'} {
+		t.Run(string(key), func(t *testing.T) {
+			assertRefreshFailureKey(t, key)
+		})
+	}
+}
+
+func assertRefreshFailureKey(t *testing.T, key rune) {
+	t.Helper()
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-orig", Name: "node-orig", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-orig", MachineID: "node-orig", Status: model.StatusRunning, Title: "Job Orig"},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-orig": {{JobID: "job-orig", Message: "log orig"}},
+		},
+		refreshErr: fmt.Errorf("MQTT subscription timeout"),
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+	if cmd == nil {
+		t.Fatalf("expected %q to produce a tea.Cmd for refresh", string(key))
+	}
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("expected refresh cmd to return a message")
+	}
+	tm, _ = tm.Update(msg)
+
+	mAfter := tm.(*tui.Model)
+	if len(mAfter.MachinesForTest()) != 1 || mAfter.MachinesForTest()[0].ID != "node-orig" {
+		t.Fatalf("expected original machines to be preserved, got %+v", mAfter.MachinesForTest())
+	}
+	if len(mAfter.JobsForTest()) != 1 || mAfter.JobsForTest()[0].ID != "job-orig" {
+		t.Fatalf("expected original jobs to be preserved, got %+v", mAfter.JobsForTest())
+	}
+	if mAfter.RefreshErrorForTest() != refreshFailureText {
+		t.Fatalf("RefreshErrorForTest() = %q, want %q", mAfter.RefreshErrorForTest(), refreshFailureText)
+	}
+	refreshFailureFooterLine(t, stripViewANSI(mAfter.View()))
+
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	mCleared := tm.(*tui.Model)
+	if mCleared.RefreshErrorForTest() != "" {
+		t.Fatalf("expected error field to be cleared on next key, got %q", mCleared.RefreshErrorForTest())
+	}
+	cleared := stripViewANSI(tm.View())
+	if strings.Contains(cleared, "刷新失败") {
+		t.Fatalf("refresh failure hint still visible after j, got %q", refreshFailureHits(cleared))
+	}
+}
+
+// refreshFailureFooterLine returns the single ANSI-stripped row that shows the
+// refresh failure. The full cause and a footer help phrase must share that row.
+func refreshFailureFooterLine(t *testing.T, plain string) string {
+	t.Helper()
+	hits := refreshFailureHits(plain)
+	if len(hits) != 1 {
+		t.Fatalf("expected exactly one view line containing 刷新失败, got %d: %#v", len(hits), hits)
+	}
+	line := hits[0]
+	if !strings.Contains(line, refreshFailureText) {
+		t.Fatalf("failure line must contain %q, got %q", refreshFailureText, line)
+	}
+	if !strings.Contains(line, refreshFailureFooterHelp) {
+		t.Fatalf("failure line must be the footer help row containing %q, got %q", refreshFailureFooterHelp, line)
+	}
+	return line
+}
+
+func refreshFailureHits(plain string) []string {
+	var hits []string
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, "刷新失败") {
+			hits = append(hits, line)
+		}
+	}
+	return hits
+}
+
+func TestTUIModel_GroupingAndSelectionPreservation(t *testing.T) {
+	t1 := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 2, 11, 30, 0, 0, time.UTC)
+
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "Studio M2", Online: true},
+			{ID: "node-2", Name: "Linux Box", Online: true},
+		},
+		jobs: []model.Job{
+			{
+				ID:        "job-legacy",
+				MachineID: "node-1",
+				Engine:    model.EngineAgy,
+				Status:    model.StatusRunning,
+				Title:     "Legacy Task without fields",
+				Progress:  50,
+			},
+			{
+				ID:          "job-repo-a",
+				MachineID:   "node-1",
+				Engine:      model.EngineAgy,
+				Status:      model.StatusRunning,
+				Title:       "Task Alpha",
+				Repo:        "owner/repo-a",
+				Project:     "repo-a",
+				Prompt:      "Implement secret sauce algorithm",
+				StartedAt:   t1,
+				RequestedBy: "alice@company.internal",
+				Progress:    75,
+			},
+			{
+				ID:          "job-repo-b",
+				MachineID:   "node-2",
+				Engine:      model.EngineOpenCode,
+				Status:      model.StatusDone,
+				Title:       "Task Beta",
+				Repo:        "owner/repo-b",
+				Project:     "repo-b",
+				Prompt:      "Refactor legacy database access layer",
+				StartedAt:   t1,
+				EndedAt:     t2,
+				RequestedBy: "bob@remote",
+				Progress:    100,
+			},
+		},
+		logs: map[string][]model.LogEntry{
+			"job-repo-a": {{JobID: "job-repo-a", Message: "step 1"}},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 45})
+
+	// Initial grouping should be GroupDefault
+	if m.GroupingForTest() != tui.GroupDefault {
+		t.Fatalf("expected initial grouping to be GroupDefault, got %v", m.GroupingForTest())
+	}
+
+	// Navigate selection to job-repo-b
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-repo-b" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("failed to navigate to job-repo-b")
+	}
+
+	// Press 'g': GroupDefault -> GroupRepo
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRepo {
+		t.Fatalf("expected GroupRepo after 'g', got %v", m.GroupingForTest())
+	}
+	// Selection must remain on job-repo-b
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("expected selection preserved on job-repo-b, got %s", m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+	}
+
+	// View must contain repo headers and fallback for legacy job
+	viewRepo := tm.View()
+	if !strings.Contains(viewRepo, "owner/repo-a") || !strings.Contains(viewRepo, "owner/repo-b") {
+		t.Errorf("expected view to contain repo names, got:\n%s", viewRepo)
+	}
+	if !strings.Contains(viewRepo, "未知/未标注") {
+		t.Errorf("expected view to contain fallback header '未知/未标注' for legacy job, got:\n%s", viewRepo)
+	}
+
+	// Press 'g' again: GroupRepo -> GroupMachine
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupMachine {
+		t.Fatalf("expected GroupMachine after 'g', got %v", m.GroupingForTest())
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-b" {
+		t.Fatalf("expected selection preserved on job-repo-b, got %s", m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+	}
+	viewMach := tm.View()
+	if !strings.Contains(viewMach, "node-1") || !strings.Contains(viewMach, "node-2") {
+		t.Errorf("expected view to contain machine IDs, got:\n%s", viewMach)
+	}
+
+	// Press 'g': GroupMachine -> GroupStatus
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupStatus {
+		t.Fatalf("expected GroupStatus, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupStatus -> GroupEngine
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupEngine {
+		t.Fatalf("expected GroupEngine, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupEngine -> GroupStarted
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupStarted {
+		t.Fatalf("expected GroupStarted, got %v", m.GroupingForTest())
+	}
+
+	// Press 'g': GroupStarted -> GroupRequested
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRequested {
+		t.Fatalf("expected GroupRequested, got %v", m.GroupingForTest())
+	}
+	viewReq := tm.View()
+	if !strings.Contains(viewReq, "alice@company.internal") || !strings.Contains(viewReq, "bob@remote") {
+		t.Errorf("expected view to contain requested_by usernames, got:\n%s", viewReq)
+	}
+
+	// Press 'g': GroupRequested -> GroupDefault
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupDefault {
+		t.Fatalf("expected cycle back to GroupDefault, got %v", m.GroupingForTest())
+	}
+
+	// Press 'G' (shift-g): cycle backwards GroupDefault -> GroupRequested
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	if m.GroupingForTest() != tui.GroupRequested {
+		t.Fatalf("expected GroupRequested after 'G', got %v", m.GroupingForTest())
+	}
+
+	// Navigate to job-repo-a to inspect detail box
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-repo-a" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-repo-a" {
+		t.Fatalf("failed to navigate to job-repo-a")
+	}
+
+	viewDetail := tm.View()
+	if !strings.Contains(viewDetail, "Prompt: \"Implement secret sauce algorithm\"") {
+		t.Errorf("expected detail box to display prompt, got:\n%s", viewDetail)
+	}
+	if !strings.Contains(viewDetail, "owner/repo-a") {
+		t.Errorf("expected detail box to display repo, got:\n%s", viewDetail)
+	}
+	if !strings.Contains(viewDetail, "alice@company.internal") {
+		t.Errorf("expected detail box to display requested_by, got:\n%s", viewDetail)
+	}
+}
+
+func TestTUIModel_LiveUpdateAndContinuousGrouping(t *testing.T) {
+	st := &fakeStore{}
+	defer st.Close()
+	m := tui.NewModel(st)
+
+	t0 := time.Now().UTC()
+	jobs := []model.Job{
+		{
+			ID:        "job-1",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/beta",
+			StartedAt: t0,
+		},
+		{
+			ID:        "job-2",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/gamma",
+			StartedAt: t0,
+		},
+		{
+			ID:        "job-3",
+			MachineID: "node-1",
+			Engine:    model.EngineAgy,
+			Status:    model.StatusRunning,
+			Repo:      "org/zeta",
+			StartedAt: t0,
+		},
+	}
+	m.SetJobsForTest(jobs)
+
+	// Set terminal size
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	// Switch to GroupRepo: press 'g'
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRepo {
+		t.Fatalf("expected GroupRepo, got %v", m.GroupingForTest())
+	}
+
+	// Navigate cursor to job-2
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-2" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Fatalf("failed to select job-2")
+	}
+
+	// 1. Receive EventJobUpdated for existing job-3: changes repo from org/zeta to org/alpha
+	// In GroupRepo, org/alpha must sort BEFORE org/beta and org/gamma!
+	updatedJob3 := jobs[2]
+	updatedJob3.Repo = "org/alpha"
+	tm, _ = tm.Update(model.Event{
+		Type: model.EventJobUpdated,
+		Job:  &updatedJob3,
+	})
+
+	// Assert job list was re-sorted according to new group order
+	firstJob := m.JobsForTest()[0]
+	if firstJob.ID != "job-3" || firstJob.Repo != "org/alpha" {
+		t.Errorf("expected job-3 (org/alpha) to be reordered to front, got %+v", firstJob)
+	}
+
+	// Assert selection preserved on job-2!
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Errorf("expected selected job to remain job-2, got %s (idx %d)",
+			m.JobsForTest()[m.SelectedJobIdxForTest()].ID, m.SelectedJobIdxForTest())
+	}
+
+	// 2. Receive EventJobUpdated for a NEW job: job-new with repo "org/00-first"
+	newJob := model.Job{
+		ID:        "job-new",
+		MachineID: "node-1",
+		Engine:    model.EngineAgy,
+		Status:    model.StatusRunning,
+		Repo:      "org/00-first",
+		StartedAt: t0,
+	}
+	tm, _ = tm.Update(model.Event{
+		Type: model.EventJobUpdated,
+		Job:  &newJob,
+	})
+
+	// Assert newly added job was sorted into correct place (first)
+	if m.JobsForTest()[0].ID != "job-new" {
+		t.Errorf("expected job-new at index 0 after grouping, got %s", m.JobsForTest()[0].ID)
+	}
+
+	// Assert selection still preserved on job-2!
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+		t.Errorf("expected selected job to remain job-2 after adding new job, got %s (idx %d)",
+			m.JobsForTest()[m.SelectedJobIdxForTest()].ID, m.SelectedJobIdxForTest())
+	}
+
+	// 3. Continuous sequential updates (simulating live broker stream)
+	for i := 0; i < 5; i++ {
+		liveJob := model.Job{
+			ID:        fmt.Sprintf("job-live-%d", i),
+			MachineID: "node-2",
+			Engine:    model.EngineOpenCode,
+			Status:    model.StatusRunning,
+			Repo:      fmt.Sprintf("org/stream-%d", i),
+			StartedAt: t0.Add(time.Duration(i) * time.Minute),
+		}
+		tm, _ = tm.Update(model.Event{
+			Type: model.EventJobUpdated,
+			Job:  &liveJob,
+		})
+
+		// Selection must remain on job-2 throughout all live events
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-2" {
+			t.Fatalf("iteration %d: selection lost, got %s instead of job-2",
+				i, m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+		}
+	}
+}
+
+func TestTUIModel_CJKAndEmojiTruncationAndNarrowWindow(t *testing.T) {
+	st := &fakeStore{}
+	defer st.Close()
+	m := tui.NewModel(st)
+
+	t0 := time.Now().UTC()
+	jobs := []model.Job{
+		{
+			ID:          "job-cjk-1",
+			MachineID:   "node-cjk",
+			Engine:      model.EngineAgy,
+			Status:      model.StatusRunning,
+			Title:       "优化数据库连接池与查询性能处理长标题测试",
+			Repo:        "mayingjie/微服务核心组件仓",
+			Project:     "微服务核心组件",
+			Prompt:      "优化数据库连接池与查询性能，确保高并发下不发生死锁或连接泄漏 🚀🔥",
+			Cwd:         "/Users/张三/开发工程/🚀/agentpulse-cli",
+			Command:     "agy run --prompt '优化数据库连接池' --concurrency=10",
+			RequestedBy: "张三@公司内网",
+			StartedAt:   t0,
+			DurationStr: "12m 30s",
+		},
+		{
+			ID:          "job-emoji-2",
+			MachineID:   "node-gpu",
+			Engine:      model.EngineOpenCode,
+			Status:      model.StatusDone,
+			Title:       "🚀🔥模型微调与量化评估✨🎉",
+			Repo:        "org/🚀-ai-models",
+			Prompt:      "Fine-tune LLaMA-3 with LoRA and QLoRA 🚀🔥🎉",
+			Cwd:         "/home/ubuntu/models/🚀",
+			Command:     "opencode train --config lora.yaml",
+			RequestedBy: "ai-engineer@remote",
+			StartedAt:   t0.Add(-time.Hour),
+			EndedAt:     t0,
+			DurationStr: "1h 0s",
+		},
+	}
+	m.SetJobsForTest(jobs)
+
+	// Test a matrix of narrow and normal terminal window sizes
+	sizes := []struct {
+		w, h int
+	}{
+		{w: 120, h: 30},
+		{w: 60, h: 20},
+		{w: 40, h: 15},
+		{w: 25, h: 10},
+		{w: 15, h: 8},
+		{w: 10, h: 5},
+	}
+
+	var tm tea.Model = m
+	for _, sz := range sizes {
+		t.Run(fmt.Sprintf("%dx%d", sz.w, sz.h), func(t *testing.T) {
+			tm, _ = tm.Update(tea.WindowSizeMsg{Width: sz.w, Height: sz.h})
+
+			// View rendering must never panic, even in extremely narrow terminals
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("render panicked at size %dx%d: %v", sz.w, sz.h, r)
+				}
+			}()
+
+			view := tm.View()
+			if !utf8.ValidString(view) {
+				t.Fatalf("View output is not valid UTF-8 at size %dx%d", sz.w, sz.h)
+			}
+		})
+	}
+}

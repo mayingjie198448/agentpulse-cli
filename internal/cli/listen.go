@@ -5,16 +5,68 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
+	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/config"
+	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 	"github.com/mayingjie198448/agentpulse-cli/internal/wrapper"
 	"github.com/spf13/cobra"
 )
 
-func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet bool) error {
+func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, heartbeatInterval time.Duration, stub, dangerouslySkipPermissions, quiet, noAttach bool, maxConcurrentJobs int) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.OutOrStderr()
+
+	fileCfg, _, _ := loadActiveConfig(cmd)
+	if machineID == "" {
+		if fileCfg != nil && fileCfg.MachineID != "" {
+			machineID = fileCfg.MachineID
+		}
+	}
+
+	host, _ := os.Hostname()
+	if machineName == "" {
+		if host != "" {
+			machineName = host
+		} else {
+			machineName = machineID
+		}
+	}
+
+	// Prepare machine announcement
+	var agentsToProbe []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agentsToProbe = fileCfg.Agents
+	} else {
+		agentsToProbe = config.DefaultAgents()
+	}
+	probedStatuses := config.ProbeAgents(agentsToProbe)
+	var announceAgents []model.AgentAnnounce
+	for _, st := range probedStatuses {
+		announceAgents = append(announceAgents, model.AgentAnnounce{
+			ID:     st.ID,
+			Alias:  st.Alias,
+			Ok:     st.Ok,
+			Detail: st.Detail,
+		})
+	}
+	rev := 1
+	if fileCfg != nil && fileCfg.Rev > 0 {
+		rev = fileCfg.Rev
+	}
+	ann := model.MachineAnnounce{
+		V:         1,
+		MachineID: machineID,
+		TS:        time.Now().UTC(),
+		Rev:       rev,
+		Hostname:  host,
+		OS:        fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Agents:    announceAgents,
+	}
 
 	mqttCfg := resolveMQTTConfig(cmd)
 	if mqttCfg.BrokerURL == "" {
@@ -23,6 +75,15 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 
 	if statusFile == "" {
 		statusFile = wrapper.DefaultStatusFile
+	}
+
+	if maxConcurrentJobs <= 0 {
+		fileCfg, _ := config.LoadConfig("")
+		if fileCfg != nil && fileCfg.MaxConcurrentJobs > 0 {
+			maxConcurrentJobs = fileCfg.MaxConcurrentJobs
+		} else {
+			maxConcurrentJobs = 1
+		}
 	}
 
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -40,6 +101,12 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 
 	pMQTT := &mqttCfg
 
+	fileCfg, _, _ = loadActiveConfig(cmd)
+	var agents []config.AgentConfig
+	if fileCfg != nil && len(fileCfg.Agents) > 0 {
+		agents = fileCfg.Agents
+	}
+
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
 		MachineID:                  machineID,
 		MachineName:                machineName,
@@ -49,16 +116,38 @@ func runListen(cmd *cobra.Command, machineID, machineName, statusFile string, he
 		Stub:                       stub,
 		DangerouslySkipPermissions: dangerouslySkipPermissions,
 		Quiet:                      quiet,
+		DisableBareAttach:          noAttach,
+		Agents:                     agents,
 		Stdout:                     out,
 		Stderr:                     errOut,
+		MaxConcurrentJobs:          maxConcurrentJobs,
 		OnMQTTConnected: func() {
 			if !quiet {
 				fmt.Fprintf(out, "[agentpulse] Connected to MQTT broker %s\n", pMQTT.BrokerURL)
 			}
+			if ann.MachineID != "" {
+				announceCfg := *pMQTT
+				announceCfg.ClientID = pMQTT.ClientID + "-announce"
+				opts := paho.NewClientOptions()
+				_ = mqtt.ApplyClientOptions(opts, announceCfg)
+				c := paho.NewClient(opts)
+				waitTimeout := announceCfg.Timeout
+				if waitTimeout <= 0 {
+					waitTimeout = 10 * time.Second
+				}
+				if token := c.Connect(); token.WaitTimeout(waitTimeout) && token.Error() == nil {
+					_ = mqtt.PublishAnnounce(c, ann)
+					c.Disconnect(100)
+				}
+			}
 		},
 		OnListening: func(topic string) {
 			if !quiet {
-				fmt.Fprintf(out, "[agentpulse listener] Listening on %s (QoS 1, serial queue)\n", topic)
+				if maxConcurrentJobs > 1 {
+					fmt.Fprintf(out, "[agentpulse listener] Listening on %s (QoS 1, concurrency limit: %d)\n", topic, maxConcurrentJobs)
+				} else {
+					fmt.Fprintf(out, "[agentpulse listener] Listening on %s (QoS 1, serial queue)\n", topic)
+				}
 				fmt.Fprintln(out, "[agentpulse listener] Waiting for incoming dispatch commands... (Press Ctrl+C to stop)")
 			}
 		},
@@ -93,6 +182,8 @@ func newListenCmd() *cobra.Command {
 		stub                       bool
 		dangerouslySkipPermissions bool
 		quiet                      bool
+		noAttach                   bool
+		maxConcurrentJobs          int
 	)
 
 	listenCmd := &cobra.Command{
@@ -100,7 +191,7 @@ func newListenCmd() *cobra.Command {
 		Short: "Run thin wrapper daemon in listen mode to receive and execute remote dispatch commands",
 		Long: `Runs an edge listener process that connects to an MQTT broker, maintains
 node heartbeat and LWT, subscribes to agentpulse/v1/machines/{machine_id}/commands/dispatch,
-and serially executes incoming AI agent jobs (agy / opencode).
+and executes incoming AI agent jobs (agy / opencode) concurrently up to max_concurrent_jobs.
 
 Node identity resolution precedence:
   1. Explicit CLI flag (--machine / --machine-id)
@@ -111,7 +202,10 @@ Examples:
   agentpulse listen --mqtt-url tcp://broker.example:1883
 
   # Listen with custom machine ID and stub execution mode:
-  agentpulse listen --mqtt-url tcp://broker.example:1883 --machine mac-studio --stub`,
+  agentpulse listen --mqtt-url tcp://broker.example:1883 --machine mac-studio --stub
+
+  # Listen with local concurrency limit 3:
+  agentpulse listen --mqtt-url tcp://broker.example:1883 --max-concurrent-jobs 3`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -119,7 +213,7 @@ Examples:
 			if machineID == "" {
 				machineID = machineIDFlag
 			}
-			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet)
+			return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, noAttach, maxConcurrentJobs)
 		},
 	}
 
@@ -131,6 +225,8 @@ Examples:
 	listenCmd.Flags().BoolVar(&stub, "stub", false, "Run executed jobs in simulated stub mode")
 	listenCmd.Flags().BoolVar(&dangerouslySkipPermissions, "dangerously-skip-permissions", false, "Auto-approve tool permissions when running agy commands")
 	listenCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress agentpulse listener header/footer banners")
+	listenCmd.Flags().BoolVar(&noAttach, "no-attach", false, "Disable automatic attachment of local bare agent CLI processes")
+	listenCmd.Flags().IntVarP(&maxConcurrentJobs, "max-concurrent-jobs", "c", 0, "最大本地并发作业数 (默认从 config.yaml 读取，缺省为 1)")
 
 	return listenCmd
 }

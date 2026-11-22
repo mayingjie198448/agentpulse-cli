@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
@@ -44,7 +46,8 @@ func newConfigCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&section, "section", "", "直接编辑指定配置分段 (broker, agents, machine_id, all)")
+	cmd.Flags().StringVar(&section, "section", "", "直接编辑指定配置分段 (broker, agents, machine_id, autostart, all)")
+	cmd.AddCommand(newAutostartCmd())
 	return cmd
 }
 
@@ -118,14 +121,17 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		cfg.Version = existingCfg.Version
 		cfg.Rev = existingCfg.Rev + 1
 		cfg.MachineID = existingCfg.MachineID
+		cfg.MaxConcurrentJobs = existingCfg.MaxConcurrentJobs
 		cfg.Broker = existingCfg.Broker
 		cfg.Agents = existingCfg.Agents
+		cfg.Autostart = existingCfg.Autostart
 	} else {
+		cfg.MaxConcurrentJobs = 1
 		cfg.Broker = config.BrokerConfig{
 			URL: "tls://broker.example:8883",
 			TLS: true,
 		}
-		cfg.Agents = config.DefaultAgents()
+		cfg.Agents = nil
 	}
 
 	fmt.Fprintln(out, "============================================================")
@@ -143,25 +149,39 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		}
 		fmt.Fprintf(out, "  • MQTT Broker: %s (%s, TLS: %v)\n", cfg.Broker.URL, authDesc, cfg.Broker.TLS)
 
-		var agentSummary []string
+		var builtinSummary, customSummary []string
 		for _, ag := range cfg.Agents {
-			if ag.IsEnabled() {
-				agentSummary = append(agentSummary, ag.ID)
+			desc := ag.ID
+			if !ag.IsEnabled() {
+				desc += "(已禁用)"
+			}
+			if ag.IsBuiltin() {
+				builtinSummary = append(builtinSummary, desc)
 			} else {
-				agentSummary = append(agentSummary, ag.ID+"(已禁用)")
+				customSummary = append(customSummary, desc)
 			}
 		}
-		if len(agentSummary) == 0 {
-			agentSummary = []string{"无"}
+		if len(builtinSummary) == 0 {
+			builtinSummary = []string{"无"}
 		}
-		fmt.Fprintf(out, "  • 本机 Agent: %s\n\n", strings.Join(agentSummary, ", "))
+		fmt.Fprintf(out, "  • 本机预置 Agent: %s\n", strings.Join(builtinSummary, ", "))
+		if len(customSummary) > 0 {
+			fmt.Fprintf(out, "  • 本机自定义 Agent: %s\n", strings.Join(customSummary, ", "))
+		}
+		autostartDesc := "未启用"
+		if cfg.Autostart {
+			autostartDesc = "已启用 (LaunchAgent)"
+		}
+		fmt.Fprintf(out, "  • 开机自启常驻后台: %s\n", autostartDesc)
+		fmt.Fprintln(out)
 
 		fmt.Fprintln(out, "请选择配置模式 (按回车默认编辑全部):")
 		fmt.Fprintln(out, "  1) 完整重新配置 (按步骤配置全部项目)")
 		fmt.Fprintln(out, "  2) 仅编辑 MQTT Broker 配置")
 		fmt.Fprintln(out, "  3) 仅编辑 本机 Agent CLI 配置")
 		fmt.Fprintln(out, "  4) 仅编辑 机器标识 (machine_id)")
-		choice := promptLine(reader, out, "请选择 [1/2/3/4]", "1")
+		fmt.Fprintln(out, "  5) 仅编辑 开机自启常驻后台 (LaunchAgent)")
+		choice := promptLine(reader, out, "请选择 [1/2/3/4/5]", "1")
 		switch choice {
 		case "2", "broker":
 			section = "broker"
@@ -169,6 +189,8 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 			section = "agents"
 		case "4", "machine_id", "machine":
 			section = "machine_id"
+		case "5", "autostart", "daemon":
+			section = "autostart"
 		default:
 			section = "all"
 		}
@@ -178,11 +200,22 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 	section = strings.ToLower(strings.TrimSpace(section))
 	switch section {
 	case "broker":
+		if len(cfg.Agents) == 0 {
+			cfg.Agents = config.DefaultAgents()
+		}
 		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
 	case "agents":
 		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, true)
 	case "machine_id":
+		if len(cfg.Agents) == 0 {
+			cfg.Agents = config.DefaultAgents()
+		}
 		cfg.MachineID = configureMachineIDSection(reader, out, cfg.MachineID)
+	case "autostart":
+		if len(cfg.Agents) == 0 {
+			cfg.Agents = config.DefaultAgents()
+		}
+		cfg.Autostart = configureAutostartSection(reader, out, cfg.Autostart)
 	default:
 		// Guided all
 		fmt.Fprintln(out, "[步骤 1/3] 配置本机机器标识 (machine_id)")
@@ -191,8 +224,15 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		fmt.Fprintln(out, "[步骤 2/3] 配置 MQTT Broker 连接与鉴权")
 		cfg.Broker = configureBrokerSection(reader, out, cfg.Broker)
 
-		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (agy, opencode 等)")
-		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, false)
+		fmt.Fprintln(out, "[步骤 3/3] 配置本机 Agent CLI (扫描、勾选预置支持引擎与自定义追加)")
+		cfg.Agents = configureAgentsSection(reader, out, cfg.Agents, !configExists)
+
+		// Windows stays unsupported: IsSupported is false there, so this does not
+		// install a Windows autostart service.
+		if autostart.IsSupported() {
+			fmt.Fprintln(out, "[开机自启] 配置常驻后台守护进程 (LaunchAgent)")
+			cfg.Autostart = configureAutostartSection(reader, out, cfg.Autostart)
+		}
 	}
 
 	// Write 0600 yaml
@@ -200,6 +240,57 @@ func RunConfigWizardWithSection(in io.Reader, out io.Writer, configPath string, 
 		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
 	fmt.Fprintf(out, "[✓] 配置文件已安全保存至: %s (权限: 0600)\n\n", configPath)
+
+	// Synchronize autostart only where the platform implements it.
+	// Windows IsSupported is false; this block must not grow a Windows service installer.
+	if autostart.IsSupported() {
+		oldMachineID := ""
+		oldBroker := config.BrokerConfig{}
+		wasAutostart := false
+		if existingCfg != nil {
+			oldMachineID = existingCfg.MachineID
+			oldBroker = existingCfg.Broker
+			wasAutostart = existingCfg.Autostart
+		}
+
+		if cfg.Autostart {
+			if wasAutostart && oldMachineID != "" && oldMachineID != cfg.MachineID {
+				fmt.Fprintf(out, "[!] 检测到 machine_id 变更 (%s -> %s)，正在同步下线旧节点并重启常驻后台服务...\n", oldMachineID, cfg.MachineID)
+				if err := autostart.PublishOffline(oldBroker, oldMachineID); err == nil {
+					fmt.Fprintf(out, "  [✓] 已向 Broker 发布旧节点 %s 离线状态 (避免长效双在线)\n", oldMachineID)
+				}
+				if err := autostart.Restart(cfg, oldMachineID, ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 重启常驻守护进程失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "  [✓] 已重启常驻守护进程并更新配置 (LaunchAgent)")
+				}
+			} else if !wasAutostart {
+				if err := autostart.Enable(cfg, ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 安装 LaunchAgent 失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "[✓] 已成功配置并启动 macOS 开机自启常驻守护进程 (LaunchAgent)")
+				}
+			} else if oldBroker != cfg.Broker {
+				fmt.Fprintln(out, "[!] 检测到 Broker 配置变更，正在重启常驻后台服务...")
+				if err := autostart.Restart(cfg, "", ""); err != nil {
+					fmt.Fprintf(out, "  [WARN] 重启常驻守护进程失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "  [✓] 已重启常驻守护进程并应用新 Broker 配置 (LaunchAgent)")
+				}
+			}
+		} else {
+			if wasAutostart || autostart.Status().Installed {
+				if oldMachineID != "" {
+					_ = autostart.PublishOffline(oldBroker, oldMachineID)
+				}
+				if err := autostart.Disable(); err != nil {
+					fmt.Fprintf(out, "  [WARN] 卸载 LaunchAgent 失败: %v\n", err)
+				} else {
+					fmt.Fprintln(out, "[✓] 已卸载 macOS 开机自启常驻后台 (LaunchAgent 已移除)")
+				}
+			}
+		}
+	}
 
 	// Immediately verify: broker connect + CLI probe (reusing doctor logic)
 	VerifyConfigDiagnostics(out, cfg)
@@ -237,6 +328,24 @@ func configureMachineIDSection(reader *bufio.Reader, out io.Writer, currentID st
 	return machineID
 }
 
+func configureAutostartSection(reader *bufio.Reader, out io.Writer, current bool) bool {
+	fmt.Fprintln(out, "------------------------------------------------------------")
+	if !autostart.IsSupported() {
+		fmt.Fprintf(out, "当前平台 (%s) 暂未支持开机自启常驻后台守护进程 (目前支持 macOS LaunchAgent)\n\n", runtime.GOOS)
+		return false
+	}
+	st := autostart.Status()
+	fmt.Fprintf(out, "当前后台自启状态: %s\n", st.Detail)
+	enabled := promptBool(reader, out, "是否开启 macOS 用户开机自启 / 后台常驻守护进程 (LaunchAgent)", current)
+	if enabled {
+		fmt.Fprintln(out, "[✓] 开机自启常驻后台: 开启")
+	} else {
+		fmt.Fprintln(out, "[✓] 开机自启常驻后台: 关闭")
+	}
+	fmt.Fprintln(out)
+	return enabled
+}
+
 func configureBrokerSection(reader *bufio.Reader, out io.Writer, current config.BrokerConfig) config.BrokerConfig {
 	fmt.Fprintln(out, "------------------------------------------------------------")
 	defaultURL := current.URL
@@ -268,44 +377,159 @@ func configureBrokerSection(reader *bufio.Reader, out io.Writer, current config.
 
 func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents []config.AgentConfig, forceCustomize bool) []config.AgentConfig {
 	fmt.Fprintln(out, "------------------------------------------------------------")
-	fmt.Fprintln(out, "正在探测本机 PATH 中的常见 Agent...")
+	fmt.Fprintln(out, "【本机 Agent CLI 配置向导】")
 
-	if len(currentAgents) == 0 {
-		currentAgents = config.DefaultAgents()
+	// If there are existing agents and not forceCustomize, show them and ask if user wants to reconfigure
+	if len(currentAgents) > 0 && !forceCustomize {
+		fmt.Fprintln(out, "当前配置的本机 Agent 状态:")
+		probed := config.ProbeAgents(currentAgents)
+		for _, p := range probed {
+			mark := "✗ 未找到"
+			if p.Ok {
+				mark = fmt.Sprintf("✓ 可用 (%s)", p.Detail)
+			} else if strings.Contains(p.Detail, "禁用") {
+				mark = "[-] 已禁用"
+			}
+			aliases := strings.Join(p.Alias, ", ")
+			customTag := ""
+			if p.Custom {
+				customTag = " [自定义]"
+			}
+			fmt.Fprintf(out, "  • %-10s [别名: %-14s]%s : %s\n", p.ID, aliases, customTag, mark)
+		}
+		fmt.Fprintln(out)
+
+		reconfigure := promptBool(reader, out, "是否运行向导重新扫描并配置本机 Agent CLI？", false)
+		if !reconfigure {
+			fmt.Fprintln(out, "[✓] 已保留当前 Agent 配置。")
+			fmt.Fprintln(out)
+			return currentAgents
+		}
 	}
 
-	probed := config.ProbeAgents(currentAgents)
-	for _, p := range probed {
-		mark := "✗ 未找到"
-		if p.Ok {
-			mark = fmt.Sprintf("✓ 可用 (%s)", p.Detail)
-		} else if strings.Contains(p.Detail, "禁用") {
-			mark = "[-] 已禁用"
+	// 1. Automatic scan (PATH + common install locations)
+	fmt.Fprintln(out, "\n[步骤 1/4] 自动扫描本机已安装的 Agent CLI (PATH 与常见安装路径)")
+	doScan := promptBool(reader, out, "是否自动扫描本机已安装的 Agent CLI？", true)
+	var scanRes config.ScanResult
+	if doScan {
+		for {
+			fmt.Fprintln(out, "正在扫描本机 PATH 及常见安装路径...")
+			scanRes = config.ScanLocalAgents()
+			printScanSummary(out, scanRes)
+			rescan := promptBool(reader, out, "是否重新扫描？", false)
+			if !rescan {
+				break
+			}
 		}
-		aliases := strings.Join(p.Alias, ", ")
-		fmt.Fprintf(out, "  • %-10s [别名: %-14s] : %s\n", p.ID, aliases, mark)
+	} else {
+		fmt.Fprintln(out, "[✓] 已跳过自动扫描。")
+	}
+
+	// 2. Multi-select built-in candidate engines
+	fmt.Fprintln(out, "\n[步骤 2/4] 勾选预置支持引擎")
+	fmt.Fprintln(out, "预置候选引擎列表 (支持自动路径探测与通用命令调度；心跳/流式/派活深度协议按各引擎能力逐步适配):")
+
+	builtinDefs := config.BuiltinEngineDefs()
+	discoveredMap := make(map[string]config.DiscoveredAgent)
+	for _, d := range scanRes.DiscoveredBuiltin {
+		discoveredMap[strings.ToLower(d.ID)] = d
+	}
+
+	existingMap := make(map[string]config.AgentConfig)
+	for _, ag := range currentAgents {
+		existingMap[strings.ToLower(ag.ID)] = ag
+	}
+
+	var defaultIndices []string
+	for i, def := range builtinDefs {
+		num := i + 1
+		idxStr := strconv.Itoa(num)
+		statusMark := "✗ 未发现"
+		if existing, ok := existingMap[strings.ToLower(def.ID)]; ok {
+			if existing.IsEnabled() {
+				if existing.Path != "" {
+					statusMark = fmt.Sprintf("✓ 已配置: %s", existing.Path)
+				} else if disc, okDisc := discoveredMap[strings.ToLower(def.ID)]; okDisc && disc.Path != "" {
+					statusMark = fmt.Sprintf("✓ 已配置 (发现: %s)", disc.Path)
+				} else {
+					statusMark = "✓ 已配置"
+				}
+				defaultIndices = append(defaultIndices, idxStr)
+			} else {
+				if existing.Path != "" {
+					statusMark = fmt.Sprintf("- 已配置(禁用): %s", existing.Path)
+				} else {
+					statusMark = "- 已配置(禁用)"
+				}
+			}
+		} else if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok {
+			statusMark = fmt.Sprintf("✓ 已发现: %s", disc.Path)
+			defaultIndices = append(defaultIndices, idxStr)
+		}
+		fmt.Fprintf(out, "  %2d) [%-20s] %-10s (%s)\n", num, statusMark, def.ID, def.Name)
 	}
 	fmt.Fprintln(out)
 
-	customize := forceCustomize
-	if !customize {
-		customize = promptBool(reader, out, "是否逐项配置/自定义本机 Agent CLI（路径、别名及启用状态）？", false)
-	}
-	if !customize {
-		fmt.Fprintln(out, "[✓] 已保留当前 Agent 配置。")
-		fmt.Fprintln(out)
-		return currentAgents
+	defaultSelectStr := strings.Join(defaultIndices, ",")
+	if defaultSelectStr == "" {
+		if len(currentAgents) > 0 {
+			defaultSelectStr = "none"
+		} else {
+			defaultSelectStr = "1,2"
+		}
 	}
 
-	var updatedAgents []config.AgentConfig
-	for _, ag := range currentAgents {
-		fmt.Fprintf(out, "\n配置 Agent: %s\n", ag.ID)
-		enabled := promptBool(reader, out, fmt.Sprintf("  是否启用 %s", ag.ID), ag.IsEnabled())
+	fmt.Fprintln(out, "请勾选要启用的预置引擎序号 (多个用逗号隔开，如 '1,2'；'all' 全部，'none' 留空)")
+	selectInput := promptLine(reader, out, "勾选预置引擎", defaultSelectStr)
+
+	var selectedDefs []config.BuiltinEngineDef
+	selectInput = strings.TrimSpace(selectInput)
+	if strings.EqualFold(selectInput, "all") {
+		selectedDefs = builtinDefs
+	} else if strings.EqualFold(selectInput, "none") {
+		selectedDefs = nil
+	} else {
+		selectedIndices := make(map[int]bool)
+		for _, part := range strings.Split(selectInput, ",") {
+			part = strings.TrimSpace(part)
+			if n, err := strconv.Atoi(part); err == nil && n >= 1 && n <= len(builtinDefs) {
+				selectedIndices[n] = true
+			}
+		}
+		for i, def := range builtinDefs {
+			if selectedIndices[i+1] {
+				selectedDefs = append(selectedDefs, def)
+			}
+		}
+	}
+
+	// 3. Item-by-item confirmation
+	fmt.Fprintln(out, "\n[步骤 3/4] 对勾选的预置引擎逐项确认 (预填扫描路径与别名)")
+	editedAgents := make(map[string]config.AgentConfig)
+	for _, def := range selectedDefs {
+		fmt.Fprintf(out, "\n[确认预置引擎: %s (%s)]\n", def.ID, def.Name)
+		defaultEnabled := true
+		if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && ex.Enabled != nil {
+			defaultEnabled = *ex.Enabled
+		}
+		enabled := promptBool(reader, out, fmt.Sprintf("  是否启用 %s", def.ID), defaultEnabled)
+
 		var path string
 		var aliases []string
 		if enabled {
-			path = promptLine(reader, out, "  可执行文件路径 (留空自动搜索 PATH)", ag.Path)
-			defaultAliases := strings.Join(ag.Alias, ", ")
+			defaultPath := ""
+			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok {
+				defaultPath = ex.Path
+			}
+			if disc, ok := discoveredMap[strings.ToLower(def.ID)]; ok {
+				defaultPath = config.WizardDefaultExecutablePath(defaultPath, disc.Path)
+			}
+			path = promptLine(reader, out, "  可执行文件路径 (留空自动搜索 PATH)", defaultPath)
+
+			defaultAliases := strings.Join(def.DefaultAlias, ", ")
+			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok && len(ex.Alias) > 0 {
+				defaultAliases = strings.Join(ex.Alias, ", ")
+			}
 			aliasStr := promptLine(reader, out, "  命令别名 (多个别名用逗号隔开)", defaultAliases)
 			for _, a := range strings.Split(aliasStr, ",") {
 				trimmed := strings.TrimSpace(a)
@@ -314,29 +538,87 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 				}
 			}
 		} else {
-			path = ag.Path
-			aliases = ag.Alias
+			if ex, ok := existingMap[strings.ToLower(def.ID)]; ok {
+				path = ex.Path
+				aliases = ex.Alias
+			}
 		}
-		updatedAgents = append(updatedAgents, config.AgentConfig{
-			ID:      ag.ID,
+		editedAgents[strings.ToLower(def.ID)] = config.AgentConfig{
+			ID:      def.ID,
 			Path:    path,
 			Alias:   aliases,
 			Enabled: &enabled,
-		})
+			Custom:  false,
+		}
 	}
 
-	// Optional add more agents
+	// 4. Custom CLI append
+	fmt.Fprintln(out, "\n[步骤 4/4] 追加自定义 CLI (可选)")
+	fmt.Fprintln(out, "注意: 自定义 CLI 需手动指定路径与别名，支持通用命令行执行；预置候选引擎已包含已知安装路径与别名探测规则。")
+	fmt.Fprintln(out, "      内置预置与自定义分库存放，自定义 CLI 勿使用系统预置引擎 ID。")
+
+	var unconfiguredCustom []config.DiscoveredAgent
+	for _, c := range scanRes.DiscoveredCustom {
+		if _, ok := existingMap[strings.ToLower(c.ID)]; !ok {
+			unconfiguredCustom = append(unconfiguredCustom, c)
+		}
+	}
+	if len(unconfiguredCustom) > 0 {
+		var candNames []string
+		for _, c := range unconfiguredCustom {
+			candNames = append(candNames, fmt.Sprintf("%s (%s)", c.ID, c.Path))
+		}
+		fmt.Fprintf(out, "扫描到其他可能的终端 CLI: %s\n", strings.Join(candNames, "; "))
+	}
+
+	var newCustomAgents []config.AgentConfig
 	for {
-		addMore := promptBool(reader, out, "是否添加其他本地 Agent CLI？", false)
-		if !addMore {
+		addCustom := promptBool(reader, out, "是否追加自定义本地 Agent CLI？", false)
+		if !addCustom {
 			break
 		}
-		customID := promptLine(reader, out, "Agent ID (如 myagent)", "")
+		customID := promptLine(reader, out, "  自定义 Agent ID (如 myagent)", "")
+		customID = strings.TrimSpace(customID)
 		if customID == "" {
 			break
 		}
-		path := promptLine(reader, out, "可执行文件路径 (留空搜索 PATH)", "")
-		aliasStr := promptLine(reader, out, "命令别名 (逗号分隔)", customID)
+		if config.IsBuiltinEngine(customID) {
+			fmt.Fprintf(out, "  [!] 错误: %q 为系统预置引擎，不可作为自定义 CLI 追加。请在步骤 2 内置引擎中配置。\n", customID)
+			continue
+		}
+
+		lowerCustomID := strings.ToLower(customID)
+		isDup := false
+		if _, ok := existingMap[lowerCustomID]; ok {
+			isDup = true
+		}
+		if !isDup {
+			if _, ok := editedAgents[lowerCustomID]; ok {
+				isDup = true
+			}
+		}
+		if !isDup {
+			for _, ag := range newCustomAgents {
+				if strings.ToLower(ag.ID) == lowerCustomID {
+					isDup = true
+					break
+				}
+			}
+		}
+		if isDup {
+			fmt.Fprintf(out, "  [!] 提示: Agent ID %q 已在列表中，请勿重复添加。\n", customID)
+			continue
+		}
+
+		defaultPath := ""
+		for _, c := range scanRes.DiscoveredCustom {
+			if strings.EqualFold(c.ID, customID) {
+				defaultPath = c.Path
+				break
+			}
+		}
+		path := promptLine(reader, out, "  可执行文件路径 (留空搜索 PATH)", defaultPath)
+		aliasStr := promptLine(reader, out, "  命令别名 (逗号分隔)", customID)
 		var aliases []string
 		for _, a := range strings.Split(aliasStr, ",") {
 			trimmed := strings.TrimSpace(a)
@@ -344,18 +626,97 @@ func configureAgentsSection(reader *bufio.Reader, out io.Writer, currentAgents [
 				aliases = append(aliases, trimmed)
 			}
 		}
-		t := true
-		updatedAgents = append(updatedAgents, config.AgentConfig{
+		enabled := promptBool(reader, out, fmt.Sprintf("  是否启用 %s", customID), true)
+		cAgent := config.AgentConfig{
 			ID:      customID,
 			Path:    path,
 			Alias:   aliases,
-			Enabled: &t,
-		})
+			Enabled: &enabled,
+			Custom:  true,
+		}
+		newCustomAgents = append(newCustomAgents, cAgent)
+		editedAgents[lowerCustomID] = cAgent
+		fmt.Fprintf(out, "  [✓] 已添加自定义 Agent: %s (custom: true)\n", customID)
 	}
 
-	fmt.Fprintln(out, "[✓] 本机 Agent 配置已更新。")
+	var finalAgents []config.AgentConfig
+	seen := make(map[string]bool)
+
+	// 1. Process current agents in their original order
+	// Preserves untouched items (both built-in and custom) with all their attributes intact!
+	for _, ag := range currentAgents {
+		lowerID := strings.ToLower(ag.ID)
+		if seen[lowerID] {
+			continue
+		}
+		seen[lowerID] = true
+		if updated, ok := editedAgents[lowerID]; ok {
+			finalAgents = append(finalAgents, updated)
+		} else {
+			finalAgents = append(finalAgents, ag)
+		}
+	}
+
+	// 2. Append newly selected built-in engines that were not previously configured
+	for _, def := range selectedDefs {
+		lowerID := strings.ToLower(def.ID)
+		if !seen[lowerID] {
+			seen[lowerID] = true
+			if updated, ok := editedAgents[lowerID]; ok {
+				finalAgents = append(finalAgents, updated)
+			}
+		}
+	}
+
+	// 3. Append newly added custom agents
+	for _, c := range newCustomAgents {
+		lowerID := strings.ToLower(c.ID)
+		if !seen[lowerID] {
+			seen[lowerID] = true
+			finalAgents = append(finalAgents, c)
+		}
+	}
+
+	fmt.Fprintln(out, "\n[✓] 本机 Agent 配置已更新。")
 	fmt.Fprintln(out)
-	return updatedAgents
+	return finalAgents
+}
+
+func printScanSummary(out io.Writer, res config.ScanResult) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "--- 扫描结果 ---")
+	if len(res.DiscoveredBuiltin) > 0 {
+		fmt.Fprintln(out, "  [已发现的预置引擎]:")
+		for _, d := range res.DiscoveredBuiltin {
+			fmt.Fprintf(out, "    ✓ %-10s : %s (%s)\n", d.ID, d.Path, d.Name)
+		}
+	} else {
+		fmt.Fprintln(out, "  [预置引擎]: 未在默认路径中直接探测到预置引擎")
+	}
+
+	if len(res.MissingBuiltin) > 0 {
+		var missingIDs []string
+		for _, m := range res.MissingBuiltin {
+			missingIDs = append(missingIDs, m.ID)
+		}
+		fmt.Fprintf(out, "  [未发现的预置引擎]: %s\n", strings.Join(missingIDs, ", "))
+	}
+
+	if len(res.IDEPlugins) > 0 {
+		fmt.Fprintln(out, "  [IDE 插件与扩展提示]:")
+		for _, p := range res.IDEPlugins {
+			fmt.Fprintf(out, "    ℹ %s: %s\n", p.Name, p.Detail)
+		}
+	}
+
+	if len(res.DiscoveredCustom) > 0 {
+		fmt.Fprintln(out, "  [其他扫描到的 CLI (可作为自定义引擎追加)]: ")
+		for _, c := range res.DiscoveredCustom {
+			fmt.Fprintf(out, "    • %-10s : %s\n", c.ID, c.Path)
+		}
+	}
+	fmt.Fprintln(out, "----------------")
+	fmt.Fprintln(out)
 }
 
 // VerifyConfigDiagnostics runs the doctor verification logic:
@@ -393,12 +754,16 @@ func VerifyConfigDiagnostics(out io.Writer, cfg *config.Config) (brokerOk bool, 
 	var announceAgents []model.AgentAnnounce
 	for _, p := range probed {
 		aliases := strings.Join(p.Alias, ", ")
+		customTag := ""
+		if p.Custom {
+			customTag = " [自定义]"
+		}
 		if !p.Ok && strings.Contains(p.Detail, "禁用") {
-			fmt.Fprintf(out, "  [-] %-10s [别名: %-14s] : %s\n", p.ID, aliases, p.Detail)
+			fmt.Fprintf(out, "  [-] %-10s [别名: %-14s]%s : %s\n", p.ID, aliases, customTag, p.Detail)
 		} else if p.Ok {
-			fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s] : 可用 (%s)\n", p.ID, aliases, p.Detail)
+			fmt.Fprintf(out, "  [✓] %-10s [别名: %-14s]%s : 可用 (%s)\n", p.ID, aliases, customTag, p.Detail)
 		} else {
-			fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s] : %s\n", p.ID, aliases, p.Detail)
+			fmt.Fprintf(out, "  [✗] %-10s [别名: %-14s]%s : %s\n", p.ID, aliases, customTag, p.Detail)
 			allAgentsOk = false
 		}
 		announceAgents = append(announceAgents, model.AgentAnnounce{
@@ -406,6 +771,7 @@ func VerifyConfigDiagnostics(out io.Writer, cfg *config.Config) (brokerOk bool, 
 			Alias:  p.Alias,
 			Ok:     p.Ok,
 			Detail: p.Detail,
+			Custom: p.Custom,
 		})
 	}
 

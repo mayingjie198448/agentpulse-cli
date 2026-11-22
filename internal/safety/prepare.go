@@ -44,6 +44,9 @@ type Request struct {
 	// RetainRoot keeps a verified run root so a test can read project files
 	// before CleanupRun. Production leaves this false.
 	RetainRoot bool
+	// Ownership is the creation record for a fixture directory. A path string
+	// or a name prefix is not accepted in its place.
+	Ownership *CreationRecord
 }
 
 // Prepared is a command that has not been started.
@@ -57,6 +60,9 @@ type Prepared struct {
 	Root     string
 	RunID    string
 
+	ChildLocalAppDataIsOwnedRoot   bool
+	ChildLocalAppDataFromOwnedRoot bool
+
 	ctx        context.Context
 	confirmR   *os.File
 	confirmW   *os.File
@@ -67,6 +73,14 @@ type Prepared struct {
 	started    bool
 	reaped     bool
 	pid        int
+	// startFn, when set, replaces Cmd.Start. Windows AppContainer uses it
+	// because os/exec cannot pass PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES.
+	startFn func() error
+	waitFn  func() error
+	killFn  func() error
+	// removeFn, when set, replaces deleteOwned. Tests use it to observe cleanup.
+	removeFn       func() (CleanupOutcome, error)
+	blockedCleanup error
 }
 
 // Outcome separates the user child from the controller.
@@ -159,6 +173,8 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		RealHome:    req.RealHome,
 		Sentinel:    req.SentinelPath,
 		ExeHash:     exeHash,
+		ExePath:     self,
+		Ownership:   req.Ownership,
 	})
 	if err != nil {
 		ev := refusedAudit(userArgv, auth, req, backend.Name(), err.Error())
@@ -170,6 +186,9 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		claimedProfile = req.ProfileHashOverride
 	}
 	claimedExe := exeHash
+	if rec.ExeSHA256 != "" {
+		claimedExe = rec.ExeSHA256
+	}
 	if req.ExeHashOverride != "" {
 		claimedExe = req.ExeHashOverride
 	}
@@ -177,7 +196,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 	if auditPath == "" {
 		auditPath = DefaultAuditPath()
 	}
-	if withinPath(rec.Root, auditPath) {
+	if pathsConflate(rec.Root, auditPath) {
 		_, _ = deleteOwned(rec, protectedHomes(req.RealHome))
 		return nil, fmt.Errorf("%w: audit path is inside the run root", ErrRefused)
 	}
@@ -194,8 +213,11 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		"--sentinel", rec.Sentinel,
 		"--sentinel-dev", strconv.FormatUint(rec.SentinelDev, 10),
 		"--sentinel-ino", strconv.FormatUint(rec.SentinelIno, 10),
-		"--",
 	}
+	if rec.ProfileName != "" {
+		args = append(args, "--profile-name", rec.ProfileName, "--package-sid", rec.PackageSID, "--cap-count", "0")
+	}
+	args = append(args, "--")
 	args = append(args, userArgv...)
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -212,7 +234,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 	if backend.Name() != "linux-landlock" {
 		detail = backend.Name() + " selected; fresh probe still required"
 	}
-	return &Prepared{
+	prepared := &Prepared{
 		Cmd:      cmd,
 		UserArgv: userArgv,
 		Danger:   explicitShape,
@@ -232,7 +254,7 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 			RealHome:         firstNonEmpty(req.RealHome, RealHome()),
 			TestHome:         rec.Home,
 			RunRoot:          rec.Root,
-			ExeSHA256:        exeHash,
+			ExeSHA256:        claimedExe,
 			ProfileHash:      rec.ProfileHash,
 			IsolationBackend: backend.Name(),
 			IsolationDetail:  detail,
@@ -244,7 +266,12 @@ func Prepare(ctx context.Context, req Request) (*Prepared, error) {
 		},
 		auditFile:  auditPath,
 		retainRoot: req.RetainRoot,
-	}, nil
+	}
+	if err := configureConfinedLaunch(prepared); err != nil {
+		_, _ = deleteOwned(rec, protectedHomes(req.RealHome))
+		return nil, fmt.Errorf("%w: %v", ErrRefused, err)
+	}
+	return prepared, nil
 }
 
 func refusedAudit(argv []string, auth string, req Request, backend, detail string) AuditEvent {
@@ -274,19 +301,35 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// composeStartError wraps a start failure with ErrRefused while preserving
+// underlying causes and diagnostics.
+func composeStartError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrRefused, err)
+}
+
 // Start starts the process. For a confined command it waits until the helper
 // confirms the fresh probe, and it does not treat a failed probe as a running
 // user command.
 func (p *Prepared) Start() error {
-	if p.Cmd == nil {
+	if p.Cmd == nil && p.startFn == nil {
 		return fmt.Errorf("%w: nothing to start", ErrRefused)
 	}
-	if err := p.Cmd.Start(); err != nil {
+	var err error
+	if p.startFn != nil {
+		err = p.startFn()
+	} else {
+		err = p.Cmd.Start()
+	}
+	if err != nil {
+		p.keepRoot(err)
 		p.finishRefused(err.Error(), nil)
-		return fmt.Errorf("%w: %v", ErrRefused, err)
+		return composeStartError(err)
 	}
 	p.started = true
-	if p.Cmd.Process != nil {
+	if p.pid == 0 && p.Cmd != nil && p.Cmd.Process != nil {
 		p.pid = p.Cmd.Process.Pid
 	}
 	if p.confirmW != nil {
@@ -320,12 +363,14 @@ func (p *Prepared) readConfirm() error {
 	if p.ctx != nil {
 		select {
 		case <-p.ctx.Done():
-			if p.Cmd.Process != nil {
-				_ = p.Cmd.Process.Kill()
-			}
-			_ = p.Cmd.Wait()
+			p.killChild()
+			werr := p.waitChild()
+			p.keepRoot(werr)
 			p.reaped = true
 			p.finishRefused("verification canceled", helperPtr(HelperExitVerify))
+			if werr != nil {
+				return werr
+			}
 			return fmt.Errorf("verification canceled")
 		case g := <-ch:
 			n, readErr = g.n, g.err
@@ -339,7 +384,8 @@ func (p *Prepared) readConfirm() error {
 		return nil
 	}
 	if !p.reaped {
-		_ = p.Cmd.Wait()
+		werr := p.waitChild()
+		p.keepRoot(werr)
 		p.reaped = true
 	}
 	if msg == "" {
@@ -359,8 +405,8 @@ func (p *Prepared) Pid() int { return p.pid }
 // confined root only when ownership still matches.
 func (p *Prepared) Wait() (Outcome, error) {
 	var waitErr error
-	if p.started && !p.reaped && p.Cmd != nil {
-		waitErr = p.Cmd.Wait()
+	if p.started && !p.reaped && (p.Cmd != nil || p.waitFn != nil) {
+		waitErr = p.waitChild()
 		p.reaped = true
 	}
 	out := Outcome{AuditPath: p.auditPath()}
@@ -387,8 +433,22 @@ func (p *Prepared) Wait() (Outcome, error) {
 	p.audit.ControllerResult = "isolated"
 	p.audit.IsolationApplied = true
 	p.audit.FSWrite = "verified"
+	if errors.Is(waitErr, ErrDescendantsActive) {
+		p.keepRoot(waitErr)
+	}
+	if p.blockedCleanup != nil {
+		p.audit.ControllerResult = "BLOCKED"
+		p.audit.CleanupResult = "BLOCKED"
+		p.audit.CleanupReason = p.blockedCleanup.Error()
+		_ = AppendAudit(p.auditPath(), p.audit)
+		out.ControllerResult = p.audit.ControllerResult
+		if waitErr == nil {
+			waitErr = p.blockedCleanup
+		}
+		return out, waitErr
+	}
 	if p.rec != nil && !p.retainRoot {
-		cout, cerr := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
+		cout, cerr := p.removeRoot()
 		out.Cleanup = cout
 		p.audit.CleanupResult = cout.Result
 		p.audit.CleanupReason = cout.Reason
@@ -413,20 +473,64 @@ func (p *Prepared) finishRefused(detail string, helper *int) {
 	p.audit.HelperExit = helper
 	p.audit.ExitCode = ExitRefused
 	p.audit.ChildExit = nil
-	if p.rec != nil {
-		cout, _ := deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
+	if p.rec != nil || p.removeFn != nil {
+		cout, cerr := p.removeRoot()
 		p.audit.CleanupResult = cout.Result
 		p.audit.CleanupReason = cout.Reason
 		p.audit.CleanupTargets = cout.Targets
+		if cerr != nil && p.audit.CleanupReason == "" {
+			p.audit.CleanupReason = cerr.Error()
+		}
 		if cout.Result != "deleted" {
 			p.audit.CleanupResult = "BLOCKED"
 		}
 	}
 	_ = AppendAudit(p.auditPath(), p.audit)
-	p.rec = nil
+	if p.blockedCleanup == nil {
+		p.rec = nil
+	}
+}
+
+func (p *Prepared) keepRoot(err error) {
+	if errors.Is(err, ErrDescendantsActive) && p.blockedCleanup == nil {
+		p.blockedCleanup = err
+	}
+}
+
+func (p *Prepared) removeRoot() (CleanupOutcome, error) {
+	if p.blockedCleanup != nil {
+		return CleanupOutcome{Result: "BLOCKED", Reason: p.blockedCleanup.Error()}, p.blockedCleanup
+	}
+	if p.removeFn != nil {
+		return p.removeFn()
+	}
+	if p.rec == nil {
+		return CleanupOutcome{}, nil
+	}
+	return deleteOwned(*p.rec, protectedHomes(p.audit.RealHome))
 }
 
 func (p *Prepared) auditPath() string { return p.auditFile }
+
+func (p *Prepared) waitChild() error {
+	if p.waitFn != nil {
+		return p.waitFn()
+	}
+	if p.Cmd == nil {
+		return nil
+	}
+	return p.Cmd.Wait()
+}
+
+func (p *Prepared) killChild() {
+	if p.killFn != nil {
+		p.killFn()
+		return
+	}
+	if p.Cmd != nil && p.Cmd.Process != nil {
+		_ = p.Cmd.Process.Kill()
+	}
+}
 
 func helperPtr(v int) *int { return &v }
 
@@ -437,6 +541,10 @@ func exitCodeOf(err error) (int, bool) {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		return ee.ExitCode(), true
+	}
+	var coded interface{ ExitCode() int }
+	if errors.As(err, &coded) {
+		return coded.ExitCode(), true
 	}
 	return 0, false
 }
