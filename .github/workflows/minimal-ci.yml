@@ -1,22 +1,22 @@
-# 最小 CI 设计稿。本文件当前不会调度任何作业。
-# 触发器只匹配一个不存在的分支，作业条件又以 false 开头。
-# 因此本 PR 的推送不会启动托管运行器，也不会把离线的自托管 runner 排进队列。
-# 登记为 offline 不是 ready。skipped 不是通过。全部作业被跳过时平台会把工作流显示为成功，
-# 所以这里根本不让工作流运行，而不是靠跳过凑出一个绿色检查。
-# 主机锁是另一项已另行批准的配置验证，不在本文件实施，也不表示本 CI 可以启用。
+# 同仓 push 入口。默认分支没有本文件时，手动派发事件收不到，所以入口不用它。
+# 入口是已存在的 CI 分支 mayingjie/minimal-ci-8a30 上的 push。
+# mac 标签字面量 self-hosted,macOS,ARM64,agentpulse
+# windows 标签字面量 self-hosted,Windows,X64,agentpulse
+# 被测源码树固定为 PR55 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf。
+# 脚本版本是本次 push 的 github.sha。PR56 变绿不等于 PR55 原树通过。
+# 新 runner 服务仍是 offline。本推送可能生成排队中的作业，但离线服务不会执行它。
+# 不安装、不启动 runner，不设置 ready，不改仓库设置。
 
 name: minimal-ci
 
 on:
   push:
     branches:
-      - agentpulse-ci-disabled-pending-approval
+      - mayingjie/minimal-ci-8a30
 
 permissions:
   contents: read
-  actions: write
 
-# 只串行本仓库这一条工作流。它不是同一台物理机上的跨仓锁。
 concurrency:
   group: agentpulse-cli-minimal-ci-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
@@ -24,102 +24,103 @@ concurrency:
 jobs:
   darwin-native:
     name: darwin native
-    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_MAC_RUNNER_LABELS == 'self-hosted,macOS,ARM64,agentpulse' }}"
+    if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/mayingjie/minimal-ci-8a30' && github.event.repository.fork == false }}"
     runs-on: [self-hosted, macOS, ARM64, agentpulse]
     timeout-minutes: 20
     steps:
-      - name: checkout pushed sha
+      - name: checkout ci scripts
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+      - name: checkout pr55 tree outside the script worktree
+        shell: bash
+        run: |
+          git fetch --depth 1 https://github.com/mayingjie198448/agentpulse-cli.git 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          git worktree add --detach "$RUNNER_TEMP/pr55-target" 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          git -C "$RUNNER_TEMP/pr55-target" rev-parse HEAD
+          git -C "$RUNNER_TEMP/pr55-target" status --porcelain
       - name: trust boundary
+        id: trust
         shell: bash
         env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          FORK: ${{ github.event.repository.fork }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: bash scripts/ci/trust-boundary.sh
-      - name: darwin lane
+      - name: darwin lane on pr55 tree
         shell: bash
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          TARGET_ROOT: ${{ runner.temp }}/pr55-target
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: bash scripts/ci/minimal-ci.sh
-      - name: upload darwin log
+      - name: cross compile from pr55 tree
+        if: steps.trust.outcome == 'success'
+        shell: bash
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin-cross
+        run: bash scripts/ci/minimal-ci.sh --cross-compile
+      - name: upload darwin logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: darwin-native-${{ github.run_id }}
-          path: ${{ runner.temp }}/agentpulse-darwin
-          if-no-files-found: warn
+          name: darwin-pr55-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/agentpulse-darwin
+            ${{ runner.temp }}/agentpulse-darwin-cross
+          if-no-files-found: error
 
   windows-native:
     name: windows native
-    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_WINDOWS_RUNNER_LABELS == 'self-hosted,Windows,X64,agentpulse' }}"
+    if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/mayingjie/minimal-ci-8a30' && github.event.repository.fork == false }}"
     runs-on: [self-hosted, Windows, X64, agentpulse]
     timeout-minutes: 20
     steps:
-      - name: checkout pushed sha
+      - name: checkout ci scripts
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+      - name: checkout pr55 tree outside the script worktree
+        shell: bash
+        run: |
+          git fetch --depth 1 https://github.com/mayingjie198448/agentpulse-cli.git 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          git worktree add --detach "$RUNNER_TEMP/pr55-target" 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          git -C "$RUNNER_TEMP/pr55-target" rev-parse HEAD
+          git -C "$RUNNER_TEMP/pr55-target" status --porcelain
       - name: trust boundary
         shell: bash
         env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          FORK: ${{ github.event.repository.fork }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
         run: bash scripts/ci/trust-boundary.sh
-      - name: windows lane
+      - name: windows lane on pr55 tree
         shell: bash
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+          TARGET_ROOT: ${{ runner.temp }}/pr55-target
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
         run: bash scripts/ci/minimal-ci.sh
-      - name: upload windows log
+      - name: upload windows logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: windows-native-${{ github.run_id }}
+          name: windows-pr55-${{ github.run_id }}
           path: ${{ runner.temp }}/agentpulse-windows
-          if-no-files-found: warn
-
-  cross-compile:
-    name: cross compile not native
-    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_MAC_RUNNER_LABELS == 'self-hosted,macOS,ARM64,agentpulse' }}"
-    runs-on: [self-hosted, macOS, ARM64, agentpulse]
-    timeout-minutes: 20
-    steps:
-      - name: checkout pushed sha
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - name: trust boundary
-        shell: bash
-        env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.sha }}
-          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-cross
-        run: bash scripts/ci/trust-boundary.sh
-      - name: cross compile
-        shell: bash
-        env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.sha }}
-          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-cross
-        run: bash scripts/ci/minimal-ci.sh --cross-compile
-      - name: upload cross log
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: cross-compile-${{ github.run_id }}
-          path: ${{ runner.temp }}/agentpulse-cross
-          if-no-files-found: warn
+          if-no-files-found: error

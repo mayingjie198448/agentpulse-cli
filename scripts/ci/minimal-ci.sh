@@ -104,12 +104,28 @@ static_contract() {
     echo "CONTRACT_FAIL untrusted_head_checkout"
     failed=1
   fi
-  if ! grep -F -q 'agentpulse-ci-disabled-pending-approval' "$workflow"; then
-    echo "CONTRACT_FAIL execution_lock_branch_missing"
+  if ! grep -F -q 'mayingjie/minimal-ci-8a30' "$workflow"; then
+    echo "CONTRACT_FAIL trusted_branch_missing"
     failed=1
   fi
-  if ! grep -F -q 'false &&' "$workflow"; then
-    echo "CONTRACT_FAIL execution_lock_missing"
+  if ! grep -F -q '9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf' "$workflow"; then
+    echo "CONTRACT_FAIL target_sha_missing"
+    failed=1
+  fi
+  if grep -n -F 'false &&' "$workflow"; then
+    echo "CONTRACT_FAIL execution_still_disabled"
+    failed=1
+  fi
+  if grep -n -F 'agentpulse-ci-disabled-pending-approval' "$workflow"; then
+    echo "CONTRACT_FAIL disabled_branch_still_present"
+    failed=1
+  fi
+  if grep -n -F 'actions: write' "$workflow"; then
+    echo "CONTRACT_FAIL actions_write_not_required"
+    failed=1
+  fi
+  if ! grep -F -q 'contents: read' "$workflow"; then
+    echo "CONTRACT_FAIL contents_read_missing"
     failed=1
   fi
   if ! grep -F -q 'persist-credentials: false' "$workflow"; then
@@ -200,6 +216,31 @@ if ! verify_identity "$ROOT" "$ARTIFACT_DIR"; then
   echo "OVERALL_RC=1 reason=identity"
   exit 1
 fi
+SCRIPT_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+SCRIPT_TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')"
+printf '%s\n' "SCRIPT_SHA=$SCRIPT_SHA"
+printf '%s\n' "SCRIPT_TREE=$SCRIPT_TREE"
+WORK_ROOT="$ROOT"
+if [[ -n "${TARGET_ROOT:-}" ]]; then
+  WORK_ROOT="$(cd "$TARGET_ROOT" && pwd)"
+  TARGET_HEAD="$(git -C "$WORK_ROOT" rev-parse HEAD)"
+  TARGET_TREE="$(git -C "$WORK_ROOT" rev-parse 'HEAD^{tree}')"
+  printf '%s\n' "TARGET_SHA_ACTUAL=$TARGET_HEAD"
+  printf '%s\n' "TARGET_TREE=$TARGET_TREE"
+  printf '%s\n' "RESULT_SCOPE=target_tree_not_script_tree"
+  if [[ -z "${TARGET_SHA:-}" || "$TARGET_HEAD" != "$TARGET_SHA" ]]; then
+    echo "OVERALL_RC=1 reason=target_sha_mismatch expected=${TARGET_SHA:-<unset>} actual=$TARGET_HEAD"
+    exit 1
+  fi
+  if [[ -n "$(git -C "$WORK_ROOT" status --porcelain)" ]]; then
+    echo "OVERALL_RC=1 reason=target_tree_dirty_before"
+    git -C "$WORK_ROOT" status --porcelain
+    exit 1
+  fi
+else
+  printf '%s\n' "RESULT_SCOPE=script_tree"
+fi
+cd "$WORK_ROOT"
 
 # 必须看到 go1.27.3。不改 go.mod，不运行 Go 安装器。
 # 不设置 GOTOOLCHAIN=local，否则包装器会报自己的旧版本。
@@ -261,8 +302,12 @@ if [[ "${1:-}" == "--cross-compile" ]]; then
       overall=1
     fi
   done
-  if ! git -C "$ROOT" diff --quiet || [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
-    echo "WORKTREE_CHANGED_DURING_CROSS"
+  if ! git -C "$WORK_ROOT" diff --quiet || [[ -n "$(git -C "$WORK_ROOT" status --porcelain)" ]]; then
+    echo "TARGET_TREE_CHANGED_DURING_CROSS"
+    git -C "$WORK_ROOT" status --porcelain
+    overall=1
+  elif ! git -C "$ROOT" diff --quiet || [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+    echo "SCRIPT_TREE_CHANGED_DURING_CROSS"
     git -C "$ROOT" status --porcelain
     overall=1
   else
@@ -322,6 +367,8 @@ printf '%s\n' "HELPER_PATH=$helper"
 printf '%s\n' "EVIDENCE_PATH=$evidence"
 
 run_and_record helper_build env CGO_ENABLED=0 go build -trimpath -o "$helper" ./cmd/agentpulse-test-helper
+printf '%s\n' "HELPER_BUILD_DOES_NOT_WRITE_TARGET_TREE=yes"
+printf '%s\n' "HELPER_SOURCE=$WORK_ROOT/cmd/agentpulse-test-helper"
 
 export AGENTPULSE_TEST_HELPER="$helper"
 export AGENTPULSE_ARGV_WIRE_EVIDENCE="$evidence"
@@ -353,8 +400,12 @@ else
   note_rc version_smoke 1
 fi
 
-if ! git -C "$ROOT" diff --quiet || [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
-  echo "WORKTREE_CHANGED_DURING_CI"
+if ! git -C "$WORK_ROOT" diff --quiet || [[ -n "$(git -C "$WORK_ROOT" status --porcelain)" ]]; then
+  echo "TARGET_TREE_CHANGED_DURING_CI"
+  git -C "$WORK_ROOT" status --porcelain
+  note_rc worktree_unchanged 1
+elif ! git -C "$ROOT" diff --quiet || [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+  echo "SCRIPT_TREE_CHANGED_DURING_CI"
   git -C "$ROOT" status --porcelain
   note_rc worktree_unchanged 1
 else

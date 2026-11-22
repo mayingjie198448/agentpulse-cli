@@ -1,0 +1,8 @@
+erratum=actions_write_was_not_required_for_same_run_artifact_upload
+old_workflow_permission=actions: write
+corrected_permission=contents: read
+source_workflow_syntax=https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+source_statement=actions write is documented there as permitting cancellation of a workflow run. contents read permits reading repository contents. The pinned actions/upload-artifact README at ea165f8d65b6e75b540449e92b4886f43607fa02 does not require declaring actions write for an upload in the same run.
+artifact_metadata_write=exists for REST storage records. This workflow does not call that API.
+old_author_and_prior_review=treated actions write as required. That was incorrect for this same-run upload.
+this_record_does_not_delete_older_logs=yes

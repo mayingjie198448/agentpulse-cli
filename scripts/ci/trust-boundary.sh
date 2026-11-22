@@ -1,37 +1,43 @@
 #!/usr/bin/env bash
-# 可信执行边界。不检出代码，不读取密钥，不注册 runner。
-# 生产允许列表为空：任何真实调用都是 BLOCKED，退出码 2。
-# 拒绝在可信工作流里检出不可信头。那一类事件直接退出 1。
+# 可信同仓 push 入口。允许列表只有本仓库的 CI 分支。
+# 被测树必须是 PR55 的固定提交。脚本版本是这次 push 的 github.sha。
+# 不执行 fork，不执行拉取请求里的代码。
 
 set -u
 
 REPOSITORY_EXPECTED='mayingjie198448/agentpulse-cli'
+REF_EXPECTED='refs/heads/mayingjie/minimal-ci-8a30'
+TARGET_SHA_EXPECTED='9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf'
 
 evaluate_trust() {
   local event="$1"
   local repository="$2"
   local ref="$3"
-  local sha="$4"
-  local head_sha="$5"
-  local queue="$6"
+  local script_sha="$4"
+  local script_head="$5"
+  local target_sha="$6"
+  local target_head="$7"
+  local fork="$8"
   printf '%s\n' "TRUST_EVENT=$event"
   printf '%s\n' "TRUST_REPOSITORY=$repository"
   printf '%s\n' "TRUST_REF=$ref"
-  printf '%s\n' "TRUST_SHA=$sha"
-  printf '%s\n' "TRUST_HEAD_SHA=$head_sha"
-  printf '%s\n' "TRUST_ALLOWLIST=empty"
-  printf '%s\n' "FORK_POLICY=fork_and_same_repo_pull_requests_are_not_executed"
-  printf '%s\n' "CHECKOUT_POLICY=only_the_sha_of_a_push_to_this_repository"
+  printf '%s\n' "TRUST_SCRIPT_SHA=$script_sha"
+  printf '%s\n' "TRUST_SCRIPT_HEAD=$script_head"
+  printf '%s\n' "TRUST_TARGET_SHA=$target_sha"
+  printf '%s\n' "TRUST_TARGET_HEAD=$target_head"
+  printf '%s\n' "TRUST_FORK=$fork"
+  printf '%s\n' "TRUST_ALLOWLIST=$REF_EXPECTED"
+  printf '%s\n' "TARGET_SHA_EXPECTED=$TARGET_SHA_EXPECTED"
+  printf '%s\n' "FORK_POLICY=fork_code_is_not_executed_on_self_hosted"
+  printf '%s\n' "CHECKOUT_POLICY=script_sha_is_push_commit_target_sha_is_pr55"
   printf '%s\n' "SECRET_BOUNDARY=no_secrets_context permissions_contents_read credentials_not_persisted"
   printf '%s\n' "EXECUTES_UNTRUSTED_HEAD=no"
-  printf '%s\n' "TRUST_QUEUE=$queue"
-  printf '%s\n' "TRUST_QUEUE_DOES_NOT_OVERRIDE_EMPTY_ALLOWLIST=yes"
   if [[ "$event" == "pull_request_target" ]]; then
     printf '%s\n' "TRUST_RESULT=REFUSED reason=would_check_out_untrusted_head_from_trusted_workflow"
     return 1
   fi
-  if [[ "$event" == "pull_request" ]]; then
-    printf '%s\n' "TRUST_RESULT=BLOCKED reason=pull_request_code_is_not_executed"
+  if [[ "$event" == "pull_request" || "$fork" == "true" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=fork_or_pull_request_code_is_not_executed"
     return 2
   fi
   if [[ "$repository" != "$REPOSITORY_EXPECTED" ]]; then
@@ -42,13 +48,29 @@ evaluate_trust() {
     printf '%s\n' "TRUST_RESULT=BLOCKED reason=event_is_not_push"
     return 2
   fi
-  # 允许列表是字面空串。没有分支被授权，包括当前禁用用的占位分支名。
-  printf '%s\n' "TRUST_RESULT=BLOCKED reason=trusted_ref_allowlist_empty ref=$ref"
-  return 2
+  if [[ "$ref" != "$REF_EXPECTED" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=ref_not_in_allowlist ref=$ref"
+    return 2
+  fi
+  if [[ -z "$script_sha" || "$script_sha" != "$script_head" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=script_checkout_is_not_the_pushed_sha"
+    return 2
+  fi
+  if [[ "$target_sha" != "$TARGET_SHA_EXPECTED" || "$target_head" != "$TARGET_SHA_EXPECTED" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=target_is_not_pr55_head"
+    return 2
+  fi
+  if [[ "$fork" != "false" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=fork_flag_not_false"
+    return 2
+  fi
+  printf '%s\n' "TRUST_RESULT=ALLOW reason=same_repo_push_of_ci_branch_testing_pr55"
+  return 0
 }
 
 run_self_check() {
   local failed=0
+  local target="$TARGET_SHA_EXPECTED"
   check_case() {
     local name="$1"
     local expected_rc="$2"
@@ -64,6 +86,10 @@ run_self_check() {
       echo "CASE_FAIL $name rc"
       failed=1
     fi
+    if [[ "$expected_rc" == "0" && "$output" != *"TRUST_RESULT=ALLOW"* ]]; then
+      echo "CASE_FAIL $name missing_ALLOW"
+      failed=1
+    fi
     if [[ "$expected_rc" == "2" && "$output" != *"TRUST_RESULT=BLOCKED"* ]]; then
       echo "CASE_FAIL $name missing_BLOCKED"
       failed=1
@@ -73,13 +99,15 @@ run_self_check() {
       failed=1
     fi
   }
-  check_case untrusted_target 1 pull_request_target "$REPOSITORY_EXPECTED" refs/heads/main abc abc ready
-  check_case pull_request_not_executed 2 pull_request "$REPOSITORY_EXPECTED" refs/pull/56/merge abc def ready
-  check_case wrong_repository 2 push example/other refs/heads/main abc abc ready
-  check_case missing_event 2 "" "$REPOSITORY_EXPECTED" refs/heads/main abc abc ready
-  check_case push_allowlist_empty 2 push "$REPOSITORY_EXPECTED" refs/heads/agentpulse-ci-disabled-pending-approval abc abc ready
-  check_case sha_mismatch_still_blocked 2 push "$REPOSITORY_EXPECTED" refs/heads/main abc def ready
-  check_case queue_ready_still_blocked 2 push "$REPOSITORY_EXPECTED" refs/heads/main abc abc ready
+  check_case allowed_ci_push 0 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
+  check_case untrusted_target 1 pull_request_target "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
+  check_case pull_request_not_executed 2 pull_request "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
+  check_case fork_not_executed 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" true
+  check_case wrong_repository 2 push example/other "$REF_EXPECTED" abc abc "$target" "$target" false
+  check_case wrong_ref 2 push "$REPOSITORY_EXPECTED" refs/heads/main abc abc "$target" "$target" false
+  check_case script_sha_mismatch 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc def "$target" "$target" false
+  check_case target_mismatch 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 false
+  check_case missing_fork_flag 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" ""
   if [[ "$failed" != "0" ]]; then
     echo "TRUST_SELF_CHECK_RC=1"
     return 1
@@ -96,13 +124,18 @@ fi
 event="${GITHUB_EVENT_NAME:-}"
 repository="${GITHUB_REPOSITORY:-}"
 ref="${GITHUB_REF:-}"
-sha="${GITHUB_SHA:-}"
-head_sha=""
-if git rev-parse HEAD >/dev/null 2>&1; then
-  head_sha="$(git rev-parse HEAD)"
-fi
+script_sha="${GITHUB_SHA:-}"
 if [[ -n "${EXPECTED_SHA:-}" ]]; then
-  sha="$EXPECTED_SHA"
+  script_sha="$EXPECTED_SHA"
 fi
-evaluate_trust "$event" "$repository" "$ref" "$sha" "$head_sha" "${AGENTPULSE_CI_QUEUE_AUTHORIZED:-}"
+script_head=""
+if git rev-parse HEAD >/dev/null 2>&1; then
+  script_head="$(git rev-parse HEAD)"
+fi
+target_sha="${TARGET_SHA:-}"
+target_head=""
+if [[ -n "${TARGET_ROOT:-}" ]] && git -C "$TARGET_ROOT" rev-parse HEAD >/dev/null 2>&1; then
+  target_head="$(git -C "$TARGET_ROOT" rev-parse HEAD)"
+fi
+evaluate_trust "$event" "$repository" "$ref" "$script_sha" "$script_head" "$target_sha" "$target_head" "${FORK:-}"
 exit $?
