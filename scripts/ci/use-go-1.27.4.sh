@@ -45,20 +45,54 @@ esac
 name="go${version}.${os}-${arch}.${ext}"
 archive="$prefix/$name"
 root="$prefix/goroot"
-if [[ ! -x "$root/bin/go" && ! -x "$root/bin/go.exe" ]]; then
-  url="https://go.dev/dl/$name"
-  echo "GO_DOWNLOAD url=$url" >&2
-  curl -fsSL "$url" -o "$archive"
+url="https://go.dev/dl/$name"
+
+verify_archive() {
+  local got=""
+  if [[ ! -f "$archive" ]]; then
+    echo "GO_ARCHIVE_MISSING path=$archive" >&2
+    return 1
+  fi
   if command -v sha256sum >/dev/null 2>&1; then
     got="$(sha256sum "$archive" | awk '{print $1}')"
   else
     got="$(shasum -a 256 "$archive" | awk '{print $1}')"
   fi
+  echo "GO_SOURCE_URL=$url" >&2
+  echo "GO_CHECKSUM_EXPECTED=$want" >&2
+  echo "GO_CHECKSUM_ACTUAL=$got" >&2
   if [[ "$got" != "$want" ]]; then
-    echo "GO_CHECKSUM_MISMATCH got=$got want=$want" >&2
+    echo "GO_CHECKSUM_MISMATCH=yes" >&2
+    return 1
+  fi
+  echo "GO_CHECKSUM_OK=yes" >&2
+  return 0
+}
+
+have_go=0
+if [[ -x "$root/bin/go" || -x "$root/bin/go.exe" ]]; then
+  have_go=1
+fi
+if [[ "$have_go" == "1" ]]; then
+  echo "GO_CACHE=hit" >&2
+  if ! verify_archive; then
+    echo "GO_CACHE_REJECTED=yes" >&2
+    rm -rf "$root"
+    rm -f "$archive"
+    have_go=0
+  else
+    echo "GO_CACHE_VERIFIED=yes" >&2
+  fi
+else
+  echo "GO_CACHE=miss" >&2
+fi
+if [[ "$have_go" != "1" ]]; then
+  echo "GO_DOWNLOAD url=$url" >&2
+  curl -fsSL "$url" -o "$archive"
+  if ! verify_archive; then
     exit 1
   fi
-  rm -rf "$prefix/unpack"
+  rm -rf "$prefix/unpack" "$root"
   mkdir -p "$prefix/unpack"
   if [[ "$ext" == "zip" ]]; then
     if command -v unzip >/dev/null 2>&1; then
@@ -69,11 +103,11 @@ if [[ ! -x "$root/bin/go" && ! -x "$root/bin/go.exe" ]]; then
   else
     tar -xzf "$archive" -C "$prefix/unpack"
   fi
-  rm -rf "$root"
   mv "$prefix/unpack/go" "$root"
 fi
 
 printf 'export GOROOT=%q\n' "$root"
+printf 'export AGENTPULSE_GOROOT_SELECTED=%q\n' "$root"
 printf 'export PATH=%q\n' "$root/bin:$PATH"
 printf 'export GOTOOLCHAIN=%q\n' "local"
 printf 'GO_INSTALL_ISOLATED=yes\n' >&2

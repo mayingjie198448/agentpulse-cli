@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 可信同仓 push 入口。允许列表只有本仓库的 CI 分支。
-# 被测树必须是 PR55 的固定提交。脚本版本是这次 push 的 github.sha。
-# 不执行 fork，不执行拉取请求里的代码。
+# 被测树就是这次 push 的 github.sha，与脚本检出是同一棵派生升级候选。
+# 它不是 PR55 原提交。不执行 fork，不执行拉取请求里的代码。
 
 set -u
 
@@ -68,7 +68,7 @@ evaluate_trust() {
     printf '%s\n' "TRUST_RESULT=BLOCKED reason=fork_flag_not_false"
     return 2
   fi
-  printf '%s\n' "TRUST_RESULT=ALLOW reason=same_repo_push_of_ci_branch_testing_pr55"
+  printf '%s\n' "TRUST_RESULT=ALLOW reason=same_repo_push_of_upgrade_candidate"
   return 0
 }
 

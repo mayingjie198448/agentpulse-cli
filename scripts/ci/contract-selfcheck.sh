@@ -25,6 +25,11 @@ if ! bash "$ROOT/scripts/ci/gate.sh" --self-check; then
   failed=1
 fi
 
+if ! bash "$ROOT/scripts/ci/pathnorm.sh" --self-check; then
+  echo "CONTRACT_SELF_CHECK_FAIL pathnorm"
+  failed=1
+fi
+
 if ! bash "$ROOT/scripts/ci/trust-boundary.sh" --self-check; then
   echo "CONTRACT_SELF_CHECK_FAIL trust"
   failed=1

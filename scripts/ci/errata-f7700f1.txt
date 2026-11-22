@@ -1,0 +1,10 @@
+name=f7700f1
+status=not_a_remote_commit
+where_it_appeared=an earlier PR description named f7700f1 as a script commit. That object was an amended local commit and was not pushed.
+do_not_use_as_tree_or_script_id=yes
+surviving_go_baseline_commit=ca8a2fd3c0d54f89c399e426978ec4c91ef3b5ea
+surviving_go_mod_tidy_commit=84c0821a04972ba848746c8093b29ed18b711bf5
+surviving_ci_script_commit=dd7e9d0f77f24f3564e5c64abd276e49c6e76062
+reviewed_head_before_this_fix=91bb0ac0fb78e69a88d95aec73ff18927c213c3e
+reviewed_tree_before_this_fix=88f2ad79eb11cba2c1a368724a52ffda8762c79f
+this_file_does_not_rewrite_old_logs=yes

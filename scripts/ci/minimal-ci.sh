@@ -64,7 +64,7 @@ static_contract() {
   local failed=0
   local workflow="$ROOT/.github/workflows/minimal-ci.yml"
   local file
-  for file in "$ROOT/scripts/ci/identity.sh" "$ROOT/scripts/ci/gate.sh" "$ROOT/scripts/ci/minimal-ci.sh" "$ROOT/scripts/ci/contract-selfcheck.sh" "$ROOT/scripts/ci/trust-boundary.sh"; do
+  for file in "$ROOT/scripts/ci/identity.sh" "$ROOT/scripts/ci/gate.sh" "$ROOT/scripts/ci/minimal-ci.sh" "$ROOT/scripts/ci/contract-selfcheck.sh" "$ROOT/scripts/ci/trust-boundary.sh" "$ROOT/scripts/ci/pathnorm.sh" "$ROOT/scripts/ci/use-go-1.27.4.sh"; do
     if ! bash -n "$file"; then
       echo "CONTRACT_FAIL syntax $file"
       failed=1
@@ -239,7 +239,14 @@ if [[ -n "${TARGET_ROOT:-}" ]]; then
   TARGET_TREE="$(git -C "$WORK_ROOT" rev-parse 'HEAD^{tree}')"
   printf '%s\n' "TARGET_SHA_ACTUAL=$TARGET_HEAD"
   printf '%s\n' "TARGET_TREE=$TARGET_TREE"
-  printf '%s\n' "RESULT_SCOPE=target_tree_not_script_tree"
+  if [[ "$TARGET_HEAD" == "$SCRIPT_SHA" ]]; then
+    printf '%s\n' "RESULT_SCOPE=pushed_upgrade_candidate"
+    printf '%s\n' "SCRIPT_SHA_EQUALS_TARGET_SHA=yes"
+  else
+    printf '%s\n' "RESULT_SCOPE=target_differs_from_script"
+    echo "OVERALL_RC=1 reason=target_is_not_the_pushed_candidate"
+    exit 1
+  fi
   if [[ -z "${TARGET_SHA:-}" || "$TARGET_HEAD" != "$TARGET_SHA" ]]; then
     echo "OVERALL_RC=1 reason=target_sha_mismatch expected=${TARGET_SHA:-<unset>} actual=$TARGET_HEAD"
     exit 1
@@ -250,7 +257,8 @@ if [[ -n "${TARGET_ROOT:-}" ]]; then
     exit 1
   fi
 else
-  printf '%s\n' "RESULT_SCOPE=script_tree"
+  printf '%s\n' "RESULT_SCOPE=script_checkout"
+  printf '%s\n' "SCRIPT_SHA_EQUALS_TARGET_SHA=yes"
 fi
 cd "$WORK_ROOT"
 
@@ -290,15 +298,15 @@ case "$go_version" in
     exit 1
     ;;
 esac
+# shellcheck disable=SC1091
+source "$ROOT/scripts/ci/pathnorm.sh"
 goroot="$(go env GOROOT)"
-case "$goroot" in
-  */go-official-1.27.4/*) ;;
-  *)
-    note_rc toolchain 1
-    echo "OVERALL_RC=1 reason=refusing_non_job_go goroot=$goroot"
-    exit 1
-    ;;
-esac
+selected="${AGENTPULSE_GOROOT_SELECTED:-$GOROOT}"
+if ! goroot_is_job_local "$selected" "$goroot"; then
+  note_rc toolchain 1
+  echo "OVERALL_RC=1 reason=refusing_non_job_go goroot=$goroot selected=$selected"
+  exit 1
+fi
 
 goos="$(go env GOOS)"
 goarch="$(go env GOARCH)"

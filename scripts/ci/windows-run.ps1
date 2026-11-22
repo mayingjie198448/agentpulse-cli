@@ -30,6 +30,22 @@ if (-not $bash) {
   exit 1
 }
 Write-Diag "GIT_BASH=$bash"
+function Convert-ToGitBashPath([string]$path) {
+  if ([string]::IsNullOrEmpty($path)) { return $path }
+  $slash = $path.Replace('\', '/')
+  if ($slash -match '^([A-Za-z]):/(.*)$') {
+    return '/' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2]
+  }
+  return $slash
+}
+foreach ($name in @('ARTIFACT_DIR', 'TARGET_ROOT', 'RUNNER_TEMP', 'TMPDIR', 'GO_INSTALL_PREFIX')) {
+  $current = [Environment]::GetEnvironmentVariable($name)
+  if (-not [string]::IsNullOrEmpty($current)) {
+    $converted = Convert-ToGitBashPath $current
+    Write-Diag "PATH_ENV $name ps=$current bash=$converted"
+    [Environment]::SetEnvironmentVariable($name, $converted)
+  }
+}
 Write-Diag "WIN_SCRIPT=$env:WIN_SCRIPT"
 & $bash --noprofile --norc -eo pipefail $env:WIN_SCRIPT
 $code = $LASTEXITCODE
