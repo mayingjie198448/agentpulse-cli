@@ -1,0 +1,118 @@
+SOURCE_HEAD=eb1bbb3f651831369596b495525623ccbf363b49
+SOURCE_TREE=b0f7ac0ca897aaac7a27977d95767d235f90335a
+SOURCE_PORCELAIN<<END
+
+END
+IDENTITY_RC=0
+SCRIPT_SHA=eb1bbb3f651831369596b495525623ccbf363b49
+SCRIPT_TREE=b0f7ac0ca897aaac7a27977d95767d235f90335a
+TARGET_SHA_ACTUAL=eb1bbb3f651831369596b495525623ccbf363b49
+TARGET_TREE=b0f7ac0ca897aaac7a27977d95767d235f90335a
+RESULT_SCOPE=pushed_upgrade_candidate
+SCRIPT_SHA_EQUALS_TARGET_SHA=yes
+GO_CACHE=hit
+GO_SOURCE_URL=https://go.dev/dl/go1.27.4.linux-amd64.tar.gz
+GO_CHECKSUM_EXPECTED=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+GO_CHECKSUM_ACTUAL=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+GO_CHECKSUM_OK=yes
+GO_CACHE_VERIFIED=yes
+GO_INSTALL_ISOLATED=yes
+GOROOT_SELECTED=/tmp/go-official-1.27.4/goroot
+GO_VERSION_LINE=go version go1.27.4 linux/amd64
+GOROOT_LINE=/tmp/go-official-1.27.4/goroot
+RC name=toolchain value=0
+GOROOT_SELECTED_NORM=/tmp/go-official-1.27.4/goroot
+GOROOT_REPORTED_NORM=/tmp/go-official-1.27.4/goroot
+PLATFORM goos=linux goarch=amd64
+UNAME=Linux 6.12.113+ x86_64
+COMMAND: go env GOVERSION GOTOOLCHAIN GOOS GOARCH CGO_ENABLED
+go1.27.4
+local
+linux
+amd64
+1
+COMMAND: gofmt -l .
+RC name=gofmt_tool value=0
+FMT_NONEMPTY files were listed and not rewritten
+cmd/c4-e2e-driver/main.go
+internal/safety/audit.go
+internal/safety/launch_windows.go
+internal/safety/launch_windows_test.go
+RC name=fmt value=1
+COMMAND_BEGIN name=vet
+COMMAND: go vet ./...
+RC name=vet value=0
+COMMAND_END name=vet
+HELPER_PATH=/tmp/agentpulse-minimal-ci.FQtIeE/agentpulse-test-helper
+EVIDENCE_PATH=/tmp/agentpulse-minimal-ci.FQtIeE/argv-wire-evidence
+COMMAND_BEGIN name=helper_build
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.FQtIeE/agentpulse-test-helper ./cmd/agentpulse-test-helper
+RC name=helper_build value=0
+COMMAND_END name=helper_build
+HELPER_BUILD_DOES_NOT_WRITE_TARGET_TREE=yes
+HELPER_SOURCE=/agent/repos/agentpulse-cli/cmd/agentpulse-test-helper
+COMMAND_BEGIN name=test
+COMMAND: go test -count=1 -timeout 8m ./...
+ENV AGENTPULSE_TEST_HELPER=/tmp/agentpulse-minimal-ci.FQtIeE/agentpulse-test-helper
+ENV AGENTPULSE_ARGV_WIRE_EVIDENCE=/tmp/agentpulse-minimal-ci.FQtIeE/argv-wire-evidence
+?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse	[no test files]
+?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse-test-helper	[no test files]
+?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-argv-wire-driver	[no test files]
+ok  	github.com/mayingjie198448/agentpulse-cli/cmd/c4-e2e-driver	0.007s
+?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-windows-driver	[no test files]
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/autostart	0.004s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/cli	1.662s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/config	2.024s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/dispatch	1.707s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/loopbackmqtt	0.005s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/model	0.002s
+--- FAIL: TestProductionExecCommandStaysBehindSafetyBoundary (0.00s)
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/cmd/c4-e2e-driver/main.go
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/autostart/autostart_darwin.go
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/config/config.go
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/attach.go
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/fields.go
+    safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/testdata/synthetic_agy.go
+FAIL
+FAIL	github.com/mayingjie198448/agentpulse-cli/internal/safety	0.096s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store	0.002s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt	5.884s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/termutil	0.002s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/tui	0.459s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/version	0.002s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/wrapper	16.830s
+FAIL
+RC name=test value=1
+COMMAND_END name=test
+COMMAND_BEGIN name=build
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.FQtIeE/agentpulse ./cmd/agentpulse
+RC name=build value=0
+COMMAND_END name=build
+COMMAND_BEGIN name=version_smoke
+COMMAND: /tmp/agentpulse-minimal-ci.FQtIeE/agentpulse version
+agentpulse 0.7.0 (commit: dev, built: 2026-11-06)
+Cross-machine monitor for Google Antigravity (agy) and OpenCode
+License: MIT
+RC name=version_smoke value=0
+COMMAND_END name=version_smoke
+3a5d34aa22c7bc3b07ac427783b01fe512cb7e2a2c4c40c56c40c69755e693da  /tmp/agentpulse-minimal-ci.FQtIeE/agentpulse
+RC name=worktree_unchanged value=0
+NOT_RUN_CATALOG_BEGIN
+item=real_agy class=privileged_or_production status=NOT_RUN detail=最小CI不启动真实agy
+item=real_opencode class=privileged_or_production status=NOT_RUN detail=最小CI不启动真实OpenCode
+item=production_mqtt class=privileged_or_production status=NOT_RUN detail=最小CI不连接生产Broker
+item=gui_session class=privileged_or_production status=NOT_RUN detail=无交互GUI或真实TTY会话；TUI纯模型测试若在本平台编译则会随go_test运行
+item=os_service_install class=privileged_or_production status=NOT_RUN detail=不安装launchd、systemd或Windows服务；darwin单测只在mac道运行且现有测试替身exec
+item=TestWindowsNativeFixture class=privileged_native_appcontainer status=NOT_RUN detail=运维验收命令，不是最小CI通过项；Windows道仅跳过这一项，Linux与mac因构建标签不会编译它
+item=c4_e2e_driver_main class=integration_driver status=NOT_RUN detail=不执行cmd/c4-e2e-driver主程序；该包内纯函数测试随go_test运行
+item=c4_windows_driver_main class=integration_driver status=NOT_RUN detail=不执行cmd/c4-windows-driver主程序
+item=c4_argv_wire_driver_main class=integration_driver status=NOT_RUN detail=不执行cmd/c4-argv-wire-driver主程序
+item=cross_compile class=not_native status=NOT_RUN detail=本步不交叉编译；交叉编译结果不能当作Linux、mac或Windows原生测试
+item=linux_arm64 class=no_native_runner status=NOT_RUN detail=没有linux/arm64原生runner
+item=darwin_amd64 class=no_native_runner status=NOT_RUN detail=没有darwin/amd64原生runner
+item=cross_repo_cpu_disk_lock class=schedule status=NOT_IMPLEMENTED detail=本仓concurrency不是跨仓锁，不能声称已错开mini或ccdq上的其它仓库
+NOT_RUN_CATALOG_END
+NOT_RUN item=windows_build_tagged_tests status=NOT_RUN detail=not_compiled_on_linux
+NOT_RUN item=darwin_build_tagged_tests status=NOT_RUN detail=not_compiled_on_linux
+NATIVE_COMPILE goos=linux goarch=amd64 cgo=0 package=./cmd/agentpulse
+OVERALL_RC=1
