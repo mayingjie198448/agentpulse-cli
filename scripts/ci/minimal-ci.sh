@@ -124,10 +124,19 @@ static_contract() {
     echo "CONTRACT_FAIL windows_skip_drifted"
     failed=1
   fi
-  local skip_flag
+  local skip_flag skip_hits skip_rc
   skip_flag="$(printf '%s%s' '-s' 'kip')"
-  if grep -n -F "$skip_flag" "$ROOT/scripts/ci/minimal-ci.sh" | grep -v 'WINDOWS_ONLY_SKIP'; then
+  set +e
+  # -e 避免把以连字符开头的针脚当成 grep 选项。
+  skip_hits="$(grep -n -F -e "$skip_flag" "$ROOT/scripts/ci/minimal-ci.sh")"
+  skip_rc=$?
+  set +e
+  if [[ "$skip_rc" -ne 0 ]]; then
+    echo "CONTRACT_FAIL skip_scan_rc=$skip_rc"
+    failed=1
+  elif printf '%s\n' "$skip_hits" | grep -v 'WINDOWS_ONLY_SKIP' >/dev/null; then
     echo "CONTRACT_FAIL unexpected_skip"
+    printf '%s\n' "$skip_hits" | grep -v 'WINDOWS_ONLY_SKIP'
     failed=1
   fi
   if [[ "$failed" != "0" ]]; then
