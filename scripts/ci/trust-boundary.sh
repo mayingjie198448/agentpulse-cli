@@ -7,7 +7,7 @@ set -u
 
 REPOSITORY_EXPECTED='mayingjie198448/agentpulse-cli'
 REF_EXPECTED='refs/heads/mayingjie/minimal-ci-8a30'
-TARGET_SHA_EXPECTED='9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf'
+PR55_ORIGINAL='9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf'
 
 evaluate_trust() {
   local event="$1"
@@ -26,10 +26,10 @@ evaluate_trust() {
   printf '%s\n' "TRUST_TARGET_SHA=$target_sha"
   printf '%s\n' "TRUST_TARGET_HEAD=$target_head"
   printf '%s\n' "TRUST_FORK=$fork"
-  printf '%s\n' "TRUST_ALLOWLIST=$REF_EXPECTED"
-  printf '%s\n' "TARGET_SHA_EXPECTED=$TARGET_SHA_EXPECTED"
+  printf '%s\n' "PR55_ORIGINAL=$PR55_ORIGINAL"
+  printf '%s\n' "RESULT_IS_NOT_PR55_ORIGINAL=yes"
   printf '%s\n' "FORK_POLICY=fork_code_is_not_executed_on_self_hosted"
-  printf '%s\n' "CHECKOUT_POLICY=script_sha_is_push_commit_target_sha_is_pr55"
+  printf '%s\n' "CHECKOUT_POLICY=github_sha_of_this_push_is_the_upgrade_candidate"
   printf '%s\n' "SECRET_BOUNDARY=no_secrets_context permissions_contents_read credentials_not_persisted"
   printf '%s\n' "EXECUTES_UNTRUSTED_HEAD=no"
   if [[ "$event" == "pull_request_target" ]]; then
@@ -56,8 +56,12 @@ evaluate_trust() {
     printf '%s\n' "TRUST_RESULT=BLOCKED reason=script_checkout_is_not_the_pushed_sha"
     return 2
   fi
-  if [[ "$target_sha" != "$TARGET_SHA_EXPECTED" || "$target_head" != "$TARGET_SHA_EXPECTED" ]]; then
-    printf '%s\n' "TRUST_RESULT=BLOCKED reason=target_is_not_pr55_head"
+  if [[ -z "$target_head" || "$target_sha" != "$script_sha" || "$target_head" != "$script_sha" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=target_is_not_the_pushed_upgrade_candidate"
+    return 2
+  fi
+  if [[ "$target_sha" == "$PR55_ORIGINAL" ]]; then
+    printf '%s\n' "TRUST_RESULT=BLOCKED reason=pr55_original_still_has_go_1_27_3"
     return 2
   fi
   if [[ "$fork" != "false" ]]; then
@@ -70,7 +74,6 @@ evaluate_trust() {
 
 run_self_check() {
   local failed=0
-  local target="$TARGET_SHA_EXPECTED"
   check_case() {
     local name="$1"
     local expected_rc="$2"
@@ -99,15 +102,15 @@ run_self_check() {
       failed=1
     fi
   }
-  check_case allowed_ci_push 0 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
-  check_case untrusted_target 1 pull_request_target "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
-  check_case pull_request_not_executed 2 pull_request "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" false
-  check_case fork_not_executed 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" true
-  check_case wrong_repository 2 push example/other "$REF_EXPECTED" abc abc "$target" "$target" false
-  check_case wrong_ref 2 push "$REPOSITORY_EXPECTED" refs/heads/main abc abc "$target" "$target" false
-  check_case script_sha_mismatch 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc def "$target" "$target" false
-  check_case target_mismatch 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 false
-  check_case missing_fork_flag 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc "$target" "$target" ""
+  check_case allowed_ci_push 0 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc abc abc false
+  check_case untrusted_target 1 pull_request_target "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc abc abc false
+  check_case pull_request_not_executed 2 pull_request "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc abc abc false
+  check_case fork_not_executed 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc abc abc true
+  check_case wrong_repository 2 push example/other "$REF_EXPECTED" abc abc abc abc false
+  check_case wrong_ref 2 push "$REPOSITORY_EXPECTED" refs/heads/main abc abc abc abc false
+  check_case script_sha_mismatch 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc def abc abc false
+  check_case original_pr55_not_the_candidate 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" "$PR55_ORIGINAL" "$PR55_ORIGINAL" "$PR55_ORIGINAL" "$PR55_ORIGINAL" false
+  check_case missing_fork_flag 2 push "$REPOSITORY_EXPECTED" "$REF_EXPECTED" abc abc abc abc ""
   if [[ "$failed" != "0" ]]; then
     echo "TRUST_SELF_CHECK_RC=1"
     return 1

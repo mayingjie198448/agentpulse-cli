@@ -1,11 +1,11 @@
 # 同仓 push 入口。默认分支没有本文件时，手动派发事件收不到，所以入口不用它。
 # 入口是已存在的 CI 分支 mayingjie/minimal-ci-8a30 上的 push。
+# 被测树是这次 push 的 github.sha，也就是带 Go 1.27.4 的 PR55 派生候选。
+# PR55 原树 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf 的 go.mod 仍是 1.27.3，不能把它当成已升级结果。
 # mac 标签字面量 self-hosted,macOS,ARM64,agentpulse
 # windows 标签字面量 self-hosted,Windows,X64,agentpulse
-# 被测源码树固定为 PR55 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf。
-# 脚本版本是本次 push 的 github.sha。PR56 变绿不等于 PR55 原树通过。
-# 新 runner 服务仍是 offline。本推送可能生成排队中的作业，但离线服务不会执行它。
-# 不安装、不启动 runner，不设置 ready，不改仓库设置。
+# Windows 步骤默认是 powershell。Git Bash 路径是 C:\Program Files\Git\bin\bash.exe，拒绝 system32 的 WSL bash。
+# workflow 现被仓库停用。本文件不重新启用它，也不另建触发器。
 
 name: minimal-ci
 
@@ -26,101 +26,122 @@ jobs:
     name: darwin native
     if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/mayingjie/minimal-ci-8a30' && github.event.repository.fork == false }}"
     runs-on: [self-hosted, macOS, ARM64, agentpulse]
-    timeout-minutes: 20
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    timeout-minutes: 30
     steps:
-      - name: checkout ci scripts
+      - name: checkout upgrade candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout pr55 tree outside the script worktree
-        shell: bash
+      - name: record target identity
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: |
-          git fetch --depth 1 https://github.com/mayingjie198448/agentpulse-cli.git 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          git worktree add --detach "$RUNNER_TEMP/pr55-target" 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          git -C "$RUNNER_TEMP/pr55-target" rev-parse HEAD
-          git -C "$RUNNER_TEMP/pr55-target" status --porcelain
+          mkdir -p "$ARTIFACT_DIR"
+          {
+            echo "SCRIPT_SHA=$(git rev-parse HEAD)"
+            echo "SCRIPT_TREE=$(git rev-parse 'HEAD^{tree}')"
+            echo "TARGET_SHA_ACTUAL=$(git rev-parse HEAD)"
+            echo "TARGET_TREE=$(git rev-parse 'HEAD^{tree}')"
+            echo "PR55_ORIGINAL=9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf"
+            echo "RESULT_IS_NOT_PR55_ORIGINAL=yes"
+            echo "GO_MOD_LINE=$(awk '/^go /{print; exit}' go.mod)"
+          } | tee "$ARTIFACT_DIR/identity.txt"
       - name: trust boundary
         id: trust
-        shell: bash
         env:
           EXPECTED_SHA: ${{ github.sha }}
-          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
           FORK: ${{ github.event.repository.fork }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: bash scripts/ci/trust-boundary.sh
-      - name: darwin lane on pr55 tree
-        shell: bash
+      - name: darwin lane
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
-          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: bash scripts/ci/minimal-ci.sh
-      - name: cross compile from pr55 tree
-        if: steps.trust.outcome == 'success'
-        shell: bash
+      - name: cross compile
+        if: "${{ always() && steps.trust.outcome == 'success' }}"
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
-          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin-cross
         run: bash scripts/ci/minimal-ci.sh --cross-compile
       - name: upload darwin logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: darwin-pr55-${{ github.run_id }}
+          name: darwin-candidate-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/agentpulse-darwin
             ${{ runner.temp }}/agentpulse-darwin-cross
-          if-no-files-found: error
+          if-no-files-found: warn
 
   windows-native:
     name: windows native
     if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/mayingjie/minimal-ci-8a30' && github.event.repository.fork == false }}"
     runs-on: [self-hosted, Windows, X64, agentpulse]
-    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    timeout-minutes: 30
     steps:
-      - name: checkout ci scripts
+      - name: checkout upgrade candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: checkout pr55 tree outside the script worktree
-        shell: bash
+      - name: record target identity
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
         run: |
-          git fetch --depth 1 https://github.com/mayingjie198448/agentpulse-cli.git 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          git worktree add --detach "$RUNNER_TEMP/pr55-target" 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          git -C "$RUNNER_TEMP/pr55-target" rev-parse HEAD
-          git -C "$RUNNER_TEMP/pr55-target" status --porcelain
+          New-Item -ItemType Directory -Force -Path $env:ARTIFACT_DIR | Out-Null
+          $head = git rev-parse HEAD
+          $tree = git rev-parse 'HEAD^{tree}'
+          @(
+            "SCRIPT_SHA=$head"
+            "SCRIPT_TREE=$tree"
+            "TARGET_SHA_ACTUAL=$head"
+            "TARGET_TREE=$tree"
+            "PR55_ORIGINAL=9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf"
+            "RESULT_IS_NOT_PR55_ORIGINAL=yes"
+          ) | Set-Content -LiteralPath (Join-Path $env:ARTIFACT_DIR 'identity.txt')
       - name: trust boundary
-        shell: bash
+        id: trust
         env:
           EXPECTED_SHA: ${{ github.sha }}
-          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
           FORK: ${{ github.event.repository.fork }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
-        run: bash scripts/ci/trust-boundary.sh
-      - name: windows lane on pr55 tree
-        shell: bash
+          WIN_SCRIPT: scripts/ci/trust-boundary.sh
+        run: |
+          Get-Content -LiteralPath scripts/ci/windows-run.ps1 -Raw | Invoke-Expression
+      - name: windows lane
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
           EXPECTED_SHA: ${{ github.sha }}
-          TARGET_SHA: 9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
-          TARGET_ROOT: ${{ runner.temp }}/pr55-target
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
-        run: bash scripts/ci/minimal-ci.sh
+          WIN_SCRIPT: scripts/ci/minimal-ci.sh
+        run: |
+          Get-Content -LiteralPath scripts/ci/windows-run.ps1 -Raw | Invoke-Expression
       - name: upload windows logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: windows-pr55-${{ github.run_id }}
+          name: windows-candidate-${{ github.run_id }}
           path: ${{ runner.temp }}/agentpulse-windows
-          if-no-files-found: error
+          if-no-files-found: warn

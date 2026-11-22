@@ -108,8 +108,20 @@ static_contract() {
     echo "CONTRACT_FAIL trusted_branch_missing"
     failed=1
   fi
-  if ! grep -F -q '9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf' "$workflow"; then
-    echo "CONTRACT_FAIL target_sha_missing"
+  if grep -n -E 'ref:[[:space:]]*9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf|git fetch .*9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf' "$workflow"; then
+    echo "CONTRACT_FAIL still_checks_out_pr55_original"
+    failed=1
+  fi
+  if grep -n -F 'shell: bash' "$workflow"; then
+    echo "CONTRACT_FAIL ambiguous_bash_shell"
+    failed=1
+  fi
+  if ! grep -F -q 'C:\Program Files\Git\bin\bash.exe' "$workflow"; then
+    echo "CONTRACT_FAIL windows_git_bash_missing"
+    failed=1
+  fi
+  if ! grep -F -q 'shell: powershell' "$workflow"; then
+    echo "CONTRACT_FAIL windows_powershell_missing"
     failed=1
   fi
   if grep -n -F 'false &&' "$workflow"; then
@@ -242,29 +254,48 @@ else
 fi
 cd "$WORK_ROOT"
 
-# 必须看到 go1.27.3。不改 go.mod，不运行 Go 安装器。
-# 不设置 GOTOOLCHAIN=local，否则包装器会报自己的旧版本。
+set +e
+go_env="$(bash "$ROOT/scripts/ci/use-go-1.27.4.sh" 2>"$ARTIFACT_DIR/go-install.stderr")"
+go_env_rc=$?
+set -e
+cat "$ARTIFACT_DIR/go-install.stderr"
+if [[ "$go_env_rc" != "0" ]]; then
+  note_rc toolchain "$go_env_rc"
+  echo "OVERALL_RC=1 reason=go_install_failed"
+  exit 1
+fi
+eval "$go_env"
+hash -r
 set +e
 go_version="$(go version 2>&1)"
 go_version_rc=$?
 set -e
+printf '%s\n' "GO_VERSION_LINE=$go_version"
+printf '%s\n' "GOROOT_LINE=$(go env GOROOT)"
+printf '%s\n' "$go_version" >"$ARTIFACT_DIR/go-version.txt"
 if [[ "$go_version_rc" != "0" ]]; then
-  printf '%s\n' "GO_VERSION_LINE=$go_version"
   note_rc toolchain "$go_version_rc"
   print_not_run
   echo "OVERALL_RC=1 reason=go_version_command_failed"
   exit 1
 fi
-printf '%s\n' "GO_VERSION_LINE=$go_version"
-printf '%s\n' "$go_version" >"$ARTIFACT_DIR/go-version.txt"
 case "$go_version" in
-  "go version go1.27.3 "*)
+  "go version go1.27.4 "*)
     note_rc toolchain 0
     ;;
   *)
     note_rc toolchain 1
     print_not_run
-    echo "OVERALL_RC=1 reason=go_baseline_not_1.27.3_local"
+    echo "OVERALL_RC=1 reason=go_baseline_not_1.27.4"
+    exit 1
+    ;;
+esac
+goroot="$(go env GOROOT)"
+case "$goroot" in
+  */go-official-1.27.4/*) ;;
+  *)
+    note_rc toolchain 1
+    echo "OVERALL_RC=1 reason=refusing_non_job_go goroot=$goroot"
     exit 1
     ;;
 esac
