@@ -1,0 +1,5 @@
+go1.27.3
+auto
+linux
+amd64
+1

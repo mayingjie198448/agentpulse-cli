@@ -1,0 +1,59 @@
+tested_sha=5081ca8bd0678da08a170f2ab525a52eea2e6865
+tested_tree=680800666a886c592c859d814a9b304d2bd0994e
+platform=linux/amd64
+go=go1.27.3
+dirty_before=empty
+dirty_after=empty
+contract_rc=0
+gate_rc=2
+trust_rc=2
+trust_reason=repository_mismatch_because_GITHUB_REPOSITORY_unset_locally
+cross_rc=0
+cross_stderr=module_download_notices_only
+lane_rc=1
+ci_linux_native_test=NOT_RUN
+cross_compile_is_not_native_linux_test=yes
+commands:
+  AGENTPULSE_CI_ENFORCE_SHA=1 EXPECTED_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865 ARTIFACT_DIR=$BASE/contract bash scripts/ci/contract-selfcheck.sh
+  AGENTPULSE_CI_ENFORCE_SHA=1 EXPECTED_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865 ARTIFACT_DIR=$BASE/gate bash scripts/ci/gate.sh
+  AGENTPULSE_CI_ENFORCE_SHA=1 EXPECTED_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865 ARTIFACT_DIR=$BASE/trust bash scripts/ci/trust-boundary.sh
+  AGENTPULSE_CI_ENFORCE_SHA=1 EXPECTED_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865 ARTIFACT_DIR=$BASE/cross bash scripts/ci/minimal-ci.sh --cross-compile
+  AGENTPULSE_CI_ENFORCE_SHA=1 EXPECTED_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865 ARTIFACT_DIR=$BASE/lane bash scripts/ci/minimal-ci.sh
+lane_steps: toolchain=0 fmt=1 vet=0 test=1 overall=1
+this_bundle_does_not_replace=scripts/ci/selftest
+files:
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/contract.rc
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/contract.stderr
+  942ef0d6a94f85049f192c73f37509e60e43cc908226df133740a86bd5308b57  scripts/ci/selftest-r2/contract.stdout
+  5707bf75dd54b4fdd5ac209444d48c9c4179ebf8510f80e2f7293dfbedc1012b  scripts/ci/selftest-r2/cross/go-version.txt
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/cross.rc
+  49f2e3f98f4d9d38a9636dcb1814c12c3415a3c4817b71a2e0f13d336722b461  scripts/ci/selftest-r2/cross.stderr
+  023c4127a83a31c86a30bdb09c7c3f340fccb764d8d8e8ce9ee7dc0d7455a3ec  scripts/ci/selftest-r2/cross.stdout
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/dirty-after.txt
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/dirty-before.txt
+  53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3  scripts/ci/selftest-r2/gate.rc
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/gate.stderr
+  ee23cb51bf0d033547f538293048c3d95861507119a2aec0599d9cb31515308b  scripts/ci/selftest-r2/gate.stdout
+  cc69b678cac36537d5545415712c5abe247b7979edf8cf2a1c25656ec1a825a4  scripts/ci/selftest-r2/lane/binary.sha256
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/build.rc
+  4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865  scripts/ci/selftest-r2/lane/fmt.rc
+  7faf15a0a92700a782af61b7ccccce8c3b53c336ca515dc2167acbe3761623c3  scripts/ci/selftest-r2/lane/go-env.txt
+  d9c7be78d0c9ea7ab7212882639f6b10a3bfecc14d0094880634eb8575f1774f  scripts/ci/selftest-r2/lane/go-test.txt
+  5707bf75dd54b4fdd5ac209444d48c9c4179ebf8510f80e2f7293dfbedc1012b  scripts/ci/selftest-r2/lane/go-version.txt
+  913e664b28bb242078074ff7b4585b0326d51447ef799677137a33c9a3486168  scripts/ci/selftest-r2/lane/gofmt.txt
+  e3db5c4eee1910993fccb8b326ced6bd7c5b21e0d56517b6b9aff2d52f1c1ec7  scripts/ci/selftest-r2/lane/head.sha
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/helper_build.rc
+  01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b  scripts/ci/selftest-r2/lane/porcelain.txt
+  4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865  scripts/ci/selftest-r2/lane/test.rc
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/toolchain.rc
+  1ce149e1dc87f8f7ad1ab7bee94d90ef693981074e0688660e7ca294825e7c14  scripts/ci/selftest-r2/lane/transcript.txt
+  a3278040791d42e21421254316f516f8af172db38fc508382357622c14944f4a  scripts/ci/selftest-r2/lane/tree.sha
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/version_smoke.rc
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/vet.rc
+  9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  scripts/ci/selftest-r2/lane/worktree_unchanged.rc
+  4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865  scripts/ci/selftest-r2/lane.rc
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/lane.stderr
+  1d91f5a3035fbd0ba68930cff0161606229f88ba309f5bc552fecbcf2e014a34  scripts/ci/selftest-r2/lane.stdout
+  53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3  scripts/ci/selftest-r2/trust.rc
+  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  scripts/ci/selftest-r2/trust.stderr
+  625464c2471bdbcc40627794d71d6041bd56dc5a24f7a1a581648ca2b897ff0e  scripts/ci/selftest-r2/trust.stdout

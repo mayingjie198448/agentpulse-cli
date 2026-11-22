@@ -1,0 +1,13 @@
+TRUST_EVENT=
+TRUST_REPOSITORY=
+TRUST_REF=
+TRUST_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865
+TRUST_HEAD_SHA=5081ca8bd0678da08a170f2ab525a52eea2e6865
+TRUST_ALLOWLIST=empty
+FORK_POLICY=fork_and_same_repo_pull_requests_are_not_executed
+CHECKOUT_POLICY=only_the_sha_of_a_push_to_this_repository
+SECRET_BOUNDARY=no_secrets_context permissions_contents_read credentials_not_persisted
+EXECUTES_UNTRUSTED_HEAD=no
+TRUST_QUEUE=
+TRUST_QUEUE_DOES_NOT_OVERRIDE_EMPTY_ALLOWLIST=yes
+TRUST_RESULT=BLOCKED reason=repository_mismatch

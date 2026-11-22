@@ -1,0 +1,16 @@
+RC name=toolchain value=0
+RC name=fmt value=1
+COMMAND_BEGIN name=vet
+COMMAND: go vet ./...
+RC name=vet value=0
+COMMAND_BEGIN name=helper_build
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.x8aSw2/agentpulse-test-helper ./cmd/agentpulse-test-helper
+RC name=helper_build value=0
+RC name=test value=1
+COMMAND_BEGIN name=build
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.x8aSw2/agentpulse ./cmd/agentpulse
+RC name=build value=0
+COMMAND_BEGIN name=version_smoke
+COMMAND: /tmp/agentpulse-minimal-ci.x8aSw2/agentpulse version
+RC name=version_smoke value=0
+RC name=worktree_unchanged value=0

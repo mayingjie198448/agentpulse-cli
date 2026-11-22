@@ -1,0 +1,4 @@
+go: downloading github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f
+go: downloading github.com/mattn/go-localereader v0.0.1
+go: downloading github.com/inconshreveable/mousetrap v1.1.0
+go: downloading golang.org/x/text v0.29.0

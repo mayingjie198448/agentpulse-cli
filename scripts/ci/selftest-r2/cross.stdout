@@ -1,0 +1,30 @@
+SOURCE_HEAD=5081ca8bd0678da08a170f2ab525a52eea2e6865
+SOURCE_TREE=680800666a886c592c859d814a9b304d2bd0994e
+SOURCE_PORCELAIN<<END
+
+END
+IDENTITY_RC=0
+GO_VERSION_LINE=go version go1.27.3 linux/amd64
+RC name=toolchain value=0
+PLATFORM goos=linux goarch=amd64
+MODE=cross_compile
+CI_LINUX_NATIVE_TEST=NOT_RUN reason=no_linux_self_hosted_runner
+CROSS_COMPILE_IS_NOT_NATIVE_LINUX_TEST=yes
+LOCAL_HOST goos=linux goarch=amd64
+COMMAND: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/agentpulse-ci-selftest/at-5081ca8bd0678da08a170f2ab525a52eea2e6865/cross/cross/agentpulse-linux-amd64 ./cmd/agentpulse
+RC name=cross_linux_amd64 value=0
+CLASS=host_arch_build_still_not_ci_linux_native_lane goos=linux goarch=amd64
+COMMAND: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/agentpulse-ci-selftest/at-5081ca8bd0678da08a170f2ab525a52eea2e6865/cross/cross/agentpulse-linux-arm64 ./cmd/agentpulse
+RC name=cross_linux_arm64 value=0
+CLASS=cross_compile_not_native_test goos=linux goarch=arm64
+COMMAND: CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -o /tmp/agentpulse-ci-selftest/at-5081ca8bd0678da08a170f2ab525a52eea2e6865/cross/cross/agentpulse-darwin-amd64 ./cmd/agentpulse
+RC name=cross_darwin_amd64 value=0
+CLASS=cross_compile_not_native_test goos=darwin goarch=amd64
+COMMAND: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o /tmp/agentpulse-ci-selftest/at-5081ca8bd0678da08a170f2ab525a52eea2e6865/cross/cross/agentpulse-darwin-arm64 ./cmd/agentpulse
+RC name=cross_darwin_arm64 value=0
+CLASS=cross_compile_not_native_test goos=darwin goarch=arm64
+COMMAND: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o /tmp/agentpulse-ci-selftest/at-5081ca8bd0678da08a170f2ab525a52eea2e6865/cross/cross/agentpulse-windows-amd64.exe ./cmd/agentpulse
+RC name=cross_windows_amd64 value=0
+CLASS=cross_compile_not_native_test goos=windows goarch=amd64
+WORKTREE_UNCHANGED=0
+OVERALL_RC=0
