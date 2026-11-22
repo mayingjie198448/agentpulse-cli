@@ -3,10 +3,11 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
-	"fmt"
-	"errors"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -24,9 +25,14 @@ const stillActive = 259
 const waitTimeoutStatus = 0x102
 
 // listenerForcedExit is the synthetic exit code passed to TerminateProcess,
-// mirroring the product pattern at process_windows.go:381; isCleanListenerExit
-// counts it as a driver-forced exit rather than a product failure.
+// mirroring the product pattern at process_windows.go:381. It is recorded as a
+// force-terminate class and is NOT counted as a clean listener exit: the raw
+// code is kept end to end, and only a raw 0 reads as clean.
 const listenerForcedExit = 0xC000013A
+
+// graceWaitMs bounds how long the listener we started may shut down on its own
+// after the control event, before the driver is allowed to force termination.
+const graceWaitMs = 5000
 
 // Identity-bound listener state, mirroring the production pattern in
 // internal/wrapper/process_windows.go:117 observeWindowsExitFor: the handle we
@@ -41,18 +47,86 @@ var listenerExitObserved = false
 var listenerExitCode = 0
 var listenerTerminationNote = "none"
 
+// graceNotes records every step of the graceful-stop sequence (send, wait,
+// force, re-wait), including the failures, so the evidence names what actually
+// happened instead of implying a clean stop.
+var graceNotes []string
+
 func setupListenerSysProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 }
 
-// stopListener asks the identity-bound helpers to decide the honest path.
+// stopListener recovers the graceful-stop sequence:
+// 1. Send CTRL_BREAK to listener process group
+// 2. Bounded wait on bound handle
+// 3. Force-terminate bound handle if still running (recording termination failures)
+// 4. Post-termination re-wait and confirm result.
 func stopListener(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	return terminateListenerIfRunning(cmd)
+	if !listenerAttached {
+		graceNotes = append(graceNotes, "no bound handle: sending CTRL_BREAK to direct child pid")
+		err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(cmd.Process.Pid))
+		if err != nil {
+			graceNotes = append(graceNotes, fmt.Sprintf("GenerateConsoleCtrlEvent failed: %v", err))
+			listenerTerminationNote = "no bound handle: GenerateConsoleCtrlEvent failed"
+			return err
+		}
+		listenerTerminationNote = "no bound handle: GenerateConsoleCtrlEvent sent"
+		return nil
+	}
+
+	// 1. Send CTRL_BREAK
+	graceNotes = append(graceNotes, fmt.Sprintf("send CTRL_BREAK to process group %d", listenerPid))
+	ctrlErr := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(listenerPid))
+	if ctrlErr != nil {
+		graceNotes = append(graceNotes, fmt.Sprintf("send CTRL_BREAK failed: %v", ctrlErr))
+	} else {
+		graceNotes = append(graceNotes, "send CTRL_BREAK succeeded")
+	}
+
+	// 2. Bounded wait on bound handle
+	graceNotes = append(graceNotes, fmt.Sprintf("bounded wait (%d ms) on bound handle", graceWaitMs))
+	waitStatus, waitErr := windows.WaitForSingleObject(listenerBoundHandle, uint32(graceWaitMs))
+	if waitErr != nil {
+		graceNotes = append(graceNotes, fmt.Sprintf("bounded wait error: %v", waitErr))
+	} else if waitStatus == windows.WAIT_OBJECT_0 {
+		graceNotes = append(graceNotes, "listener exited gracefully within bounded wait")
+		listenerTerminationNote = "graceful-stop (CTRL_BREAK succeeded within bounded wait)"
+		return nil
+	} else if waitStatus == waitTimeoutStatus {
+		graceNotes = append(graceNotes, "bounded wait timed out; listener still running")
+	} else {
+		graceNotes = append(graceNotes, fmt.Sprintf("bounded wait returned unexpected status: 0x%x", waitStatus))
+	}
+
+	// 3. Force-terminate bound handle if still running
+	confirmBoundIdentity("before-force-terminate")
+	graceNotes = append(graceNotes, fmt.Sprintf("force-terminating bound handle (pid %d) with exit code 0x%X", listenerPid, uint32(listenerForcedExit)))
+	termErr := windows.TerminateProcess(listenerBoundHandle, uint32(listenerForcedExit))
+	if termErr != nil {
+		graceNotes = append(graceNotes, fmt.Sprintf("TerminateProcess failed: %v", termErr))
+		listenerTerminationNote = fmt.Sprintf("force-terminate failed: %v", termErr)
+		return fmt.Errorf("c4-e2e-driver: TerminateProcess failed: %w", termErr)
+	}
+	graceNotes = append(graceNotes, "TerminateProcess issued to bound handle")
+
+	// 4. Re-wait and record result
+	graceNotes = append(graceNotes, "post-termination wait (5000 ms) on bound handle")
+	postStatus, postErr := windows.WaitForSingleObject(listenerBoundHandle, 5000)
+	if postErr != nil {
+		graceNotes = append(graceNotes, fmt.Sprintf("post-termination wait error: %v", postErr))
+	} else if postStatus == windows.WAIT_OBJECT_0 {
+		graceNotes = append(graceNotes, "bound handle confirmed terminated in post-termination wait")
+	} else {
+		graceNotes = append(graceNotes, fmt.Sprintf("post-termination wait returned status: 0x%x", postStatus))
+	}
+	confirmBoundIdentity("after-post-wait")
+	listenerTerminationNote = fmt.Sprintf("forced-termination (pid %d terminated with code 0x%X)", listenerPid, uint32(listenerForcedExit))
+	return nil
 }
 
 // isProcessAlive is a convenience check ONLY: a fresh OpenProcess by pid cannot
@@ -68,11 +142,9 @@ func isProcessAlive(pid int) bool {
 	return true
 }
 
+// Item 2 (re-review 2026-11-21): only a raw exit code of 0 reads as clean.
 func isCleanListenerExit(raw int) bool {
-	if raw == 0 || raw == int(listenerForcedExit) {
-		return true
-	}
-	return raw >= 1 && raw <= 128
+	return raw == 0
 }
 
 // attachListenerHandle mirrors internal/wrapper/process_windows.go observeWindowsExitFor
@@ -85,7 +157,7 @@ func attachListenerHandle(cmd *exec.Cmd) (stamp string, err error) {
 		return "not-attached", errors.New("listener process handle unavailable")
 	}
 	listenerPid = cmd.Process.Pid
-	h, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION | processSynchronize, false, uint32(listenerPid))
+	h, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|processSynchronize, false, uint32(listenerPid))
 	if e != nil {
 		return "not-attached", errors.New("attach: OpenProcess failed for the just-started pid")
 	}
@@ -113,10 +185,8 @@ func attachListenerHandle(cmd *exec.Cmd) (stamp string, err error) {
 	listenerCreationNs = created.Nanoseconds()
 	st := time.Unix(0, listenerCreationNs).Format(time.RFC3339Nano)
 	stamp = st
-	_ = listenerPid
-	return "creation-ns="+fmt.Sprint(listenerCreationNs)+" stamp="+stamp, nil
+	return "creation-ns=" + fmt.Sprint(listenerCreationNs) + " stamp=" + stamp, nil
 }
-
 
 // listenerReclaimProof is identity-bound evidence: the exit code read from the
 // handle attached at start time, whose pid AND creation time are still confirmed
@@ -159,21 +229,15 @@ func listenerReclaimProof(cmd *exec.Cmd) (proof string, raw int, ok bool) {
 		return "exit code unavailable: GetExitCodeProcess failed on the bound handle", 0, false
 	}
 	if exitCode == stillActive {
-		// process_windows.go:364: an exit code without an exit-status event is
-		// weak evidence only.
 		return "weak: exit code read without an observed exit-status event", int(exitCode), false
 	}
 	listenerExitObserved = true
 	listenerExitCode = int(exitCode)
-	proof = "bound-handle exit status: pid="+fmt.Sprint(listenerPid)+" creation-ns="+fmt.Sprint(listenerCreationNs)+" exit-code="+fmt.Sprint(listenerExitCode)
+	proof = "bound-handle exit status: pid=" + fmt.Sprint(listenerPid) + " creation-ns=" + fmt.Sprint(listenerCreationNs) + " exit-code=" + fmt.Sprint(listenerExitCode)
 	return proof, listenerExitCode, true
 }
 
-// terminateListenerIfRunning chooses the honest termination path: with a bound
-// handle, consult the wait state FIRST (product exit-first rule in process_windows.go
-//:379) and TerminateProcess that handle only; without one, a live direct child
-// justifies Kill and an already-departed child none. Recycled or historical pids
-// are never signalled.
+// terminateListenerIfRunning terminates the bound handle if still running.
 func terminateListenerIfRunning(cmd *exec.Cmd) error {
 	if !listenerAttached {
 		if cmd == nil || cmd.Process == nil {
@@ -192,19 +256,50 @@ func terminateListenerIfRunning(cmd *exec.Cmd) error {
 		listenerTerminationNote = "already exited: no termination signal needed"
 		return nil
 	}
-	// Still running: terminate the bound handle with the synthetic code so
-	// isCleanListenerExit counts a driver-forced exit, mirroring the product
-	// pattern at process_windows.go:381.
-	var ce uint32
-	ce = uint32(listenerForcedExit)
-	_ = ce
+	confirmBoundIdentity("before-direct-terminate")
+	ce := uint32(listenerForcedExit)
 	e5 := windows.TerminateProcess(listenerBoundHandle, ce)
-	_ = e5
-	listenerTerminationNote = "bound-handle TerminateProcess for pid "+fmt.Sprint(listenerPid)
+	if e5 != nil {
+		listenerTerminationNote = fmt.Sprintf("bound-handle TerminateProcess failed: %v", e5)
+		return fmt.Errorf("c4-e2e-driver: TerminateProcess failed: %w", e5)
+	}
+	// Post-termination re-wait
+	_, _ = windows.WaitForSingleObject(listenerBoundHandle, 5000)
+	confirmBoundIdentity("after-direct-terminate")
+	listenerTerminationNote = fmt.Sprintf("forced-termination (pid %d terminated with code 0x%X)", listenerPid, ce)
 	return nil
 }
 
-// listenerTerminationVia reports which termination path was taken, for evidence.
+// confirmBoundIdentity re-reads GetProcessId and the creation time on the bound handle.
+func confirmBoundIdentity(when string) {
+	confirmed, e := windows.GetProcessId(listenerBoundHandle)
+	if e != nil || int(confirmed) != listenerPid {
+		graceNotes = append(graceNotes, "bound-handle identity broken at "+when+": GetProcessId no longer names the listener pid")
+		return
+	}
+	var created2 windows.Filetime
+	var exited2 windows.Filetime
+	var kernel2 windows.Filetime
+	var user2 windows.Filetime
+	e2 := windows.GetProcessTimes(listenerBoundHandle, &created2, &exited2, &kernel2, &user2)
+	if e2 != nil || created2.Nanoseconds() != listenerCreationNs {
+		graceNotes = append(graceNotes, "bound-handle identity broken at "+when+": creation time no longer matches the attach-time value")
+		return
+	}
+	_ = exited2
+	_ = kernel2
+	_ = user2
+	graceNotes = append(graceNotes, "bound-handle identity confirmed at "+when)
+}
+
+// listenerGraceEvents reports the graceful-stop sequence for the evidence.
+func listenerGraceEvents() []string {
+	out := make([]string, len(graceNotes))
+	copy(out, graceNotes)
+	return out
+}
+
+// listenerTerminationVia reports which termination path was taken.
 func listenerTerminationVia() string {
 	return listenerTerminationNote
 }
@@ -217,4 +312,21 @@ func releaseListenerHandle() error {
 	h := listenerBoundHandle
 	listenerBoundHandle = 0
 	return windows.CloseHandle(h)
+}
+
+// isLinkOrReparse checks whether fi is a symlink, irregular, or has FILE_ATTRIBUTE_REPARSE_POINT.
+func isLinkOrReparse(fi os.FileInfo, path string) bool {
+	if fi == nil {
+		return false
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || fi.Mode()&os.ModeIrregular != 0 {
+		return true
+	}
+	const fileAttributeReparsePoint = 0x00000400
+	if sys, ok := fi.Sys().(*syscall.Win32FileAttributeData); ok {
+		if sys.FileAttributes&fileAttributeReparsePoint != 0 {
+			return true
+		}
+	}
+	return false
 }

@@ -3,10 +3,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
-	"fmt"
 )
 
 func setupListenerSysProcAttr(cmd *exec.Cmd) {}
@@ -26,8 +26,12 @@ func isProcessAlive(pid int) bool {
 	return p.Signal(syscall.Signal(0)) == nil
 }
 
+// Item 2 (re-review 2026-11-21): only a raw exit code of 0 is clean. The
+// -1 sentinel used to mean 'exit status not yet observed', which read as a
+// false pass; an unobserved status is reported by the reclaim proof as
+// unknown and fails the related checks instead.
 func isCleanListenerExit(exitCode int) bool {
-	return exitCode == 0 || exitCode == -1
+	return exitCode == 0
 }
 
 // attachListenerHandle has no Windows handle to bind on POSIX: the os/exec
@@ -49,11 +53,9 @@ func listenerReclaimProof(cmd *exec.Cmd) (proof string, raw int, ok bool) {
 	}
 	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 		code := cmd.ProcessState.ExitCode()
-		_ = code
-		proof := "posix direct-child exit observed: exit code "+fmt.Sprint(code)
+		proof := "posix direct-child exit observed: exit code " + fmt.Sprint(code)
 		return proof, code, true
 	}
-	_ = cmd
 	return "posix direct child still running: exit status not yet observed", 1, false
 }
 
@@ -62,11 +64,9 @@ func listenerReclaimProof(cmd *exec.Cmd) (proof string, raw int, ok bool) {
 func terminateListenerIfRunning(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		// The direct child already exited: no signal is justified.
-		_ = cmd
 		return nil
 	}
 	// A live direct child justifies a single interrupt signal.
-	_ = cmd
 	return cmd.Process.Signal(os.Interrupt)
 }
 
@@ -76,7 +76,23 @@ func releaseListenerHandle() error {
 	return nil
 }
 
+// Item 3 (re-review 2026-11-21): the bounded graceful-stop sequence is a
+// Windows console-event feature, so POSIX records the honest single step:
+// one interrupt signal to the direct child we started, never to a pid
+// number taken from a historical record.
+func listenerGraceEvents() []string {
+	return []string{"posix: single interrupt signal to the direct child only; bounded grace sequence is Windows-only"}
+}
+
 func listenerTerminationVia() string {
 	// POSIX path always signals the direct child when still live.
 	return "posix direct-child signal or already exited"
+}
+
+// isLinkOrReparse checks whether fi is a symlink or irregular file mode.
+func isLinkOrReparse(fi os.FileInfo, path string) bool {
+	if fi == nil {
+		return false
+	}
+	return fi.Mode()&os.ModeSymlink != 0 || fi.Mode()&os.ModeIrregular != 0
 }
