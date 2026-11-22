@@ -160,7 +160,8 @@ if ! verify_identity "$ROOT" "$ARTIFACT_DIR"; then
   exit 1
 fi
 
-export GOTOOLCHAIN=local
+# 必须看到 go1.27.3。不改 go.mod，不运行 Go 安装器。
+# 不设置 GOTOOLCHAIN=local，否则包装器会报自己的旧版本。
 set +e
 go_version="$(go version 2>&1)"
 go_version_rc=$?
