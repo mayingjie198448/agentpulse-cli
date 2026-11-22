@@ -1,13 +1,13 @@
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse	[no test files]
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse-test-helper	[no test files]
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-argv-wire-driver	[no test files]
-ok  	github.com/mayingjie198448/agentpulse-cli/cmd/c4-e2e-driver	0.006s
+ok  	github.com/mayingjie198448/agentpulse-cli/cmd/c4-e2e-driver	0.003s
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-windows-driver	[no test files]
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/autostart	0.003s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/cli	1.682s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/config	2.032s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/dispatch	1.707s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/loopbackmqtt	0.006s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/autostart	0.005s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/cli	1.651s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/config	2.021s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/dispatch	1.710s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/loopbackmqtt	0.005s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/model	0.002s
 --- FAIL: TestProductionExecCommandStaysBehindSafetyBoundary (0.00s)
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/cmd/c4-e2e-driver/main.go
@@ -17,11 +17,11 @@ ok  	github.com/mayingjie198448/agentpulse-cli/internal/model	0.002s
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/fields.go
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/testdata/synthetic_agy.go
 FAIL
-FAIL	github.com/mayingjie198448/agentpulse-cli/internal/safety	0.095s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/store	0.002s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt	5.888s
+FAIL	github.com/mayingjie198448/agentpulse-cli/internal/safety	0.093s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store	0.003s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt	5.957s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/termutil	0.001s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/tui	0.372s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/tui	0.443s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/version	0.001s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/wrapper	16.860s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/wrapper	16.808s
 FAIL

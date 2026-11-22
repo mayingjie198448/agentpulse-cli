@@ -1,5 +1,5 @@
-SOURCE_HEAD=f43fe256f755d3555c5bd182971a2995def1bfa7
-SOURCE_TREE=0fac8d06c9ffa09740c7c3a4a246248622b808d8
+SOURCE_HEAD=a0e903453b3946040ce97d6f2523458ac29e1a7b
+SOURCE_TREE=5155e19506d12ff5fbeda250c9f65c3352ae17fa
 SOURCE_PORCELAIN<<END
 
 END
@@ -26,26 +26,26 @@ COMMAND_BEGIN name=vet
 COMMAND: go vet ./...
 RC name=vet value=0
 COMMAND_END name=vet
-HELPER_PATH=/tmp/agentpulse-minimal-ci.PaCx9W/agentpulse-test-helper
-EVIDENCE_PATH=/tmp/agentpulse-minimal-ci.PaCx9W/argv-wire-evidence
+HELPER_PATH=/tmp/agentpulse-minimal-ci.nrOLJV/agentpulse-test-helper
+EVIDENCE_PATH=/tmp/agentpulse-minimal-ci.nrOLJV/argv-wire-evidence
 COMMAND_BEGIN name=helper_build
-COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.PaCx9W/agentpulse-test-helper ./cmd/agentpulse-test-helper
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.nrOLJV/agentpulse-test-helper ./cmd/agentpulse-test-helper
 RC name=helper_build value=0
 COMMAND_END name=helper_build
 COMMAND_BEGIN name=test
 COMMAND: go test -count=1 -timeout 8m ./...
-ENV AGENTPULSE_TEST_HELPER=/tmp/agentpulse-minimal-ci.PaCx9W/agentpulse-test-helper
-ENV AGENTPULSE_ARGV_WIRE_EVIDENCE=/tmp/agentpulse-minimal-ci.PaCx9W/argv-wire-evidence
+ENV AGENTPULSE_TEST_HELPER=/tmp/agentpulse-minimal-ci.nrOLJV/agentpulse-test-helper
+ENV AGENTPULSE_ARGV_WIRE_EVIDENCE=/tmp/agentpulse-minimal-ci.nrOLJV/argv-wire-evidence
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse	[no test files]
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/agentpulse-test-helper	[no test files]
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-argv-wire-driver	[no test files]
-ok  	github.com/mayingjie198448/agentpulse-cli/cmd/c4-e2e-driver	0.006s
+ok  	github.com/mayingjie198448/agentpulse-cli/cmd/c4-e2e-driver	0.003s
 ?   	github.com/mayingjie198448/agentpulse-cli/cmd/c4-windows-driver	[no test files]
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/autostart	0.003s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/cli	1.682s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/config	2.032s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/dispatch	1.707s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/loopbackmqtt	0.006s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/autostart	0.005s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/cli	1.651s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/config	2.021s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/dispatch	1.710s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/loopbackmqtt	0.005s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/model	0.002s
 --- FAIL: TestProductionExecCommandStaysBehindSafetyBoundary (0.00s)
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/cmd/c4-e2e-driver/main.go
@@ -55,28 +55,28 @@ ok  	github.com/mayingjie198448/agentpulse-cli/internal/model	0.002s
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/fields.go
     safety_test.go:613: exec.Command outside the safety boundary: /agent/repos/agentpulse-cli/internal/wrapper/testdata/synthetic_agy.go
 FAIL
-FAIL	github.com/mayingjie198448/agentpulse-cli/internal/safety	0.095s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/store	0.002s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt	5.888s
+FAIL	github.com/mayingjie198448/agentpulse-cli/internal/safety	0.093s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store	0.003s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt	5.957s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/termutil	0.001s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/tui	0.372s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/tui	0.443s
 ok  	github.com/mayingjie198448/agentpulse-cli/internal/version	0.001s
-ok  	github.com/mayingjie198448/agentpulse-cli/internal/wrapper	16.860s
+ok  	github.com/mayingjie198448/agentpulse-cli/internal/wrapper	16.808s
 FAIL
 RC name=test value=1
 COMMAND_END name=test
 COMMAND_BEGIN name=build
-COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.PaCx9W/agentpulse ./cmd/agentpulse
+COMMAND: env CGO_ENABLED=0 go build -trimpath -o /tmp/agentpulse-minimal-ci.nrOLJV/agentpulse ./cmd/agentpulse
 RC name=build value=0
 COMMAND_END name=build
 COMMAND_BEGIN name=version_smoke
-COMMAND: /tmp/agentpulse-minimal-ci.PaCx9W/agentpulse version
+COMMAND: /tmp/agentpulse-minimal-ci.nrOLJV/agentpulse version
 agentpulse 0.7.0 (commit: dev, built: 2026-11-06)
 Cross-machine monitor for Google Antigravity (agy) and OpenCode
 License: MIT
 RC name=version_smoke value=0
 COMMAND_END name=version_smoke
-687acab8571cb4421a0c578875440e262a5eea2cb5352f08dc9c9d0bb14d440c  /tmp/agentpulse-minimal-ci.PaCx9W/agentpulse
+8ef94c8151f8a11acdba3072f7bf9a92ccc37d28f18c06125b5ce91260b84a57  /tmp/agentpulse-minimal-ci.nrOLJV/agentpulse
 RC name=worktree_unchanged value=0
 NOT_RUN_CATALOG_BEGIN
 item=real_agy class=privileged_or_production status=NOT_RUN detail=最小CI不启动真实agy
