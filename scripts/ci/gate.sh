@@ -5,10 +5,13 @@
 
 set -u
 
-# 已确认的本仓 runner 标签。第四个 agentpulse 使本仓作业不会落到
-# ccdq 的三标签 runner 上。注册或 offline 都不是 ready。
+# 本仓仓库级 runner。它们只绑定 agentpulse-cli，不能被 ccdq-go 选中。
+# ccdq-go 的 runner 也只绑定那个仓库，不能被本仓选中。
+# 第四个标签 agentpulse 只用于本仓两台机器之间的精确选择，不是跨仓防护。
+# 两套仓库级实例仍可能共享同一台物理机。主机锁是另一项工作，本脚本不启用它。
 # mac: agentpulse-mac-mini id 3，登记时 offline，服务未安装/未启用。
 # windows: agentpulse-ccdq-win id 2，登记时 offline，服务未安装/未启用。
+# 注册或 offline 都不是 ready。没有 Linux 自托管 runner，Linux 原生测试保持 NOT_RUN。
 MAC_EXPECTED='self-hosted,macOS,ARM64,agentpulse'
 WIN_EXPECTED='self-hosted,Windows,X64,agentpulse'
 
@@ -24,11 +27,7 @@ forbidden_label_set() {
 }
 
 decide_linux() {
-  if [[ "${AGENTPULSE_CI_LINUX_READY:-}" == "ready" ]]; then
-    printf '%s\n' "READY reason=AGENTPULSE_CI_LINUX_READY=ready hosted_public_linux_not_a_self_hosted_machine"
-  else
-    printf '%s\n' "BLOCKED reason=AGENTPULSE_CI_LINUX_READY_is_not_exactly_ready value=${AGENTPULSE_CI_LINUX_READY:-<unset>}"
-  fi
+  printf '%s\n' "NOT_RUN reason=no_linux_self_hosted_runner cross_compile_is_not_native_linux_test linux_ready_var=${AGENTPULSE_CI_LINUX_READY:-<unset>} ignored=yes"
 }
 
 decide_machine() {
@@ -77,9 +76,16 @@ emit_decisions() {
   printf '%s\n' "OFFLINE_IS_NOT_READY=yes"
   printf '%s\n' "SKIPPED_JOB_IS_NOT_PASS=yes"
   printf '%s\n' "QUEUE_AUTHORIZED value=${AGENTPULSE_CI_QUEUE_AUTHORIZED:-<unset>}"
-  printf '%s\n' "RESIDUAL_RISK=once_online_other_repo_jobs_that_require_only_the_three_os_labels_can_still_select_these_runners"
-  printf '%s\n' "OTHER_REPOS_AND_HOST_MUTEX=unchanged_pending_separate_approval"
-  if [[ "$linux_decision" == READY* && "$darwin_decision" == READY* && "$windows_decision" == READY* && "${AGENTPULSE_CI_QUEUE_AUTHORIZED:-}" == "ready" ]]; then
+  printf '%s\n' "RUNNER_BINDING=repository_scoped agentpulse-cli"
+  printf '%s\n' "CCDQ_GO_RUNNERS_CANNOT_BE_SELECTED_BY_THIS_REPO=yes"
+  printf '%s\n' "THIS_REPO_RUNNERS_CANNOT_BE_SELECTED_BY_OTHER_REPOS=yes"
+  printf '%s\n' "AGENTPULSE_LABEL=in_repo_machine_selector_not_cross_repo_control"
+  printf '%s\n' "HOST_CONTENTION=same_physical_host_is_a_separate_problem"
+  printf '%s\n' "HOST_LOCK=separately_authorized_for_configuration_and_verification_not_enabled_here"
+  printf '%s\n' "GITHUB_HOSTED_RUNNERS=removed"
+  printf '%s\n' "LINUX_NATIVE=NOT_RUN"
+  printf '%s\n' "CROSS_COMPILE_IS_NOT_NATIVE_LINUX_TEST=yes"
+  if [[ "$darwin_decision" == READY* && "$windows_decision" == READY* && "${AGENTPULSE_CI_QUEUE_AUTHORIZED:-}" == "ready" ]]; then
     overall="READY"
   else
     overall="BLOCKED"
@@ -94,7 +100,9 @@ emit_decisions() {
       echo "- \`$linux_decision\`（linux）"
       echo "- \`$darwin_decision\`（darwin）"
       echo "- \`$windows_decision\`（windows）"
-      echo "- 跨仓 CPU/磁盘互斥：未实现。本仓 concurrency 不能错开同一台机器上其它仓库的 runner。"
+      echo "- 本仓 runner 与 ccdq-go 的 runner 都是仓库级绑定，不能互相调度。agentpulse 标签只在本仓内选机器。"
+      echo "- 同一台物理机的资源争用是另一问题。主机锁已另行批准做配置和验证，这里没有启用，也不表示 CI 可以上线。"
+      echo "- Linux 原生测试 NOT_RUN。交叉编译不是 Linux 原生验证。"
       echo "- 登记事实不是就绪：agentpulse-mac-mini（id 3）与 agentpulse-ccdq-win（id 2）登记时为 offline，服务未安装或未启用。本脚本不探测在线状态。"
       echo "- skipped 的执行道不是通过。"
       echo "- 结果：\`$overall\`"

@@ -1,130 +1,51 @@
-# 最小 CI。默认只跑 ubuntu 上的准入作业，并以非 0 退出表示 BLOCKED。
-# agentpulse-mac-mini（id 3）与 agentpulse-ccdq-win（id 2）已注册但登记时 offline，
-# 服务未安装或未启用。registered 不是 ready。skipped 的执行道不是通过。
-# 跨仓错峰尚未落实。本文件的 concurrency 不是跨仓锁。
-# 未另获批准前不改其它仓库、runner 服务、主机互斥、代理或 ACL。
+# 最小 CI 设计稿。本文件当前不会调度任何作业。
+# 触发器只匹配一个不存在的分支，作业条件又以 false 开头。
+# 因此本 PR 的推送不会启动托管运行器，也不会把离线的自托管 runner 排进队列。
+# 登记为 offline 不是 ready。skipped 不是通过。全部作业被跳过时平台会把工作流显示为成功，
+# 所以这里根本不让工作流运行，而不是靠跳过凑出一个绿色检查。
+# 主机锁是另一项已另行批准的配置验证，不在本文件实施，也不表示本 CI 可以启用。
 
 name: minimal-ci
 
 on:
-  pull_request:
+  push:
+    branches:
+      - agentpulse-ci-disabled-pending-approval
 
 permissions:
   contents: read
   actions: write
 
-# 只串行本仓库这一条工作流。不能阻止同一台 mini/ccdq 上其它仓库的 runner。
+# 只串行本仓库这一条工作流。它不是同一台物理机上的跨仓锁。
 concurrency:
   group: agentpulse-cli-minimal-ci-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  admission:
-    name: admission
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: checkout head tree
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: script contract
-        shell: bash
-        env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-admission
-        run: bash scripts/ci/contract-selfcheck.sh
-
-      - name: admit or block
-        shell: bash
-        env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-admission
-          AGENTPULSE_CI_LINUX_READY: ${{ vars.AGENTPULSE_CI_LINUX_READY }}
-          AGENTPULSE_CI_RUNNER_READY: ${{ vars.AGENTPULSE_CI_RUNNER_READY }}
-          AGENTPULSE_CI_SCHEDULE_READY: ${{ vars.AGENTPULSE_CI_SCHEDULE_READY }}
-          AGENTPULSE_MAC_RUNNER_LABELS: ${{ vars.AGENTPULSE_MAC_RUNNER_LABELS }}
-          AGENTPULSE_WINDOWS_RUNNER_LABELS: ${{ vars.AGENTPULSE_WINDOWS_RUNNER_LABELS }}
-          AGENTPULSE_CI_QUEUE_AUTHORIZED: ${{ vars.AGENTPULSE_CI_QUEUE_AUTHORIZED }}
-        run: |
-          mkdir -p "$ARTIFACT_DIR"
-          set +e
-          bash scripts/ci/gate.sh >"$ARTIFACT_DIR/admission.txt" 2>&1
-          rc=$?
-          cat "$ARTIFACT_DIR/admission.txt"
-          if [[ "$rc" -eq 2 ]]; then
-            echo "ADMISSION_RESULT=BLOCKED"
-            echo "SKIPPED_LANES_ARE_NOT_PASS"
-            echo "SELF_HOSTED_JOBS_NOT_QUEUED"
-            exit 2
-          fi
-          if [[ "$rc" -ne 0 ]]; then
-            echo "ADMISSION_RESULT=FAIL rc=$rc"
-            exit "$rc"
-          fi
-          echo "ADMISSION_RESULT=READY"
-          echo "READY_IS_NOT_A_TEST_PASS"
-          exit 0
-
-      - name: upload admission log
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: admission-${{ github.run_id }}
-          path: ${{ runner.temp }}/agentpulse-admission
-          if-no-files-found: warn
-
-  linux-native:
-    name: linux native
-    needs: admission
-    if: "${{ needs.admission.result == 'success' && vars.AGENTPULSE_CI_LINUX_READY == 'ready' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' }}"
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: checkout head tree
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - name: linux lane
-        shell: bash
-        env:
-          AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-linux
-        run: bash scripts/ci/minimal-ci.sh
-      - name: upload linux log
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: linux-native-${{ github.run_id }}
-          path: ${{ runner.temp }}/agentpulse-linux
-          if-no-files-found: warn
-
   darwin-native:
     name: darwin native
-    needs: admission
-    if: "${{ needs.admission.result == 'success' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_MAC_RUNNER_LABELS == 'self-hosted,macOS,ARM64,agentpulse' }}"
+    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_MAC_RUNNER_LABELS == 'self-hosted,macOS,ARM64,agentpulse' }}"
     runs-on: [self-hosted, macOS, ARM64, agentpulse]
     timeout-minutes: 20
     steps:
-      - name: checkout head tree
+      - name: checkout pushed sha
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+      - name: trust boundary
+        shell: bash
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
+        run: bash scripts/ci/trust-boundary.sh
       - name: darwin lane
         shell: bash
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ github.sha }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
         run: bash scripts/ci/minimal-ci.sh
       - name: upload darwin log
@@ -137,22 +58,28 @@ jobs:
 
   windows-native:
     name: windows native
-    needs: admission
-    if: "${{ needs.admission.result == 'success' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_WINDOWS_RUNNER_LABELS == 'self-hosted,Windows,X64,agentpulse' }}"
+    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_WINDOWS_RUNNER_LABELS == 'self-hosted,Windows,X64,agentpulse' }}"
     runs-on: [self-hosted, Windows, X64, agentpulse]
     timeout-minutes: 20
     steps:
-      - name: checkout head tree
+      - name: checkout pushed sha
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+      - name: trust boundary
+        shell: bash
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
+        run: bash scripts/ci/trust-boundary.sh
       - name: windows lane
         shell: bash
         env:
           AGENTPULSE_CI_ENFORCE_SHA: "1"
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ github.sha }}
           ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-windows
         run: bash scripts/ci/minimal-ci.sh
       - name: upload windows log
@@ -161,4 +88,38 @@ jobs:
         with:
           name: windows-native-${{ github.run_id }}
           path: ${{ runner.temp }}/agentpulse-windows
+          if-no-files-found: warn
+
+  cross-compile:
+    name: cross compile not native
+    if: "${{ false && github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && github.ref == 'refs/heads/agentpulse-ci-disabled-pending-approval' && vars.AGENTPULSE_CI_QUEUE_AUTHORIZED == 'ready' && vars.AGENTPULSE_CI_RUNNER_READY == 'ready' && vars.AGENTPULSE_CI_SCHEDULE_READY == 'ready' && vars.AGENTPULSE_MAC_RUNNER_LABELS == 'self-hosted,macOS,ARM64,agentpulse' }}"
+    runs-on: [self-hosted, macOS, ARM64, agentpulse]
+    timeout-minutes: 20
+    steps:
+      - name: checkout pushed sha
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: trust boundary
+        shell: bash
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-cross
+        run: bash scripts/ci/trust-boundary.sh
+      - name: cross compile
+        shell: bash
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-cross
+        run: bash scripts/ci/minimal-ci.sh --cross-compile
+      - name: upload cross log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-compile-${{ github.run_id }}
+          path: ${{ runner.temp }}/agentpulse-cross
           if-no-files-found: warn

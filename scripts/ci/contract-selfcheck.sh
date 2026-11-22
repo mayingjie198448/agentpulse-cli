@@ -25,6 +25,11 @@ if ! bash "$ROOT/scripts/ci/gate.sh" --self-check; then
   failed=1
 fi
 
+if ! bash "$ROOT/scripts/ci/trust-boundary.sh" --self-check; then
+  echo "CONTRACT_SELF_CHECK_FAIL trust"
+  failed=1
+fi
+
 if [[ "$failed" != "0" ]]; then
   echo "CONTRACT_SELF_CHECK_RC=1"
   exit 1

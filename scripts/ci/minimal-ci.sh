@@ -64,7 +64,7 @@ static_contract() {
   local failed=0
   local workflow="$ROOT/.github/workflows/minimal-ci.yml"
   local file
-  for file in "$ROOT/scripts/ci/identity.sh" "$ROOT/scripts/ci/gate.sh" "$ROOT/scripts/ci/minimal-ci.sh" "$ROOT/scripts/ci/contract-selfcheck.sh"; do
+  for file in "$ROOT/scripts/ci/identity.sh" "$ROOT/scripts/ci/gate.sh" "$ROOT/scripts/ci/minimal-ci.sh" "$ROOT/scripts/ci/contract-selfcheck.sh" "$ROOT/scripts/ci/trust-boundary.sh"; do
     if ! bash -n "$file"; then
       echo "CONTRACT_FAIL syntax $file"
       failed=1
@@ -80,6 +80,7 @@ static_contract() {
     "$ROOT/scripts/ci/gate.sh" \
     "$ROOT/scripts/ci/contract-selfcheck.sh" \
     "$ROOT/scripts/ci/minimal-ci.sh" \
+    "$ROOT/scripts/ci/trust-boundary.sh" \
     "$workflow"; then
     echo "CONTRACT_FAIL hidden_success_pattern"
     failed=1
@@ -88,12 +89,43 @@ static_contract() {
     echo "CONTRACT_FAIL self_hosted_only"
     failed=1
   fi
-  if grep -n -E 'macos-latest|windows-latest' "$workflow"; then
-    echo "CONTRACT_FAIL paid_or_hosted_desktop_runner"
+  local hosted_runner pr_event
+  hosted_runner="$(printf '%s' 'ubuntu-latest')"
+  pr_event="$(printf '%s_%s' 'pull' 'request')"
+  if grep -n -F -e "$hosted_runner" -e 'macos-latest' -e 'windows-latest' "$workflow"; then
+    echo "CONTRACT_FAIL hosted_runner"
+    failed=1
+  fi
+  if grep -n -F -e "$pr_event" "$workflow"; then
+    echo "CONTRACT_FAIL untrusted_pr_trigger"
+    failed=1
+  fi
+  if grep -n -F 'head.sha' "$workflow"; then
+    echo "CONTRACT_FAIL untrusted_head_checkout"
+    failed=1
+  fi
+  if ! grep -F -q 'agentpulse-ci-disabled-pending-approval' "$workflow"; then
+    echo "CONTRACT_FAIL execution_lock_branch_missing"
+    failed=1
+  fi
+  if ! grep -F -q 'false &&' "$workflow"; then
+    echo "CONTRACT_FAIL execution_lock_missing"
+    failed=1
+  fi
+  if ! grep -F -q 'persist-credentials: false' "$workflow"; then
+    echo "CONTRACT_FAIL credentials_not_disabled"
+    failed=1
+  fi
+  if ! grep -F -q 'ref: ${{ github.sha }}' "$workflow"; then
+    echo "CONTRACT_FAIL pushed_sha_checkout_missing"
     failed=1
   fi
   if grep -n -E 'workflow_dispatch|workflow_call' "$workflow"; then
     echo "CONTRACT_FAIL manual_dispatch_enabled"
+    failed=1
+  fi
+  if grep -n -F 'secrets.' "$workflow"; then
+    echo "CONTRACT_FAIL secrets_context"
     failed=1
   fi
   if ! grep -F -q '[self-hosted, macOS, ARM64, agentpulse]' "$workflow"; then
@@ -199,6 +231,46 @@ esac
 goos="$(go env GOOS)"
 goarch="$(go env GOARCH)"
 printf '%s\n' "PLATFORM goos=$goos goarch=$goarch"
+if [[ "${1:-}" == "--cross-compile" ]]; then
+  overall=0
+  printf '%s\n' "MODE=cross_compile"
+  printf '%s\n' "CI_LINUX_NATIVE_TEST=NOT_RUN reason=no_linux_self_hosted_runner"
+  printf '%s\n' "CROSS_COMPILE_IS_NOT_NATIVE_LINUX_TEST=yes"
+  printf '%s\n' "LOCAL_HOST goos=$goos goarch=$goarch"
+  mkdir -p "$ARTIFACT_DIR/cross"
+  for spec in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+    target_os="${spec%%/*}"
+    target_arch="${spec##*/}"
+    ext=""
+    if [[ "$target_os" == "windows" ]]; then
+      ext=".exe"
+    fi
+    out="$ARTIFACT_DIR/cross/agentpulse-${target_os}-${target_arch}${ext}"
+    printf '%s\n' "COMMAND: CGO_ENABLED=0 GOOS=$target_os GOARCH=$target_arch go build -trimpath -o $out ./cmd/agentpulse"
+    set +e
+    CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" go build -trimpath -o "$out" ./cmd/agentpulse
+    build_rc=$?
+    set -e
+    printf '%s\n' "RC name=cross_${target_os}_${target_arch} value=$build_rc"
+    if [[ "$target_os" == "$goos" && "$target_arch" == "$goarch" ]]; then
+      printf '%s\n' "CLASS=host_arch_build_still_not_ci_linux_native_lane goos=$target_os goarch=$target_arch"
+    else
+      printf '%s\n' "CLASS=cross_compile_not_native_test goos=$target_os goarch=$target_arch"
+    fi
+    if [[ "$build_rc" != "0" ]]; then
+      overall=1
+    fi
+  done
+  if ! git -C "$ROOT" diff --quiet || [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+    echo "WORKTREE_CHANGED_DURING_CROSS"
+    git -C "$ROOT" status --porcelain
+    overall=1
+  else
+    echo "WORKTREE_UNCHANGED=0"
+  fi
+  echo "OVERALL_RC=$overall"
+  exit "$overall"
+fi
 printf '%s\n' "UNAME=$(uname -srm)"
 go env GOVERSION GOTOOLCHAIN GOOS GOARCH CGO_ENABLED >"$ARTIFACT_DIR/go-env.txt"
 printf '%s\n' "COMMAND: go env GOVERSION GOTOOLCHAIN GOOS GOARCH CGO_ENABLED"
