@@ -69,41 +69,53 @@ verify_archive() {
   return 0
 }
 
-have_go=0
-if [[ -x "$root/bin/go" || -x "$root/bin/go.exe" ]]; then
-  have_go=1
-fi
-if [[ "$have_go" == "1" ]]; then
+if [[ -f "$archive" ]]; then
   echo "GO_CACHE=hit" >&2
   if ! verify_archive; then
     echo "GO_CACHE_REJECTED=yes" >&2
-    rm -rf "$root"
     rm -f "$archive"
-    have_go=0
   else
     echo "GO_CACHE_VERIFIED=yes" >&2
   fi
 else
   echo "GO_CACHE=miss" >&2
 fi
-if [[ "$have_go" != "1" ]]; then
+
+if [[ ! -f "$archive" ]]; then
   echo "GO_DOWNLOAD url=$url" >&2
-  curl -fsSL "$url" -o "$archive"
-  if ! verify_archive; then
+  if ! curl -fsSL "$url" -o "$archive"; then
+    echo "GO_DOWNLOAD_FAILED" >&2
     exit 1
   fi
-  rm -rf "$prefix/unpack" "$root"
-  mkdir -p "$prefix/unpack"
-  if [[ "$ext" == "zip" ]]; then
-    if command -v unzip >/dev/null 2>&1; then
-      unzip -q "$archive" -d "$prefix/unpack"
-    else
-      tar -xf "$archive" -C "$prefix/unpack"
-    fi
-  else
-    tar -xzf "$archive" -C "$prefix/unpack"
+  if ! verify_archive; then
+    rm -f "$archive"
+    exit 1
   fi
-  mv "$prefix/unpack/go" "$root"
+fi
+
+# 优先从校验通过的安装包重新解压到本作业独占的干净目录，不得仅凭旧解压目录存在或版本号信任。
+rm -rf "$prefix/unpack" "$root"
+mkdir -p "$prefix/unpack"
+if [[ "$ext" == "zip" ]]; then
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$archive" -d "$prefix/unpack"
+  else
+    tar -xf "$archive" -C "$prefix/unpack"
+  fi
+else
+  tar -xzf "$archive" -C "$prefix/unpack"
+fi
+if [[ ! -d "$prefix/unpack/go" ]]; then
+  echo "GO_UNPACK_MISSING_GO_DIR" >&2
+  rm -rf "$prefix/unpack"
+  exit 1
+fi
+mv "$prefix/unpack/go" "$root"
+rm -rf "$prefix/unpack"
+
+if [[ ! -x "$root/bin/go" && ! -x "$root/bin/go.exe" ]]; then
+  echo "GO_BINARY_NOT_EXECUTABLE path=$root/bin" >&2
+  exit 1
 fi
 
 printf 'export GOROOT=%q\n' "$root"
