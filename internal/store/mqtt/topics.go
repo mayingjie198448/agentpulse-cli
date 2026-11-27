@@ -142,4 +142,3 @@ func parseTopic(topic string) parsedTopic {
 
 	return parsedTopic{typ: topicUnknown}
 }
-

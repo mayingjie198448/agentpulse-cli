@@ -784,17 +784,17 @@ func TestDispatch_EndToEnd_WithListener(t *testing.T) {
 	// 2. Dispatch a job from publisher CLI with --wait and --follow
 	outBuf := new(bytes.Buffer)
 	cmd, err := dispatch.Dispatch(context.Background(), dispatch.Config{
-		MachineID:   "edge-mac-1",
-		JobID:       "job-e2e-dispatch-01",
-		Engine:      model.EngineAgy,
-		Command:     "agy",
-		Args:        []string{"--prompt", "E2E integration test"},
-		Title:       "E2E Dispatch Integration",
-		Wait:        true,
-		Follow:      true,
-		MQTTClient:  mockClient,
-		Out:         outBuf,
-		Quiet:       false,
+		MachineID:  "edge-mac-1",
+		JobID:      "job-e2e-dispatch-01",
+		Engine:     model.EngineAgy,
+		Command:    "agy",
+		Args:       []string{"--prompt", "E2E integration test"},
+		Title:      "E2E Dispatch Integration",
+		Wait:       true,
+		Follow:     true,
+		MQTTClient: mockClient,
+		Out:        outBuf,
+		Quiet:      false,
 	})
 	if err != nil {
 		t.Fatalf("end-to-end dispatch failed: %v", err)
@@ -853,12 +853,18 @@ func (f *fakeDispatchStore) GetAnnounce(ctx context.Context, id string) (*model.
 }
 
 func (f *fakeDispatchStore) ListJobs(ctx context.Context) ([]model.Job, error) { return nil, nil }
-func (f *fakeDispatchStore) GetJob(ctx context.Context, id string) (*model.Job, error) { return nil, nil }
+func (f *fakeDispatchStore) GetJob(ctx context.Context, id string) (*model.Job, error) {
+	return nil, nil
+}
 func (f *fakeDispatchStore) DeleteJob(ctx context.Context, id string) error { return nil }
-func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) { return nil, nil }
-func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) { return nil, nil }
+func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int) ([]model.LogEntry, error) {
+	return nil, nil
+}
+func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) {
+	return nil, nil
+}
 func (f *fakeDispatchStore) IsConnected() bool { return true }
-func (f *fakeDispatchStore) Close() error { return nil }
+func (f *fakeDispatchStore) Close() error      { return nil }
 
 func TestDispatch_TargetMachineGate(t *testing.T) {
 	now := time.Now()
@@ -1276,4 +1282,3 @@ func TestDispatch_MQTT_TLS_InvalidCert_Fails(t *testing.T) {
 		t.Errorf("expected error to mention 'failed to read CA certificate', got: %v", err)
 	}
 }
-

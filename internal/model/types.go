@@ -179,4 +179,3 @@ type DispatchCommand struct {
 	RequestedBy    string            `json:"requested_by"`
 	Timestamp      time.Time         `json:"timestamp"`
 }
-

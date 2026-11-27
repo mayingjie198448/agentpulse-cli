@@ -19,10 +19,10 @@ func newSuccessToken() *fakeToken {
 	return &fakeToken{done: c, err: nil}
 }
 
-func (t *fakeToken) Wait() bool                        { return true }
-func (t *fakeToken) WaitTimeout(d time.Duration) bool  { return true }
-func (t *fakeToken) Done() <-chan struct{}             { return t.done }
-func (t *fakeToken) Error() error                      { return t.err }
+func (t *fakeToken) Wait() bool                       { return true }
+func (t *fakeToken) WaitTimeout(d time.Duration) bool { return true }
+func (t *fakeToken) Done() <-chan struct{}            { return t.done }
+func (t *fakeToken) Error() error                     { return t.err }
 
 // fakeMessage implements paho.Message.
 type fakeMessage struct {
