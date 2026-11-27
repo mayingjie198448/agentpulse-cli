@@ -1,0 +1,156 @@
+# 同仓受信任分支 push 入口。
+# mac 标签字面量 self-hosted,macOS,ARM64,agentpulse
+# windows 标签字面量 self-hosted,Windows,X64,agentpulse
+# Windows 作业使用 shell: cmd 并显式调用 C:\Program Files\Git\bin\bash.exe，拒绝 C:\Windows\system32\bash.exe（WSL）。
+
+name: minimal-ci
+
+on:
+  push:
+    branches:
+      - release/0.8.0
+      - mayingjie/minimal-ci-on-release-0.8.0
+      - feat/tui-machines-refresh-autostart-0.8.0
+      - mayingjie/fix-refresh-maintainer-subscribe-race-0996
+      - feat/config-scan-wizard-0.8.0
+      - feat/dispatch-jobs-fields-0.8.0
+      - fix/dispatch-runtime-0.8.0
+      - feat/bare-cli-attach-0.8.0
+      - mayingjie/allowlist-scoped-discovery-fabf
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentpulse-cli-minimal-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  darwin-native:
+    name: darwin native
+    if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && (github.ref == 'refs/heads/release/0.8.0' || github.ref == 'refs/heads/mayingjie/minimal-ci-on-release-0.8.0' || github.ref == 'refs/heads/feat/tui-machines-refresh-autostart-0.8.0' || github.ref == 'refs/heads/mayingjie/fix-refresh-maintainer-subscribe-race-0996' || github.ref == 'refs/heads/feat/config-scan-wizard-0.8.0' || github.ref == 'refs/heads/feat/dispatch-jobs-fields-0.8.0' || github.ref == 'refs/heads/fix/dispatch-runtime-0.8.0' || github.ref == 'refs/heads/feat/bare-cli-attach-0.8.0' || github.ref == 'refs/heads/mayingjie/allowlist-scoped-discovery-fabf') && github.event.repository.fork == false }}"
+    runs-on: [self-hosted, macOS, ARM64, agentpulse]
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    timeout-minutes: 30
+    steps:
+      - name: checkout candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: record target identity
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          {
+            echo "SCRIPT_SHA=$(git rev-parse HEAD)"
+            echo "SCRIPT_TREE=$(git rev-parse 'HEAD^{tree}')"
+            echo "TARGET_SHA_ACTUAL=$(git rev-parse HEAD)"
+            echo "TARGET_TREE=$(git rev-parse 'HEAD^{tree}')"
+            echo "GO_MOD_LINE=$(awk '/^go /{print; exit}' go.mod)"
+          } | tee "$ARTIFACT_DIR/identity.txt"
+      - name: trust boundary
+        id: trust
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
+          FORK: ${{ github.event.repository.fork }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
+        run: bash scripts/ci/trust-boundary.sh
+      - name: darwin lane
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin
+        run: bash scripts/ci/minimal-ci.sh
+      - name: cross compile
+        if: "${{ always() && steps.trust.outcome == 'success' }}"
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
+          ARTIFACT_DIR: ${{ runner.temp }}/agentpulse-darwin-cross
+        run: bash scripts/ci/minimal-ci.sh --cross-compile
+      - name: upload darwin logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: darwin-candidate-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/agentpulse-darwin
+            ${{ runner.temp }}/agentpulse-darwin-cross
+          if-no-files-found: warn
+
+  windows-native:
+    name: windows native
+    if: "${{ github.event_name == 'push' && github.repository == 'mayingjie198448/agentpulse-cli' && (github.ref == 'refs/heads/release/0.8.0' || github.ref == 'refs/heads/mayingjie/minimal-ci-on-release-0.8.0' || github.ref == 'refs/heads/feat/tui-machines-refresh-autostart-0.8.0' || github.ref == 'refs/heads/mayingjie/fix-refresh-maintainer-subscribe-race-0996' || github.ref == 'refs/heads/feat/config-scan-wizard-0.8.0' || github.ref == 'refs/heads/feat/dispatch-jobs-fields-0.8.0' || github.ref == 'refs/heads/fix/dispatch-runtime-0.8.0' || github.ref == 'refs/heads/feat/bare-cli-attach-0.8.0' || github.ref == 'refs/heads/mayingjie/allowlist-scoped-discovery-fabf') && github.event.repository.fork == false }}"
+    runs-on: [self-hosted, Windows, X64, agentpulse]
+    defaults:
+      run:
+        shell: cmd
+    timeout-minutes: 30
+    steps:
+      - name: checkout candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: record target identity
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}\agentpulse-windows
+        run: |
+          if not exist "%ARTIFACT_DIR%" mkdir "%ARTIFACT_DIR%"
+          for /f "delims=" %%i in ('git rev-parse HEAD') do set "HEAD_SHA=%%i"
+          for /f "delims=" %%i in ('git rev-parse HEAD:') do set "HEAD_TREE=%%i"
+          (
+            echo SCRIPT_SHA=%HEAD_SHA%
+            echo SCRIPT_TREE=%HEAD_TREE%
+            echo TARGET_SHA_ACTUAL=%HEAD_SHA%
+            echo TARGET_TREE=%HEAD_TREE%
+          ) > "%ARTIFACT_DIR%\identity.txt"
+          type "%ARTIFACT_DIR%\identity.txt"
+      - name: trust boundary
+        id: trust
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
+          FORK: ${{ github.event.repository.fork }}
+          ARTIFACT_DIR: ${{ runner.temp }}\agentpulse-windows
+        run: |
+          echo REJECTED_WSL_BASH=C:\Windows\system32\bash.exe reason=WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+          if not exist "C:\Program Files\Git\bin\bash.exe" (
+            echo GIT_BASH=missing
+            exit /b 1
+          )
+          "C:\Program Files\Git\bin\bash.exe" --noprofile --norc -eo pipefail scripts/ci/trust-boundary.sh
+      - name: windows lane
+        env:
+          AGENTPULSE_CI_ENFORCE_SHA: "1"
+          EXPECTED_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_ROOT: ${{ github.workspace }}
+          ARTIFACT_DIR: ${{ runner.temp }}\agentpulse-windows
+        run: |
+          echo REJECTED_WSL_BASH=C:\Windows\system32\bash.exe reason=WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+          if not exist "C:\Program Files\Git\bin\bash.exe" (
+            echo GIT_BASH=missing
+            exit /b 1
+          )
+          "C:\Program Files\Git\bin\bash.exe" --noprofile --norc -eo pipefail scripts/ci/minimal-ci.sh
+      - name: upload windows logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/agentpulse-windows
+          if-no-files-found: warn
