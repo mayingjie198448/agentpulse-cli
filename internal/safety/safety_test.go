@@ -136,13 +136,15 @@ func TestRequireCredentialIPCFailsClosed(t *testing.T) {
 }
 
 func TestDarwinProfileIsNotAVerification(t *testing.T) {
-	profile, err := DarwinSeatbeltProfile("/tmp/agentpulse-run-example")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, needle := range []string{"deny file-write*", "subpath \"/tmp/agentpulse-run-example\"", "com.apple.securityd", "com.apple.SecurityServer"} {
-		if !strings.Contains(profile, needle) {
-			t.Fatalf("profile missing %q:\n%s", needle, profile)
+	if runtime.GOOS != "windows" {
+		profile, err := DarwinSeatbeltProfile("/tmp/agentpulse-run-example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, needle := range []string{"deny file-write*", "subpath \"/tmp/agentpulse-run-example\"", "com.apple.securityd", "com.apple.SecurityServer"} {
+			if !strings.Contains(profile, needle) {
+				t.Fatalf("profile missing %q:\n%s", needle, profile)
+			}
 		}
 	}
 	status := NativeVerification()
