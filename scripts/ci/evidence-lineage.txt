@@ -1,0 +1,20 @@
+line=a0e903453b3946040ce97d6f2523458ac29e1a7b
+tree=5155e19506d12ff5fbeda250c9f65c3352ae17fa
+bundle=scripts/ci/selftest
+worktree_at_that_sha=clean
+what_it_verified=contract_rc_0 gate_rc_2 lane_rc_1 on that exact tree
+not_a_clean_verification_of=796b659c033f5ecc25d381ea944b435ad8d06152
+reason=796b659 only replaced selftest originals after a0e9034. Its tree is 6891a63db65f439112ba8c869482f22081f7259b. The lane did not run on that tree.
+hosted_run_on_796b659=45008955439
+hosted_run_record=scripts/ci/hosted-run-45008955439.txt
+hosted_cost=UNKNOWN
+hosted_run_is_not_authorization=yes
+
+bare_go_test_5_fail_4_skip=author_statement_only
+committed_go_test=scripts/ci/selftest/lane/go-test.txt
+committed_go_test_means=after_helper_and_evidence_dir cli_and_wrapper_ok safety_boundary_still_failed
+do_not_infer_skip_to_green_from_the_uncommitted_bare_run=yes
+
+safety_failure_paths=cmd/c4-e2e-driver/main.go driver; internal/autostart/autostart_darwin.go product; internal/config/config.go product; internal/wrapper/attach.go product; internal/wrapper/fields.go product; internal/wrapper/testdata/synthetic_agy.go testdata
+not_six_product_files=yes
+product_and_driver_not_edited_for_ci=yes

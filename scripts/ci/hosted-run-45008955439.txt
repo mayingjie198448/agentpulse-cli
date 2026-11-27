@@ -1,0 +1,22 @@
+record=first_hosted_execution_deviation
+run_id=45008955439
+html_url=https://github.com/mayingjie198448/agentpulse-cli/actions/runs/45008955439
+event=pull_request
+head_sha=796b659c033f5ecc25d381ea944b435ad8d06152
+head_tree=6891a63db65f439112ba8c869482f22081f7259b
+head_branch=mayingjie/minimal-ci-8a30
+created_at=2026-11-22T09:43:51Z
+updated_at=2026-11-22T09:44:00Z
+conclusion=failure
+cost=UNKNOWN
+authorization=not_granted_by_the_self_hosted_scope
+this_record_does_not_approve_the_run=yes
+
+job=admission conclusion=failure labels=ubuntu-latest runner_name=GitHub Actions 1000002208 runner_group=GitHub Actions started_at=2026-11-22T09:43:53Z completed_at=2026-11-22T09:43:59Z
+job=linux native conclusion=skipped labels=ubuntu-latest runner_name= runner_group= started_at=2026-11-22T09:44:00Z completed_at=2026-11-22T09:44:00Z
+job=darwin native conclusion=skipped labels=self-hosted,macOS,ARM64,agentpulse runner_name= runner_group= started_at=2026-11-22T09:44:00Z completed_at=2026-11-22T09:44:00Z
+job=windows native conclusion=skipped labels=self-hosted,Windows,X64,agentpulse runner_name= runner_group= started_at=2026-11-22T09:44:00Z completed_at=2026-11-22T09:44:00Z
+
+self_hosted_runner_assigned=no
+skipped_is_not_pass=yes
+workflow_conclusion_failure_was_the_hosted_admission_job=yes

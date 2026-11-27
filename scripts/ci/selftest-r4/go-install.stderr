@@ -1,0 +1,2 @@
+GO_INSTALL_ISOLATED=yes
+GOROOT_SELECTED=/tmp/go-official-1.27.4/goroot

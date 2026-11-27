@@ -1,0 +1,12 @@
+entry=push refs/heads/mayingjie/minimal-ci-8a30
+why_not_manual_dispatch=GitHub workflow syntax says that event only arrives when the workflow file is on the default branch. This file is not on main.
+repository=mayingjie198448/agentpulse-cli
+fork_policy=all_external_contributors was set by an authorized change. That does not approve executing fork or pull-request code on self-hosted runners. This workflow does not listen for those events.
+tested_tree=the pushed github.sha on this CI branch. It is a PR55-derived candidate whose go.mod says 1.27.4.
+pr55_original=9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf still has go 1.27.3 and is not rewritten by this branch.
+linux_native=NOT_RUN
+permissions=contents: read
+windows_shell=powershell invokes C:\Program Files\Git\bin\bash.exe and rejects system32 bash.exe
+workflow_state=left disabled_manually. This change does not enable it.
+expected_failure=gofmt lists four existing files. The linux safety boundary test still fails when the lane runs on linux. It is not skipped. Darwin and windows jobs do not compile that linux-tagged test.
+helper=CGO_ENABLED=0 go build -trimpath -o $TMP/agentpulse-test-helper ./cmd/agentpulse-test-helper from the candidate tree, output outside the tree.

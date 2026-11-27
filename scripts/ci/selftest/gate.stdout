@@ -1,0 +1,24 @@
+SOURCE_HEAD=a0e903453b3946040ce97d6f2523458ac29e1a7b
+SOURCE_TREE=5155e19506d12ff5fbeda250c9f65c3352ae17fa
+SOURCE_PORCELAIN<<END
+
+END
+IDENTITY_RC=0
+LANE linux BLOCKED reason=AGENTPULSE_CI_LINUX_READY_is_not_exactly_ready value=<unset>
+LANE darwin BLOCKED reason=AGENTPULSE_CI_RUNNER_READY_is_not_exactly_ready value=<unset>
+LANE windows BLOCKED reason=AGENTPULSE_CI_RUNNER_READY_is_not_exactly_ready value=<unset>
+CROSS_REPO_LOCK=NOT_IMPLEMENTED single_repo_concurrency_is_not_a_lock
+MAC_RUNS_ON=self-hosted,macOS,ARM64,agentpulse
+WINDOWS_RUNS_ON=self-hosted,Windows,X64,agentpulse
+CCDQ_MAC_LABELS_FORBIDDEN=self-hosted,macOS,ARM64
+CCDQ_WINDOWS_LABELS_FORBIDDEN=self-hosted,Windows,X64
+RECORDED_AT_AUTHORING runner=agentpulse-mac-mini id=3 runs_on=self-hosted,macOS,ARM64,agentpulse registered=yes online=no service=not_installed_or_not_enabled
+RECORDED_AT_AUTHORING runner=agentpulse-ccdq-win id=2 runs_on=self-hosted,Windows,X64,agentpulse registered=yes online=no service=not_installed_or_not_enabled
+RUNNER_STATUS_NOT_POLLED=yes
+REGISTERED_IS_NOT_READY=yes
+OFFLINE_IS_NOT_READY=yes
+SKIPPED_JOB_IS_NOT_PASS=yes
+QUEUE_AUTHORIZED value=<unset>
+RESIDUAL_RISK=once_online_other_repo_jobs_that_require_only_the_three_os_labels_can_still_select_these_runners
+OTHER_REPOS_AND_HOST_MUTEX=unchanged_pending_separate_approval
+ADMISSION_RESULT=BLOCKED

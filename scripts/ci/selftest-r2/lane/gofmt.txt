@@ -1,0 +1,4 @@
+cmd/c4-e2e-driver/main.go
+internal/safety/audit.go
+internal/safety/launch_windows.go
+internal/safety/launch_windows_test.go

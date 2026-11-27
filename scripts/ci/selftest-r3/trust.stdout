@@ -1,0 +1,15 @@
+TRUST_EVENT=
+TRUST_REPOSITORY=
+TRUST_REF=
+TRUST_SCRIPT_SHA=421454ea89f6529c130b236575231b5877bcbcb1
+TRUST_SCRIPT_HEAD=421454ea89f6529c130b236575231b5877bcbcb1
+TRUST_TARGET_SHA=
+TRUST_TARGET_HEAD=
+TRUST_FORK=
+TRUST_ALLOWLIST=refs/heads/mayingjie/minimal-ci-8a30
+TARGET_SHA_EXPECTED=9ac0b5c2ef21a9b77c501e67a8836e37a59e50bf
+FORK_POLICY=fork_code_is_not_executed_on_self_hosted
+CHECKOUT_POLICY=script_sha_is_push_commit_target_sha_is_pr55
+SECRET_BOUNDARY=no_secrets_context permissions_contents_read credentials_not_persisted
+EXECUTES_UNTRUSTED_HEAD=no
+TRUST_RESULT=BLOCKED reason=repository_mismatch
