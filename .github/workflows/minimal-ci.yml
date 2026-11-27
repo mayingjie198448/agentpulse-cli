@@ -110,7 +110,7 @@ jobs:
         run: |
           if not exist "%ARTIFACT_DIR%" mkdir "%ARTIFACT_DIR%"
           set "PATH=C:\Program Files\Git\cmd;%PATH%"
-          git -c core.autocrlf=false checkout-index --force --all
+          git checkout-index --force --all
           for /f "delims=" %%i in ('git rev-parse HEAD') do set "HEAD_SHA=%%i"
           for /f "delims=" %%i in ('git rev-parse HEAD:') do set "HEAD_TREE=%%i"
           (
