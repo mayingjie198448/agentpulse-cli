@@ -13,6 +13,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func TestMain(m *testing.M) {
+	tmpHome, err := os.MkdirTemp("", "agentpulse-cli-test-home-*")
+	if err == nil {
+		_ = os.Setenv("HOME", tmpHome)
+		_ = os.Setenv("USERPROFILE", tmpHome)
+		_ = os.Setenv("XDG_CONFIG_HOME", tmpHome)
+		_ = os.Setenv("APPDATA", filepath.Join(tmpHome, "AppData", "Roaming"))
+		_ = os.Setenv("LOCALAPPDATA", filepath.Join(tmpHome, "AppData", "Local"))
+	}
+	code := m.Run()
+	if tmpHome != "" {
+		_ = os.RemoveAll(tmpHome)
+	}
+	os.Exit(code)
+}
+
 func TestRootCommands(t *testing.T) {
 	tests := []struct {
 		name      string
