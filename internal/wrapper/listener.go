@@ -370,8 +370,6 @@ func (l *Listener) onConnect(c paho.Client) {
 		l.logError(fmt.Sprintf("[agentpulse listener] subscription timed out for topic %s on (re)connect", dispatchTopic))
 	} else if err := token.Error(); err != nil {
 		l.logError(fmt.Sprintf("[agentpulse listener] subscription failed for topic %s on (re)connect: %v", dispatchTopic, err))
-	} else if l.cfg.OnListening != nil {
-		l.cfg.OnListening(dispatchTopic)
 	}
 
 	l.mu.Lock()
