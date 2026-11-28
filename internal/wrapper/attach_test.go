@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1004,4 +1005,49 @@ func TestParsePIDAllowlist(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestResolveProcessStartTimeUsesLocalZone pins issue #60 (B1): ps lstart has
+// no zone and prints local wall-clock time, so it must parse in time.Local.
+func TestResolveProcessStartTimeUsesLocalZone(t *testing.T) {
+	var psArgs []string
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if name != "ps" {
+				t.Errorf("unexpected probe command %q", name)
+			}
+			psArgs = append([]string(nil), args...)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperProcessLstart$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	prevLocal := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*3600)
+	t.Cleanup(func() { time.Local = prevLocal })
+
+	got := wrapper.ResolveProcessStartTime(424242)
+
+	if strings.Join(psArgs, " ") != "-p 424242 -o lstart=" {
+		t.Fatalf("ps argv = %q, want targeted -p 424242 -o lstart=", psArgs)
+	}
+	// Helper prints "Fri Nov 27 10:00:00 2026" as UTC+8 wall clock; the UTC
+	// instant is 8 hours earlier.
+	want := time.Date(2026, 11, 27, 2, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("ResolveProcessStartTime = %s, want %s (local 10:00 UTC+8 minus 8h)", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	if got.Location() != time.UTC {
+		t.Fatalf("result location = %v, want UTC", got.Location())
+	}
+}
+
+func TestHelperProcessLstart(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stdout, "Fri Nov 27 10:00:00 2026\n")
+	os.Exit(0)
 }

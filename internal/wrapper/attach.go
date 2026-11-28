@@ -611,7 +611,7 @@ func ResolveProcessStartTime(pid int) time.Time {
 			time.ANSIC,
 		}
 		for _, layout := range layouts {
-			if t, err := time.Parse(layout, str); err == nil {
+			if t, err := time.ParseInLocation(layout, str, time.Local); err == nil {
 				return t.UTC()
 			}
 		}
