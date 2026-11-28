@@ -23,6 +23,9 @@ func newDispatchCmd() *cobra.Command {
 		engine             string
 		cwd                string
 		title              string
+		repoFlag           string
+		projectFlag        string
+		promptFlag         string
 		timeoutSeconds     int
 		waitTimeoutSeconds int
 		requestedBy        string
@@ -189,6 +192,9 @@ func newDispatchCmd() *cobra.Command {
 				Command:            agentOrCLI,
 				Args:               finalArgs,
 				Title:              title,
+				Repo:               repoFlag,
+				Project:            projectFlag,
+				Prompt:             promptFlag,
 				TimeoutSeconds:     timeoutSeconds,
 				WaitTimeoutSeconds: waitTimeoutSeconds,
 				Env:                envMap,
@@ -215,6 +221,9 @@ func newDispatchCmd() *cobra.Command {
 	dispatchCmd.Flags().StringVar(&engine, "engine", "", "Agent 引擎类型 ('agy' 或 'opencode')")
 	dispatchCmd.Flags().StringVar(&cwd, "cwd", "", "远端工作目录")
 	dispatchCmd.Flags().StringVar(&title, "title", "", "作业标题或说明")
+	dispatchCmd.Flags().StringVar(&repoFlag, "repo", "", "仓库名 (如 org/repo，省略时自动推断)")
+	dispatchCmd.Flags().StringVar(&projectFlag, "project", "", "项目名 (省略时自动推断)")
+	dispatchCmd.Flags().StringVarP(&promptFlag, "prompt", "p", "", "任务提示词 (省略时从命令参数自动提取)")
 	dispatchCmd.Flags().IntVar(&timeoutSeconds, "timeout-seconds", 0, "远端作业超时时间 (秒，0 表示不设限)")
 	dispatchCmd.Flags().IntVar(&waitTimeoutSeconds, "wait-timeout", 0, "本地等待超时时间 (秒，0 表示不设限)")
 	dispatchCmd.Flags().StringVar(&requestedBy, "requested-by", "", "派发者身份标识 (默认: $USER@hostname)")
