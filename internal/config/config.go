@@ -18,6 +18,7 @@ type Config struct {
 	Rev       int           `yaml:"rev,omitempty"`
 	Broker    BrokerConfig  `yaml:"broker"`
 	Agents    []AgentConfig `yaml:"agents"`
+	Autostart bool          `yaml:"autostart,omitempty"`
 }
 
 // BrokerConfig holds MQTT connection and authentication details.

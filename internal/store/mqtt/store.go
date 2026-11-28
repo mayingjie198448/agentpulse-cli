@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,25 @@ type Store struct {
 	subscribers map[chan model.Event]struct{}
 	closeCh     chan struct{}
 	closed      bool
+	refreshMu   sync.Mutex
+	staging     *refreshStaging
+
+	activeRefreshGen uint64
+	refreshAborted   bool
+	subRestoring     bool
+}
+
+type refreshStaging struct {
+	machines      map[string]*model.Machine
+	jobs          map[string]*model.Job
+	announces     map[string]*model.MachineAnnounce
+	realtimeQueue []rawMessage
+}
+
+type rawMessage struct {
+	topic      string
+	payload    []byte
+	isRetained bool
 }
 
 // New initializes a new MQTT Store, connects to the configured broker,
@@ -96,8 +116,13 @@ func New(cfg Config) (*Store, error) {
 		client.Disconnect(100)
 		return nil, fmt.Errorf("MQTT subscription failed: %w", err)
 	}
+	if err := CheckSubscribeResult(subToken); err != nil {
+		client.Disconnect(100)
+		return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+	}
 
 	go s.runHeartbeatChecker()
+	go s.runSubscriptionMaintainer()
 
 	// Cold-start retained settle per docs/mqtt-protocol.md §5.1:
 	// Wait briefly for retained messages from broker to settle so one-shot queries (list/logs)
@@ -142,10 +167,17 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 		token := client.SubscribeMultiple(filters, s.onMQTTMessage)
 		if token != nil {
 			token.WaitTimeout(cfg.Timeout)
+			if err := token.Error(); err != nil {
+				return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+			}
+			if err := CheckSubscribeResult(token); err != nil {
+				return nil, fmt.Errorf("MQTT subscription failed: %w", err)
+			}
 		}
 	}
 
 	go s.runHeartbeatChecker()
+	go s.runSubscriptionMaintainer()
 
 	if cfg.SettleTimeout > 0 {
 		time.Sleep(cfg.SettleTimeout)
@@ -156,30 +188,235 @@ func NewWithClient(cfg Config, client paho.Client) (*Store, error) {
 }
 
 func (s *Store) onMQTTMessage(_ paho.Client, msg paho.Message) {
-	s.HandleMessage(msg.Topic(), msg.Payload())
+	s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), msg.Retained())
+}
+
+// onRefreshMessage handles incoming MQTT messages for a specific Refresh generation.
+func (s *Store) onRefreshMessage(gen uint64, msg paho.Message) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+
+	// Check if this message belongs to an aborted/expired generation or staging was cleared
+	if gen != s.activeRefreshGen || s.refreshAborted || s.staging == nil {
+		s.mu.Unlock()
+		if msg.Retained() {
+			// Discard late-arriving retained messages from aborted/cancelled refresh window.
+			// They must NEVER leak into live cache.
+			return
+		}
+		// Real-time message arriving concurrent with or after abort: forward to live store.
+		s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), false)
+		return
+	}
+
+	pt := parseTopic(msg.Topic())
+	if pt.typ == topicUnknown {
+		s.mu.Unlock()
+		return
+	}
+
+	if !msg.Retained() {
+		// Real-time message during refresh: record for live replay & broadcast
+		payloadCopy := make([]byte, len(msg.Payload()))
+		copy(payloadCopy, msg.Payload())
+		s.staging.realtimeQueue = append(s.staging.realtimeQueue, rawMessage{
+			topic:      msg.Topic(),
+			payload:    payloadCopy,
+			isRetained: false,
+		})
+	}
+
+	// Apply to staging
+	switch pt.typ {
+	case topicMachineStatus:
+		s.applyMachineStatusStaging(pt, msg.Payload())
+	case topicJobStatus:
+		s.applyJobStatusStaging(pt, msg.Payload())
+	case topicJobLog:
+		// Logs are streaming events, not retained state, so they don't enter staging snapshot.
+	case topicAnnounce:
+		s.applyAnnounceStaging(pt, msg.Payload())
+	}
+	s.mu.Unlock()
+}
+
+// onRestoreMessage handles incoming MQTT messages for subscriptions restored after a failed/cancelled refresh.
+// Historical retained messages delivered by the broker immediately following the restore SUBSCRIBE are discarded
+// so they do not contaminate or overwrite the existing cache; subsequent real-time events are processed normally.
+func (s *Store) onRestoreMessage(_ paho.Client, msg paho.Message) {
+	if msg.Retained() {
+		return
+	}
+	s.HandleMessageWithRetain(msg.Topic(), msg.Payload(), false)
 }
 
 // HandleMessage parses and handles incoming MQTT messages for machine status,
 // job status, and job logs. Exported for tests and mock message injection.
+// Messages injected via HandleMessage are treated as real-time events.
 func (s *Store) HandleMessage(topic string, payload []byte) {
+	s.HandleMessageWithRetain(topic, payload, false)
+}
+
+// HandleMessageWithRetain parses and handles incoming MQTT messages with an explicit
+// retained flag indicating whether the message is a broker retained re-delivery.
+func (s *Store) HandleMessageWithRetain(topic string, payload []byte, isRetained bool) {
 	pt := parseTopic(topic)
 	if pt.typ == topicUnknown {
 		return
 	}
 
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+
+	if s.staging != nil {
+		if !isRetained {
+			// Real-time message during refresh: record for live replay & broadcast
+			payloadCopy := make([]byte, len(payload))
+			copy(payloadCopy, payload)
+			s.staging.realtimeQueue = append(s.staging.realtimeQueue, rawMessage{
+				topic:      topic,
+				payload:    payloadCopy,
+				isRetained: false,
+			})
+		}
+
+		// Apply to staging
+		switch pt.typ {
+		case topicMachineStatus:
+			s.applyMachineStatusStaging(pt, payload)
+		case topicJobStatus:
+			s.applyJobStatusStaging(pt, payload)
+		case topicJobLog:
+			// Logs are streaming events, not retained state, so they don't enter staging snapshot.
+		case topicAnnounce:
+			s.applyAnnounceStaging(pt, payload)
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	// Live mode: update live state and broadcast
 	switch pt.typ {
 	case topicMachineStatus:
-		s.handleMachineStatus(pt, payload)
+		s.handleLiveMachineStatus(pt, payload)
 	case topicJobStatus:
-		s.handleJobStatus(pt, payload)
+		s.handleLiveJobStatus(pt, payload)
 	case topicJobLog:
-		s.handleJobLog(pt, payload)
+		s.handleLiveJobLog(pt, payload)
 	case topicAnnounce:
-		s.handleAnnounce(pt, payload)
+		s.handleLiveAnnounce(pt, payload)
 	}
 }
 
-func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
+func (s *Store) applyMachineStatusStaging(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		delete(s.staging.machines, pt.machineID)
+		return
+	}
+
+	var m model.Machine
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return
+	}
+	if m.ID == "" {
+		m.ID = pt.machineID
+	}
+	if m.Name == "" {
+		m.Name = m.ID
+	}
+	if m.LastHeartbeat.IsZero() {
+		m.LastHeartbeat = time.Now()
+	}
+
+	stored := m
+	s.staging.machines[m.ID] = &stored
+}
+
+func (s *Store) applyJobStatusStaging(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		delete(s.staging.jobs, pt.jobID)
+		return
+	}
+
+	var j model.Job
+	if err := json.Unmarshal(payload, &j); err != nil {
+		return
+	}
+	if j.ID == "" {
+		j.ID = pt.jobID
+	}
+	if j.MachineID == "" {
+		j.MachineID = pt.machineID
+	}
+	if j.UpdatedAt.IsZero() {
+		j.UpdatedAt = time.Now()
+	}
+	if j.StartedAt.IsZero() {
+		j.StartedAt = j.UpdatedAt
+	}
+
+	stored := j
+	s.staging.jobs[j.ID] = &stored
+}
+
+func (s *Store) applyAnnounceStaging(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		delete(s.staging.announces, pt.machineID)
+		return
+	}
+
+	var ann model.MachineAnnounce
+	if err := json.Unmarshal(payload, &ann); err != nil {
+		return
+	}
+	if ann.MachineID == "" {
+		ann.MachineID = pt.machineID
+	}
+	if ann.TS.IsZero() {
+		ann.TS = time.Now().UTC()
+	}
+
+	stagingExisting, stagingExists := s.staging.announces[ann.MachineID]
+	if stagingExists && stagingExisting != nil {
+		if ann.Rev < stagingExisting.Rev || (ann.Rev == stagingExisting.Rev && !ann.TS.After(stagingExisting.TS)) {
+			return
+		}
+	}
+	stored := ann
+	s.staging.announces[ann.MachineID] = &stored
+}
+
+func (s *Store) handleLiveMachineStatus(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		// Empty payload is an MQTT clear-retained tombstone
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		deletedMachine, exists := s.machines[pt.machineID]
+		delete(s.machines, pt.machineID)
+		s.mu.Unlock()
+
+		if exists && deletedMachine != nil {
+			delCopy := *deletedMachine
+			delCopy.Online = false
+			s.broadcast(model.Event{
+				Type:      model.EventMachineUpdated,
+				Machine:   &delCopy,
+				Timestamp: time.Now(),
+			})
+		}
+		return
+	}
+
 	var m model.Machine
 	if err := json.Unmarshal(payload, &m); err != nil {
 		return
@@ -211,7 +448,7 @@ func (s *Store) handleMachineStatus(pt parsedTopic, payload []byte) {
 	})
 }
 
-func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
+func (s *Store) handleLiveJobStatus(pt parsedTopic, payload []byte) {
 	if len(bytes.TrimSpace(payload)) == 0 {
 		// Empty payload is an MQTT clear-retained tombstone per docs/mqtt-protocol.md
 		s.mu.Lock()
@@ -268,7 +505,7 @@ func (s *Store) handleJobStatus(pt parsedTopic, payload []byte) {
 	})
 }
 
-func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
+func (s *Store) handleLiveJobLog(pt parsedTopic, payload []byte) {
 	var entry model.LogEntry
 	if err := json.Unmarshal(payload, &entry); err != nil {
 		// Fallback for raw text lines
@@ -322,7 +559,19 @@ func (s *Store) handleJobLog(pt parsedTopic, payload []byte) {
 	})
 }
 
-func (s *Store) handleAnnounce(pt parsedTopic, payload []byte) {
+func (s *Store) handleLiveAnnounce(pt parsedTopic, payload []byte) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		// Empty payload is an MQTT clear-retained tombstone
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.announces, pt.machineID)
+		s.mu.Unlock()
+		return
+	}
+
 	var ann model.MachineAnnounce
 	if err := json.Unmarshal(payload, &ann); err != nil {
 		return
@@ -475,6 +724,15 @@ func (s *Store) DeleteJob(ctx context.Context, id string) error {
 	deletedJob := *job
 
 	// Remove from in-memory cache
+	if s.staging != nil {
+		delete(s.staging.jobs, id)
+		topic := JobStatusTopic(machineID, id)
+		s.staging.realtimeQueue = append(s.staging.realtimeQueue, rawMessage{
+			topic:      topic,
+			payload:    []byte{},
+			isRetained: false,
+		})
+	}
 	delete(s.jobs, id)
 	delete(s.logs, id)
 	client := s.client
@@ -727,6 +985,181 @@ func (s *Store) CheckStaleMachines() {
 	s.checkStaleMachines()
 }
 
+// CheckSubscribeResult verifies that all subscribed topics were accepted by the broker.
+// Paho's SubscribeToken does not set token.Error() when the broker returns SUBACK with failure code
+// (e.g. 0x80 / 128 in MQTT 3.1.1, or >= 0x80 in MQTT 5.0). This helper extracts Result() and checks
+// for any rejected or missing topic filters.
+func CheckSubscribeResult(token paho.Token, expectedTopics ...string) error {
+	if token == nil {
+		return nil
+	}
+	type resultGetter interface {
+		Result() map[string]byte
+	}
+	rg, ok := token.(resultGetter)
+	if !ok {
+		return nil
+	}
+	results := rg.Result()
+	if len(results) == 0 {
+		return nil
+	}
+	var rejections []string
+	for topic, code := range results {
+		// In MQTT 3.1.1, return code 0x80 (128) means Failure.
+		// In MQTT 5.0, Reason Codes >= 0x80 indicate errors/rejection.
+		if code >= 0x80 {
+			rejections = append(rejections, fmt.Sprintf("%s (code 0x%02x)", topic, code))
+		}
+	}
+	for _, expected := range expectedTopics {
+		if _, exists := results[expected]; !exists {
+			rejections = append(rejections, fmt.Sprintf("%s (missing from SUBACK)", expected))
+		}
+	}
+	if len(rejections) > 0 {
+		sort.Strings(rejections)
+		return fmt.Errorf("broker rejected subscription for topic(s): %s", strings.Join(rejections, ", "))
+	}
+	return nil
+}
+
+// Refresh re-subscribes to MQTT topics, re-pulls and settles retained messages from the broker,
+// and transactionally replaces cached state per docs/mqtt-protocol.md §5.1.
+// If disconnected, canceled, or subscription fails (including broker SUBACK rejection),
+// existing state is left unchanged and an error is returned.
+// Any real-time messages that arrive during the refresh window are safely queued and merged
+// so that no events are lost regardless of whether the refresh succeeds or fails.
+func (s *Store) Refresh(ctx context.Context) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return fmt.Errorf("store closed")
+	}
+	client := s.client
+	s.mu.RUnlock()
+
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("MQTT client not connected")
+	}
+
+	// Prepare transactional staging state to collect incoming retained messages
+	staging := &refreshStaging{
+		machines:      make(map[string]*model.Machine),
+		jobs:          make(map[string]*model.Job),
+		announces:     make(map[string]*model.MachineAnnounce),
+		realtimeQueue: make([]rawMessage, 0),
+	}
+
+	s.mu.Lock()
+	s.activeRefreshGen++
+	gen := s.activeRefreshGen
+	s.refreshAborted = false
+	s.staging = staging
+	s.mu.Unlock()
+
+	committed := false
+	unsubscribed := false
+	filters := map[string]byte{
+		TopicMachinesStatus:           1,
+		TopicJobsStatus:               1,
+		TopicJobsLogs:                 0,
+		TopicAnnounceWildcard:         1,
+		TopicMachinesAnnounceWildcard: 1,
+	}
+	unsubTopics := []string{
+		TopicMachinesStatus,
+		TopicJobsStatus,
+		TopicJobsLogs,
+		TopicAnnounceWildcard,
+		TopicMachinesAnnounceWildcard,
+	}
+
+	defer func() {
+		if !committed {
+			s.mu.Lock()
+			s.refreshAborted = true
+			var pendingQueue []rawMessage
+			if s.staging == staging {
+				s.staging = nil
+				pendingQueue = staging.realtimeQueue
+			}
+			s.mu.Unlock()
+
+			// Discard staging. Replay any real-time messages that arrived during
+			// the failed refresh into live store so they are not lost.
+			for _, msg := range pendingQueue {
+				s.HandleMessageWithRetain(msg.topic, msg.payload, false)
+			}
+
+			if unsubscribed {
+				_ = s.restoreSubscriptions(filters)
+			}
+		}
+	}()
+
+	if token := client.Unsubscribe(unsubTopics...); token != nil {
+		unsubscribed = true
+		token.WaitTimeout(s.cfg.Timeout)
+	}
+
+	refreshCallback := func(_ paho.Client, msg paho.Message) {
+		s.onRefreshMessage(gen, msg)
+	}
+
+	subToken := client.SubscribeMultiple(filters, refreshCallback)
+	if subToken != nil {
+		if !subToken.WaitTimeout(s.cfg.Timeout) {
+			return fmt.Errorf("MQTT subscription timed out during refresh")
+		}
+		if err := subToken.Error(); err != nil {
+			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
+		}
+		if err := CheckSubscribeResult(subToken); err != nil {
+			return fmt.Errorf("MQTT subscription failed during refresh: %w", err)
+		}
+	}
+
+	settle := s.cfg.SettleTimeout
+	if settle <= 0 {
+		settle = 200 * time.Millisecond
+	}
+
+	select {
+	case <-time.After(settle):
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.closeCh:
+		return fmt.Errorf("store closed")
+	}
+
+	// Atomically replace caches after successful settle/re-pull of retained messages
+	s.mu.Lock()
+	s.machines = staging.machines
+	s.jobs = staging.jobs
+	s.announces = staging.announces
+	for jid := range s.logs {
+		if _, ok := s.jobs[jid]; !ok {
+			delete(s.logs, jid)
+		}
+	}
+	realtimeQueue := staging.realtimeQueue
+	s.staging = nil
+	committed = true
+	s.mu.Unlock()
+
+	// Replay real-time events that occurred during refresh to live subscribers
+	for _, msg := range realtimeQueue {
+		s.HandleMessageWithRetain(msg.topic, msg.payload, false)
+	}
+
+	s.checkStaleMachines()
+	return nil
+}
+
 // Settle pauses the caller for the configured duration (or default) to allow retained messages to settle.
 func (s *Store) Settle(d time.Duration) {
 	if d <= 0 {
@@ -749,4 +1182,103 @@ func (s *Store) RawJobPointer(id string) *model.Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.jobs[id]
+}
+
+func (s *Store) setSubRestoring(restoring bool) {
+	s.mu.Lock()
+	s.subRestoring = restoring
+	s.mu.Unlock()
+}
+
+// restoreSubscriptions re-subscribes to all product filters after a failed or cancelled refresh.
+// It verifies the subscription return token and results, ensuring failure is visible and recorded.
+func (s *Store) restoreSubscriptions(filters map[string]byte) error {
+	s.mu.RLock()
+	client := s.client
+	closed := s.closed
+	s.mu.RUnlock()
+
+	if closed || client == nil || !client.IsConnected() {
+		s.setSubRestoring(true)
+		return fmt.Errorf("MQTT client not connected")
+	}
+
+	token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+	if token == nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription returned nil token")
+	}
+
+	timeout := s.cfg.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if !token.WaitTimeout(timeout) {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription timed out")
+	}
+	if err := token.Error(); err != nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription failed: %w", err)
+	}
+	if err := CheckSubscribeResult(token); err != nil {
+		s.setSubRestoring(true)
+		return fmt.Errorf("restore subscription rejected: %w", err)
+	}
+
+	s.setSubRestoring(false)
+	return nil
+}
+
+// runSubscriptionMaintainer periodically retries subscribing to all filters when subscriptions
+// were rejected or degraded (e.g. temporary Dynamic Security broker ACL denial), so that as soon
+// as broker ACL is restored, the store automatically resumes receiving all live heartbeats and jobs.
+func (s *Store) runSubscriptionMaintainer() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	filters := map[string]byte{
+		TopicMachinesStatus:           1,
+		TopicJobsStatus:               1,
+		TopicJobsLogs:                 0,
+		TopicAnnounceWildcard:         1,
+		TopicMachinesAnnounceWildcard: 1,
+	}
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			restoring := s.subRestoring
+			closed := s.closed
+			client := s.client
+			s.mu.RUnlock()
+
+			if closed || !restoring || client == nil || !client.IsConnected() {
+				continue
+			}
+
+			token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+			if token == nil {
+				continue
+			}
+			timeout := s.cfg.Timeout
+			if timeout <= 0 {
+				timeout = 500 * time.Millisecond
+			}
+			if !token.WaitTimeout(timeout) {
+				continue
+			}
+			if token.Error() != nil {
+				continue
+			}
+			if err := CheckSubscribeResult(token); err != nil {
+				continue
+			}
+
+			s.setSubRestoring(false)
+		}
+	}
 }

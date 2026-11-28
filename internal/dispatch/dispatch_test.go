@@ -863,8 +863,9 @@ func (f *fakeDispatchStore) GetLogs(ctx context.Context, jobID string, limit int
 func (f *fakeDispatchStore) Subscribe(ctx context.Context) (<-chan model.Event, error) {
 	return nil, nil
 }
-func (f *fakeDispatchStore) IsConnected() bool { return true }
-func (f *fakeDispatchStore) Close() error      { return nil }
+func (f *fakeDispatchStore) Refresh(ctx context.Context) error { return nil }
+func (f *fakeDispatchStore) IsConnected() bool                 { return true }
+func (f *fakeDispatchStore) Close() error                      { return nil }
 
 func TestDispatch_TargetMachineGate(t *testing.T) {
 	now := time.Now()
