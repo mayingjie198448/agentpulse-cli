@@ -3,6 +3,7 @@
 package autostart
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,17 +11,29 @@ import (
 	"strings"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 )
 
 var (
 	// Test hooks for directory and command overrides
 	testLaunchAgentsDir string
 	testLogsDir         string
-	execCommand         = exec.Command
+	execCommand         = runThroughSafetyBoundary
 )
 
+func runThroughSafetyBoundary(name string, args ...string) *exec.Cmd {
+	argv := append([]string{name}, args...)
+	prepared, err := safety.Prepare(context.Background(), safety.Request{
+		Argv: argv,
+	})
+	if err != nil {
+		return &exec.Cmd{Err: err}
+	}
+	return prepared.Cmd
+}
+
 // SetTestOverrides allows unit tests to redirect LaunchAgents/Logs dirs to temp dirs
-// and mock exec.Command without affecting the user's real LaunchAgent.
+// and mock command execution without affecting the user's real LaunchAgent.
 func SetTestOverrides(launchAgentsDir, logsDir string, cmdFn func(name string, args ...string) *exec.Cmd) func() {
 	oldLaunch := testLaunchAgentsDir
 	oldLogs := testLogsDir
