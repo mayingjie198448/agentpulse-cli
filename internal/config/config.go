@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 	"gopkg.in/yaml.v3"
 )
 
@@ -495,10 +496,15 @@ func ProbeAgyAuth(binPath string) (bool, string) {
 
 // ProbeAgyAuthContext probes whether agy is authenticated within the provided context.
 func ProbeAgyAuthContext(ctx context.Context, binPath string) (bool, string) {
-	cmd := exec.CommandContext(ctx, binPath, "models")
-	cmd.Env = FilterChildProcessEnv(os.Environ())
+	prepared, err := safety.Prepare(ctx, safety.Request{
+		Argv:    []string{binPath, "models"},
+		Environ: FilterChildProcessEnv(os.Environ()),
+	})
+	if err != nil {
+		return false, fmt.Sprintf("执行 'agy models' 失败: %v", err)
+	}
 
-	output, err := cmd.CombinedOutput()
+	output, err := prepared.Cmd.CombinedOutput()
 	outStr := strings.TrimSpace(string(output))
 	lower := strings.ToLower(outStr)
 
