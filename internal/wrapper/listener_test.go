@@ -1126,3 +1126,54 @@ func TestListener_ConcurrentExecution(t *testing.T) {
 		t.Errorf("expected machine job count to be 0 after all jobs complete, got %d", l.Machine().JobCount)
 	}
 }
+
+// TestListener_OnListeningFiresOnceOnStartup pins issue #65: paho's initial
+// OnConnect callback and Run's explicit subscribe must not both announce.
+func TestListener_OnListeningFiresOnceOnStartup(t *testing.T) {
+	mockClient := newMockMQTTClient()
+	var mu sync.Mutex
+	count := 0
+	l, err := wrapper.NewListener(wrapper.ListenerConfig{
+		MachineID:         "once-node-1",
+		StatusFile:        filepath.Join(t.TempDir(), "once-status.json"),
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
+		OnListening: func(_ string) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	// paho fires OnConnect on the initial connection, before Run subscribes.
+	l.OnConnect(mockClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		c := count
+		mu.Unlock()
+		if c >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 1 {
+		t.Fatalf("OnListening fired %d times on startup, want exactly 1", count)
+	}
+}

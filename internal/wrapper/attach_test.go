@@ -1,10 +1,12 @@
 package wrapper_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -202,6 +204,16 @@ func TestMatchAgentProcess(t *testing.T) {
 				Args: []string{"wrapper.test", "-test.run", "TestSomething"},
 			},
 			wantMatch: false,
+		},
+		{
+			name: "windows exe suffix matches agent id",
+			proc: wrapper.ProcessInfo{
+				PID:  1243,
+				PPID: 1,
+				Args: []string{"C:/bin/agy.exe", "-p", "task"},
+			},
+			wantMatch: true,
+			wantAgID:  "agy",
 		},
 	}
 
@@ -1004,4 +1016,132 @@ func TestParsePIDAllowlist(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestResolveProcessStartTimeUsesLocalZone pins issue #60 (B1): ps lstart has
+// no zone and prints local wall-clock time, so it must parse in time.Local.
+func TestResolveProcessStartTimeUsesLocalZone(t *testing.T) {
+	var psArgs []string
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if name != "ps" {
+				t.Errorf("unexpected probe command %q", name)
+			}
+			psArgs = append([]string(nil), args...)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperProcessLstart$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	prevLocal := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*3600)
+	t.Cleanup(func() { time.Local = prevLocal })
+
+	got := wrapper.ResolveProcessStartTime(424242)
+
+	if strings.Join(psArgs, " ") != "-p 424242 -o lstart=" {
+		t.Fatalf("ps argv = %q, want targeted -p 424242 -o lstart=", psArgs)
+	}
+	// Helper prints "Fri Nov 27 10:00:00 2026" as UTC+8 wall clock; the UTC
+	// instant is 8 hours earlier.
+	want := time.Date(2026, 11, 27, 2, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("ResolveProcessStartTime = %s, want %s (local 10:00 UTC+8 minus 8h)", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	if got.Location() != time.UTC {
+		t.Fatalf("result location = %v, want UTC", got.Location())
+	}
+}
+
+func TestHelperProcessLstart(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stdout, "Fri Nov 27 10:00:00 2026\n")
+	os.Exit(0)
+}
+
+// TestDefaultProcessListerPPIDSubstring pins issue #63: a PPID whose digits
+// occur inside the PID (e.g. PPID 1, PID 12345) must not truncate the args.
+func TestDefaultProcessListerPPIDSubstring(t *testing.T) {
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperPSLines$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	procs, err := wrapper.DefaultProcessLister(context.Background())
+	if err != nil {
+		t.Fatalf("DefaultProcessLister: %v", err)
+	}
+	if len(procs) != 2 {
+		t.Fatalf("expected 2 processes, got %d", len(procs))
+	}
+	if procs[0].PID != 12345 || procs[0].PPID != 1 {
+		t.Fatalf("first row pid/ppid = %d/%d, want 12345/1", procs[0].PID, procs[0].PPID)
+	}
+	if len(procs[0].Args) == 0 || procs[0].Args[0] != "/usr/local/bin/agy" {
+		t.Fatalf("PPID=1 inside PID=12345 truncated args: got %q, want /usr/local/bin/agy", procs[0].Args)
+	}
+	if len(procs[1].Args) == 0 || procs[1].Args[0] != "/usr/local/bin/opencode" {
+		t.Fatalf("second row args = %q, want /usr/local/bin/opencode", procs[1].Args)
+	}
+}
+
+func TestHelperPSLines(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stdout, "12345     1 /usr/local/bin/agy -p task\n23456     1 /usr/local/bin/opencode run\n")
+	os.Exit(0)
+}
+
+// TestAttachManagerPSErrorSurfaced pins issue #63: a targeted ps failure with
+// stderr output must not be silently swallowed as "no processes".
+func TestAttachManagerPSErrorSurfaced(t *testing.T) {
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperPSFail$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	stderr := new(bytes.Buffer)
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:      "psfail-node",
+		PIDAllowlist:   []int{424242},
+		ScanInterval:   30 * time.Millisecond,
+		Agents:         []config.AgentConfig{{ID: "agy", Alias: []string{"agy"}, Enabled: boolPtr(true)}},
+		IsProcessAlive: func(int) bool { return false },
+		Stderr:         stderr,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(stderr.String(), "process scan error") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	mgr.Stop()
+
+	if !strings.Contains(stderr.String(), "process scan error") {
+		t.Fatalf("ps failure with stderr was silently swallowed, stderr=%q", stderr.String())
+	}
+}
+
+func TestHelperPSFail(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stderr, "ps: simulated failure\n")
+	os.Exit(1)
 }

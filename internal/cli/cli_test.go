@@ -15,6 +15,7 @@ import (
 	"github.com/mayingjie198448/agentpulse-cli/internal/autostart"
 	"github.com/mayingjie198448/agentpulse-cli/internal/cli"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
+	"github.com/mayingjie198448/agentpulse-cli/internal/model"
 	"github.com/spf13/cobra"
 )
 
@@ -1512,4 +1513,41 @@ func TestDispatchCommand_ExtendedFlags(t *testing.T) {
 			t.Errorf("expected dispatch --help to contain flag %q, got:\n%s", expected, out)
 		}
 	}
+}
+
+// TestMachineDisplayUsesMachineID pins issue #33 (I1): list and plain watch
+// must show the configured machine_id as the primary name, not the hostname.
+func TestMachineDisplayUsesMachineID(t *testing.T) {
+	machines := []model.Machine{{
+		ID:            "mac-mini",
+		Name:          "mayingjiedeMac-mini.local",
+		Online:        true,
+		LastHeartbeat: time.Now(),
+		Platform:      "darwin/arm64",
+		JobCount:      1,
+	}}
+
+	t.Run("list table", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		cli.WriteMachineTableForTest(buf, machines)
+		out := buf.String()
+		if !strings.Contains(out, "mac-mini") {
+			t.Fatalf("list table must show machine_id mac-mini, got:\n%s", out)
+		}
+		if !strings.Contains(out, "MACHINE") || !strings.Contains(out, "mayingjiedeMac-mini.local") {
+			t.Errorf("expected MACHINE primary column and hostname as secondary, got:\n%s", out)
+		}
+	})
+
+	t.Run("plain watch snapshot", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		cli.PrintPlainSnapshotForTest(buf, machines, nil)
+		out := buf.String()
+		if !strings.Contains(out, "mac-mini") {
+			t.Fatalf("plain snapshot must show machine_id mac-mini, got:\n%s", out)
+		}
+		if !strings.Contains(out, "mayingjiedeMac-mini.local") {
+			t.Errorf("expected hostname kept as secondary field, got:\n%s", out)
+		}
+	})
 }

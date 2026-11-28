@@ -844,3 +844,49 @@ func TestRunConfigWizard_BrokerUnchanged_NoRestart(t *testing.T) {
 		t.Errorf("expected NO broker change notification when broker is unchanged, got:\n%s", outStr)
 	}
 }
+
+// TestRunConfigWizard_TLSDefaultFollowsScheme pins issue #64: accepting the
+// TLS default for a tcp:// broker must save plaintext, not TLS.
+func TestRunConfigWizard_TLSDefaultFollowsScheme(t *testing.T) {
+	t.Run("tcp defaults to plaintext", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Setenv("HOME", tmpDir)
+		confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
+
+		// URL, username, password, TLS: all Enter (accept defaults).
+		input := "tcp://127.0.0.1:1\n\n\n\n"
+		var out bytes.Buffer
+		if err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "broker"); err != nil {
+			t.Fatalf("wizard broker failed: %v", err)
+		}
+		if !strings.Contains(out.String(), "启用 TLS 加密连接 [y/N]") {
+			t.Errorf("expected TLS prompt to default N for tcp://, got:\n%s", out.String())
+		}
+		loaded, err := config.LoadConfig(confPath)
+		if err != nil {
+			t.Fatalf("failed to load saved config: %v", err)
+		}
+		if loaded.Broker.TLS {
+			t.Errorf("tcp:// broker must default TLS=false, got true")
+		}
+	})
+
+	t.Run("tls still defaults to encrypted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		t.Setenv("HOME", tmpDir)
+		confPath := filepath.Join(tmpDir, "agentpulse", "config.yaml")
+
+		input := "tls://127.0.0.1:1\n\n\n\n"
+		var out bytes.Buffer
+		if err := cli.RunConfigWizardWithSection(strings.NewReader(input), &out, confPath, "broker"); err != nil {
+			t.Fatalf("wizard broker failed: %v", err)
+		}
+		loaded, err := config.LoadConfig(confPath)
+		if err != nil {
+			t.Fatalf("failed to load saved config: %v", err)
+		}
+		if !loaded.Broker.TLS {
+			t.Errorf("tls:// broker must default TLS=true, got false")
+		}
+	})
+}

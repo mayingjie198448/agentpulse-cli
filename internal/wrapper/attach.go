@@ -160,7 +160,8 @@ func MatchAgentProcess(
 	}
 
 	binBase := filepath.Base(p.Args[0])
-	binLower := strings.ToLower(binBase)
+	// Windows agent binaries carry an .exe suffix; match the engine ID.
+	binLower := strings.TrimSuffix(strings.ToLower(binBase), ".exe")
 
 	if strings.Contains(binLower, "agentpulse") || blockedProcessNames[binLower] || strings.HasSuffix(binLower, ".test") {
 		return config.AgentConfig{}, false
@@ -269,7 +270,9 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 	if err != nil {
 		if len(pids) > 0 && len(bytes.TrimSpace(out)) == 0 {
 			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
+			// Empty stdout and empty stderr means none of the requested PIDs
+			// exist; stderr content means ps itself failed and must surface.
+			if errors.As(err, &exitErr) && len(bytes.TrimSpace(exitErr.Stderr)) == 0 {
 				return nil, nil
 			}
 		}
@@ -298,12 +301,7 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 			continue
 		}
 
-		// Find the start of the args section
-		idx := strings.Index(line, fields[1])
-		if idx < 0 {
-			continue
-		}
-		cmdLine := strings.TrimSpace(line[idx+len(fields[1]):])
+		cmdLine := argsAfterPIDColumns(line)
 		args := TokenizeCommandLine(cmdLine)
 		if len(args) == 0 {
 			args = fields[2:]
@@ -316,6 +314,22 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 		})
 	}
 	return procs, nil
+}
+
+// argsAfterPIDColumns returns the remainder of a ps row after the PID and
+// PPID columns. Searching for the PPID substring misfires when those digits
+// occur inside the PID (e.g. PPID 1, PID 12345), truncating the command line.
+func argsAfterPIDColumns(line string) string {
+	i := 0
+	for col := 0; col < 2; col++ {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
+	}
+	return strings.TrimSpace(line[i:])
 }
 
 // listLinuxPIDs reads only the allowlisted PIDs. It does not walk /proc and
@@ -611,7 +625,7 @@ func ResolveProcessStartTime(pid int) time.Time {
 			time.ANSIC,
 		}
 		for _, layout := range layouts {
-			if t, err := time.Parse(layout, str); err == nil {
+			if t, err := time.ParseInLocation(layout, str, time.Local); err == nil {
 				return t.UTC()
 			}
 		}
@@ -624,6 +638,9 @@ func ResolveProcessStartTime(pid int) time.Time {
 func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
+	}
+	if runtime.GOOS == "windows" {
+		return windowsProcessAlive(pid)
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
@@ -686,6 +703,7 @@ type AttachManager struct {
 	knownPIDs         map[int]time.Time
 	pidAllowlist      map[int]bool
 	usesDefaultLister bool
+	exitObs           exitObserver
 	stopCh            chan struct{}
 	doneCh            chan struct{}
 	started           atomic.Bool
@@ -747,6 +765,7 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 		knownPIDs:         make(map[int]time.Time),
 		pidAllowlist:      allowlistMap,
 		usesDefaultLister: usesDefaultLister,
+		exitObs:           newExitObserver(),
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 	}
@@ -816,6 +835,10 @@ func (m *AttachManager) Stop() {
 	case <-m.doneCh:
 	case <-time.After(2 * time.Second):
 	}
+
+	if m.exitObs != nil {
+		m.exitObs.close()
+	}
 }
 
 func (m *AttachManager) run(ctx context.Context) {
@@ -854,6 +877,9 @@ func (m *AttachManager) discoverProcesses(ctx context.Context) ([]ProcessInfo, e
 	m.mu.Unlock()
 
 	pids = normalizePIDs(pids)
+	if useDefault && runtime.GOOS == "windows" {
+		return windowsProcessList(ctx, pids)
+	}
 	if useDefault && len(pids) > 0 {
 		if runtime.GOOS == "linux" {
 			return listLinuxPIDs(pids)
@@ -976,6 +1002,10 @@ func (m *AttachManager) attachProcess(ctx context.Context, p ProcessInfo, ag con
 	m.knownPIDs[p.PID] = time.Now()
 	m.mu.Unlock()
 
+	if m.exitObs != nil {
+		m.exitObs.watch(p.PID)
+	}
+
 	if m.cfg.OnJobCountChange != nil {
 		m.cfg.OnJobCountChange()
 	}
@@ -993,6 +1023,10 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 		m.mu.Lock()
 		delete(m.activeJobs, aj.pid)
 		m.mu.Unlock()
+
+		if m.exitObs != nil {
+			m.exitObs.unwatch(aj.pid)
+		}
 
 		if m.cfg.OnJobCountChange != nil {
 			m.cfg.OnJobCountChange()
@@ -1048,6 +1082,8 @@ func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted bool) {
 	var exitCodeKnown bool
 	if !interrupted && exitChecker != nil {
 		exitCode, exitCodeKnown = exitChecker(aj.pid)
+	} else if !interrupted && m.exitObs != nil {
+		exitCode, exitCodeKnown = m.exitObs.exitCode(aj.pid)
 	}
 
 	hasReliableSuccess := false

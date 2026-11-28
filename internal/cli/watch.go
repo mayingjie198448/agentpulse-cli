@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -131,23 +132,7 @@ func runPlainWatch(ctx context.Context, st store.Store, interval time.Duration) 
 	printSnapshot := func() {
 		machines, _ := st.ListMachines(ctx)
 		jobs, _ := st.ListJobs(ctx)
-
-		fmt.Printf("=== [AgentPulse 监控快照 @ %s] ===\n", time.Now().Format("15:04:05"))
-		fmt.Printf("节点设备 (%d 在线 / %d 总计):\n", countOnline(machines), len(machines))
-		for _, m := range machines {
-			status := "离线"
-			if m.Online {
-				status = "在线"
-			}
-			fmt.Printf("  - %-12s [%-4s] 心跳: %-8s 任务数: %d\n", m.Name, status, m.HeartbeatAgo(), m.JobCount)
-		}
-
-		fmt.Printf("任务列表 (%d total):\n", len(jobs))
-		for _, j := range jobs {
-			fmt.Printf("  - %-14s [%-8s] @%-10s [%-7s] %5.1f%% : %s\n",
-				j.ID, j.Engine, j.MachineID, j.Status, j.Progress, j.Title)
-		}
-		fmt.Println()
+		printPlainSnapshot(os.Stdout, machines, jobs)
 	}
 
 	// Print first snapshot immediately
@@ -174,4 +159,33 @@ func countOnline(machines []model.Machine) int {
 		}
 	}
 	return cnt
+}
+
+func printPlainSnapshot(out io.Writer, machines []model.Machine, jobs []model.Job) {
+	fmt.Fprintf(out, "=== [AgentPulse 监控快照 @ %s] ===\n", time.Now().Format("15:04:05"))
+	fmt.Fprintf(out, "节点设备 (%d 在线 / %d 总计):\n", countOnline(machines), len(machines))
+	for _, m := range machines {
+		status := "离线"
+		if m.Online {
+			status = "在线"
+		}
+		primary := machinePrimaryID(m)
+		host := ""
+		if m.Name != "" && m.Name != primary {
+			host = " (" + m.Name + ")"
+		}
+		fmt.Fprintf(out, "  - %-12s%s [%-4s] 心跳: %-8s 任务数: %d\n", primary, host, status, m.HeartbeatAgo(), m.JobCount)
+	}
+
+	fmt.Fprintf(out, "任务列表 (%d total):\n", len(jobs))
+	for _, j := range jobs {
+		fmt.Fprintf(out, "  - %-14s [%-8s] @%-10s [%-7s] %5.1f%% : %s\n",
+			j.ID, j.Engine, j.MachineID, j.Status, j.Progress, j.Title)
+	}
+	fmt.Fprintln(out)
+}
+
+// PrintPlainSnapshotForTest exposes printPlainSnapshot for testing.
+func PrintPlainSnapshotForTest(out io.Writer, machines []model.Machine, jobs []model.Job) {
+	printPlainSnapshot(out, machines, jobs)
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"text/tabwriter"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
@@ -55,17 +56,7 @@ func newListCmd() *cobra.Command {
 
 			// Format machine table
 			fmt.Fprintln(out, "MACHINES:")
-			w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATUS\tHEARTBEAT\tPLATFORM\tIP\tACTIVE JOBS")
-			for _, m := range machines {
-				status := "ONLINE"
-				if !m.Online {
-					status = "OFFLINE"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n",
-					m.Name, status, m.HeartbeatAgo(), m.Platform, m.IP, m.JobCount)
-			}
-			w.Flush()
+			writeMachineTable(out, machines)
 
 			fmt.Fprintln(out, "\nJOBS:")
 			wJobs := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
@@ -94,4 +85,30 @@ func selectOnlineMachines(machines []model.Machine) []model.Machine {
 		}
 	}
 	return filtered
+}
+
+func machinePrimaryID(m model.Machine) string {
+	if m.ID != "" {
+		return m.ID
+	}
+	return m.Name
+}
+
+func writeMachineTable(out io.Writer, machines []model.Machine) {
+	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "MACHINE\tHOST\tSTATUS\tHEARTBEAT\tPLATFORM\tIP\tACTIVE JOBS")
+	for _, m := range machines {
+		status := "ONLINE"
+		if !m.Online {
+			status = "OFFLINE"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+			machinePrimaryID(m), m.Name, status, m.HeartbeatAgo(), m.Platform, m.IP, m.JobCount)
+	}
+	w.Flush()
+}
+
+// WriteMachineTableForTest exposes writeMachineTable for testing.
+func WriteMachineTableForTest(out io.Writer, machines []model.Machine) {
+	writeMachineTable(out, machines)
 }
