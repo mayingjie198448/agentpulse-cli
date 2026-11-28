@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 把官方 go1.27.4 解到本作业的临时目录，并在标准输出打印本进程要用的导出语句。
 # 官方归档放在 runner 跨作业仍保留的目录里；GOROOT 每次从校验过的归档重新解压。
-# 校验值来自 https://go.dev/dl/?mode=json 的 go1.27.4 档案。不写入 /usr/local/go。
+# 下载先试 https://golang.google.cn/dl/ （Google 官方中国镜像），失败再试 https://go.dev/dl/ 。
+# 校验值来自 https://go.dev/dl/?mode=json 的 go1.27.4 档案，两个源共用同一组 sha256。不写入 /usr/local/go。
 # 下载或校验失败时直接以非零退出，不回退到系统已安装的 Go。
 
 set -u
@@ -98,7 +99,6 @@ case "$uname_s" in
 esac
 
 name="go${version}.${os}-${arch}.${ext}"
-url="https://go.dev/dl/$name"
 
 # 归档目录：显式前缀优先，否则用跨作业的 RUNNER_TOOL_CACHE，再没有才退回作业临时目录。
 install_prefix="$(to_posix_path "${GO_INSTALL_PREFIX:-}")"
@@ -140,9 +140,11 @@ case "$job_dir" in
     ;;
 esac
 
-# 校验指定文件。不符返回 1，由调用方删除。不信任调用方传来的路径以外的旧树。
+# 校验指定文件。source_url 只用于日志。不符返回 1，由调用方删除。
+# 不信任调用方传来的路径以外的旧树，也不因为换了下载源就换校验值。
 verify_archive() {
   local path="$1"
+  local source_url="${2:-}"
   local got=""
   local tool=""
   if [[ ! -f "$path" ]]; then
@@ -159,7 +161,9 @@ verify_archive() {
     echo "GO_CHECKSUM_TOOL_MISSING" >&2
     return 1
   fi
-  echo "GO_SOURCE_URL=$url" >&2
+  if [[ -n "$source_url" ]]; then
+    echo "GO_SOURCE_URL=$source_url" >&2
+  fi
   echo "GO_CHECKSUM_TOOL=$tool" >&2
   echo "GO_CHECKSUM_EXPECTED=$want" >&2
   echo "GO_CHECKSUM_ACTUAL=$got" >&2
@@ -168,6 +172,60 @@ verify_archive() {
     return 1
   fi
   echo "GO_CHECKSUM_OK=yes path=$path" >&2
+  return 0
+}
+
+# 从一个源下载到临时文件。校验通过并改名到缓存后返回 0。
+# partial 必须是全局变量，EXIT trap 才能在中途失败时删掉半截文件。
+download_from() {
+  local source_url="$1"
+  local effective=""
+  partial="${cache_dir}/.${name}.partial.$$"
+  rm -f "$partial"
+  echo "GO_DOWNLOAD url=$source_url" >&2
+  echo "GO_DOWNLOAD_PARTIAL=$partial" >&2
+  # -f 在 -fsSL 中。每个源单独重试；--max-time 截断单次传输，--retry-max-time 截断这一源的重试窗口。
+  if ! effective="$(curl -fsSL \
+    --retry 3 \
+    --retry-delay 5 \
+    --retry-all-errors \
+    --connect-timeout 30 \
+    --max-time 600 \
+    --retry-max-time 600 \
+    --output "$partial" \
+    -w '%{url_effective}' \
+    "$source_url")"; then
+    echo "GO_DOWNLOAD_FAILED url=$source_url" >&2
+    rm -f "$partial"
+    partial=""
+    return 1
+  fi
+  # Windows curl 的 -w 可能带 CR。命令替换已经去掉结尾换行。
+  effective="${effective//$'\r'/}"
+  if [[ -z "$effective" ]]; then
+    effective="$source_url"
+  fi
+  echo "GO_DOWNLOAD_EFFECTIVE_URL=$effective" >&2
+  if ! verify_archive "$partial" "$effective"; then
+    echo "GO_DOWNLOAD_CHECKSUM_FAILED url=$effective path=$partial" >&2
+    rm -f "$partial"
+    partial=""
+    return 1
+  fi
+  if ! mv -f "$partial" "$archive"; then
+    echo "GO_CACHE_RENAME_FAILED from=$partial to=$archive" >&2
+    rm -f "$partial"
+    partial=""
+    return 1
+  fi
+  partial=""
+  # 使用前再校验已经落在缓存位置的归档，避免改名后的文件和临时文件不一致。
+  if ! verify_archive "$archive" "$effective"; then
+    echo "GO_CACHE_POST_RENAME_MISMATCH url=$effective path=$archive" >&2
+    rm -f "$archive"
+    return 1
+  fi
+  echo "GO_DOWNLOAD_URL=$effective" >&2
   return 0
 }
 
@@ -185,6 +243,7 @@ if [[ -f "$archive" ]]; then
   echo "GO_CACHE=hit path=$archive" >&2
   if verify_archive "$archive"; then
     echo "GO_CACHE_VERIFIED=yes" >&2
+    echo "GO_DOWNLOAD_URL=none reason=cache_hit" >&2
     cache_ok=1
   else
     echo "GO_CACHE_REJECTED=yes" >&2
@@ -195,40 +254,20 @@ else
 fi
 
 if [[ "$cache_ok" != "1" ]]; then
-  partial="${cache_dir}/.${name}.partial.$$"
-  rm -f "$partial"
-  echo "GO_DOWNLOAD url=$url" >&2
-  echo "GO_DOWNLOAD_PARTIAL=$partial" >&2
-  # -f 在 -fsSL 中。连接被掐断（如 schannel 56）时整次重试，不使用半截文件。
-  if ! curl -fsSL \
-    --retry 5 \
-    --retry-delay 5 \
-    --retry-all-errors \
-    --connect-timeout 30 \
-    --output "$partial" \
-    "$url"; then
-    echo "GO_DOWNLOAD_FAILED url=$url" >&2
-    rm -f "$partial"
-    partial=""
-    exit 1
-  fi
-  if ! verify_archive "$partial"; then
-    echo "GO_DOWNLOAD_CHECKSUM_FAILED path=$partial" >&2
-    rm -f "$partial"
-    partial=""
-    exit 1
-  fi
-  if ! mv -f "$partial" "$archive"; then
-    echo "GO_CACHE_RENAME_FAILED from=$partial to=$archive" >&2
-    rm -f "$partial"
-    partial=""
-    exit 1
-  fi
-  partial=""
-  # 使用前再校验已经落在缓存位置的归档，避免改名后的文件和临时文件不一致。
-  if ! verify_archive "$archive"; then
-    echo "GO_CACHE_POST_RENAME_MISMATCH path=$archive" >&2
-    rm -f "$archive"
+  downloaded=0
+  # 大陆网络先走 Google 官方中国镜像，失败再走 go.dev。校验值不随源改变。
+  for source_url in \
+    "https://golang.google.cn/dl/${name}" \
+    "https://go.dev/dl/${name}"
+  do
+    if download_from "$source_url"; then
+      downloaded=1
+      break
+    fi
+    echo "GO_DOWNLOAD_SOURCE_FAILED url=$source_url" >&2
+  done
+  if [[ "$downloaded" != "1" ]]; then
+    echo "GO_DOWNLOAD_ALL_SOURCES_FAILED" >&2
     exit 1
   fi
 fi
