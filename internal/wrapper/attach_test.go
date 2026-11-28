@@ -205,6 +205,16 @@ func TestMatchAgentProcess(t *testing.T) {
 			},
 			wantMatch: false,
 		},
+		{
+			name: "windows exe suffix matches agent id",
+			proc: wrapper.ProcessInfo{
+				PID:  1243,
+				PPID: 1,
+				Args: []string{"C:/bin/agy.exe", "-p", "task"},
+			},
+			wantMatch: true,
+			wantAgID:  "agy",
+		},
 	}
 
 	for _, tt := range tests {

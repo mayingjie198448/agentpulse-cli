@@ -160,7 +160,8 @@ func MatchAgentProcess(
 	}
 
 	binBase := filepath.Base(p.Args[0])
-	binLower := strings.ToLower(binBase)
+	// Windows agent binaries carry an .exe suffix; match the engine ID.
+	binLower := strings.TrimSuffix(strings.ToLower(binBase), ".exe")
 
 	if strings.Contains(binLower, "agentpulse") || blockedProcessNames[binLower] || strings.HasSuffix(binLower, ".test") {
 		return config.AgentConfig{}, false
@@ -638,6 +639,9 @@ func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
+	if runtime.GOOS == "windows" {
+		return windowsProcessAlive(pid)
+	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return false
@@ -873,6 +877,9 @@ func (m *AttachManager) discoverProcesses(ctx context.Context) ([]ProcessInfo, e
 	m.mu.Unlock()
 
 	pids = normalizePIDs(pids)
+	if useDefault && runtime.GOOS == "windows" {
+		return windowsProcessList(ctx, pids)
+	}
 	if useDefault && len(pids) > 0 {
 		if runtime.GOOS == "linux" {
 			return listLinuxPIDs(pids)
