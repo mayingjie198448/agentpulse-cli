@@ -6,7 +6,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -29,18 +28,28 @@ func detach() {
 		}
 		env = append(env, entry)
 	}
-	cmd := exec.Command(os.Args[0], os.Args[1:]...)
-	cmd.Env = env
-	if wd, err := os.Getwd(); err == nil {
-		cmd.Dir = wd
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("%d\n", cmd.Process.Pid)
-	_ = cmd.Process.Release()
+	defer devNull.Close()
+
+	attr := &os.ProcAttr{
+		Env:   env,
+		Files: []*os.File{devNull, devNull, devNull},
+		Sys:   &syscall.SysProcAttr{Setsid: true},
+	}
+	if wd, err := os.Getwd(); err == nil {
+		attr.Dir = wd
+	}
+	proc, err := os.StartProcess(os.Args[0], os.Args, attr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("%d\n", proc.Pid)
+	_ = proc.Release()
 }
 
 func hold() {
