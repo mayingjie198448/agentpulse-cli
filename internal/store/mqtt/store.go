@@ -37,7 +37,23 @@ type Store struct {
 	activeRefreshGen uint64
 	refreshAborted   bool
 	subRestoring     bool
+	// subGen / subKind decide which in-flight subscribe owns incoming messages.
+	// Paho keeps only the latest SubscribeMultiple callback, so Refresh and the
+	// recovery maintainer must share one router. A recovery attempt that started
+	// before the current generation must not clear subRestoring or change kind.
+	subGen  uint64
+	subKind subscriptionKind
 }
+
+// subscriptionKind is who is allowed to consume the active product subscription.
+// The zero value is live delivery, used before the first Refresh.
+type subscriptionKind int
+
+const (
+	subscriptionLive subscriptionKind = iota
+	subscriptionRefresh
+	subscriptionRestore
+)
 
 type refreshStaging struct {
 	machines      map[string]*model.Machine
@@ -241,6 +257,28 @@ func (s *Store) onRefreshMessage(gen uint64, msg paho.Message) {
 		s.applyAnnounceStaging(pt, msg.Payload())
 	}
 	s.mu.Unlock()
+}
+
+// dispatchMQTT is the callback for Refresh, restore, and the recovery maintainer.
+// Those calls replace each other's paho handler. Routing follows subKind at
+// delivery time, so a later recovery subscribe cannot strand a historical
+// RETAIN=1 replay on a handler that drops it while Refresh still owns the cache commit.
+func (s *Store) dispatchMQTT(_ paho.Client, msg paho.Message) {
+	s.mu.RLock()
+	kind := s.subKind
+	gen := s.activeRefreshGen
+	s.mu.RUnlock()
+
+	switch kind {
+	case subscriptionRefresh:
+		s.onRefreshMessage(gen, msg)
+	case subscriptionRestore:
+		s.onRestoreMessage(nil, msg)
+	case subscriptionLive:
+		s.onMQTTMessage(nil, msg)
+	default:
+		s.onMQTTMessage(nil, msg)
+	}
 }
 
 // onRestoreMessage handles incoming MQTT messages for subscriptions restored after a failed/cancelled refresh.
@@ -1056,9 +1094,13 @@ func (s *Store) Refresh(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.activeRefreshGen++
-	gen := s.activeRefreshGen
 	s.refreshAborted = false
 	s.staging = staging
+	// Claim ownership before subscribe returns. The client may deliver, or block
+	// inside SubscribeMultiple, before that call comes back.
+	s.subGen++
+	ownGen := s.subGen
+	s.subKind = subscriptionRefresh
 	s.mu.Unlock()
 
 	committed := false
@@ -1106,11 +1148,7 @@ func (s *Store) Refresh(ctx context.Context) error {
 		token.WaitTimeout(s.cfg.Timeout)
 	}
 
-	refreshCallback := func(_ paho.Client, msg paho.Message) {
-		s.onRefreshMessage(gen, msg)
-	}
-
-	subToken := client.SubscribeMultiple(filters, refreshCallback)
+	subToken := client.SubscribeMultiple(filters, s.dispatchMQTT)
 	if subToken != nil {
 		if !subToken.WaitTimeout(s.cfg.Timeout) {
 			return fmt.Errorf("MQTT subscription timed out during refresh")
@@ -1136,8 +1174,14 @@ func (s *Store) Refresh(ctx context.Context) error {
 		return fmt.Errorf("store closed")
 	}
 
-	// Atomically replace caches after successful settle/re-pull of retained messages
+	// Atomically replace caches after successful settle/re-pull of retained messages.
+	// Refuse the commit when a newer subscribe generation owns the stream: the
+	// staging map would be an empty or partial view of the broker replay.
 	s.mu.Lock()
+	if s.subGen != ownGen || s.subKind != subscriptionRefresh || s.staging != staging || s.refreshAborted {
+		s.mu.Unlock()
+		return fmt.Errorf("MQTT refresh lost subscription ownership before commit")
+	}
 	s.machines = staging.machines
 	s.jobs = staging.jobs
 	s.announces = staging.announces
@@ -1148,6 +1192,9 @@ func (s *Store) Refresh(ctx context.Context) error {
 	}
 	realtimeQueue := staging.realtimeQueue
 	s.staging = nil
+	// This Refresh's subscribe is the live subscription. An overlapped recovery
+	// attempt must not stay pending and resubscribe over it.
+	s.subRestoring = false
 	committed = true
 	s.mu.Unlock()
 
@@ -1193,17 +1240,22 @@ func (s *Store) setSubRestoring(restoring bool) {
 // restoreSubscriptions re-subscribes to all product filters after a failed or cancelled refresh.
 // It verifies the subscription return token and results, ensuring failure is visible and recorded.
 func (s *Store) restoreSubscriptions(filters map[string]byte) error {
-	s.mu.RLock()
+	s.mu.Lock()
+	s.subGen++
+	myGen := s.subGen
+	s.subKind = subscriptionRestore
 	client := s.client
 	closed := s.closed
-	s.mu.RUnlock()
+	s.mu.Unlock()
 
 	if closed || client == nil || !client.IsConnected() {
 		s.setSubRestoring(true)
 		return fmt.Errorf("MQTT client not connected")
 	}
 
-	token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+	// Same router as Refresh. Historical RETAIN=1 is ignored because kind is
+	// restore; real-time messages still update the preserved live cache.
+	token := client.SubscribeMultiple(filters, s.dispatchMQTT)
 	if token == nil {
 		s.setSubRestoring(true)
 		return fmt.Errorf("restore subscription returned nil token")
@@ -1226,7 +1278,13 @@ func (s *Store) restoreSubscriptions(filters map[string]byte) error {
 		return fmt.Errorf("restore subscription rejected: %w", err)
 	}
 
-	s.setSubRestoring(false)
+	s.mu.Lock()
+	// Only this restore generation may clear the pending flag. A superseded
+	// attempt must not cancel a newer failure's retry.
+	if s.subGen == myGen {
+		s.subRestoring = false
+	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -1250,17 +1308,22 @@ func (s *Store) runSubscriptionMaintainer() {
 		case <-s.closeCh:
 			return
 		case <-ticker.C:
-			s.mu.RLock()
+			s.mu.Lock()
 			restoring := s.subRestoring
 			closed := s.closed
 			client := s.client
-			s.mu.RUnlock()
+			kind := s.subKind
+			seen := s.subGen
+			s.mu.Unlock()
 
-			if closed || !restoring || client == nil || !client.IsConnected() {
+			// Do not call SubscribeMultiple while a Refresh owns the callback.
+			// An attempt already inside SubscribeMultiple uses dispatchMQTT, so
+			// its later registration still follows the Refresh generation.
+			if closed || !restoring || client == nil || !client.IsConnected() || kind == subscriptionRefresh {
 				continue
 			}
 
-			token := client.SubscribeMultiple(filters, s.onRestoreMessage)
+			token := client.SubscribeMultiple(filters, s.dispatchMQTT)
 			if token == nil {
 				continue
 			}
@@ -1278,7 +1341,11 @@ func (s *Store) runSubscriptionMaintainer() {
 				continue
 			}
 
-			s.setSubRestoring(false)
+			s.mu.Lock()
+			if s.subGen == seen && s.subKind != subscriptionRefresh && s.subRestoring {
+				s.subRestoring = false
+			}
+			s.mu.Unlock()
 		}
 	}
 }

@@ -71,17 +71,57 @@ type PublishedMessage struct {
 
 // FakeMQTTClient implements paho.Client in memory for tests.
 type FakeMQTTClient struct {
-	mu                  sync.Mutex
-	connected           bool
-	subscriptions       map[string]paho.MessageHandler
-	retained            map[string]fakeMessage
-	published           []PublishedMessage
-	unsubscribed        []string
-	disconnectWait      uint
-	subscribeErr        error
-	subscribeTimeout    bool
-	subscribeResults    map[string]byte
-	onSubscribeMultiple func()
+	mu                          sync.Mutex
+	connected                   bool
+	subscriptions               map[string]paho.MessageHandler
+	retained                    map[string]fakeMessage
+	published                   []PublishedMessage
+	unsubscribed                []string
+	disconnectWait              uint
+	subscribeErr                error
+	subscribeTimeout            bool
+	subscribeResults            map[string]byte
+	onSubscribeMultiple         func()
+	suppressRetainedOnSubscribe bool
+	gateArmed                   bool
+	gate                        chan *SubscribeHold
+	gateWaiting                 []*SubscribeHold
+}
+
+// SubscribeHold pauses one SubscribeMultiple call before that call's callback
+// is stored. Release unblocks it. Registered closes after the callback map
+// update is visible to Deliver. This is a deterministic stand-in for a broker
+// that accepts SUBACK before it emits the retained replay.
+type SubscribeHold struct {
+	release     chan struct{}
+	registered  chan struct{}
+	releaseOnce sync.Once
+	regOnce     sync.Once
+}
+
+// Release lets the paused SubscribeMultiple store its callback and return.
+func (h *SubscribeHold) Release() {
+	if h == nil {
+		return
+	}
+	h.releaseOnce.Do(func() { close(h.release) })
+}
+
+// Registered is closed once this call has finished updating the callback map.
+func (h *SubscribeHold) Registered() <-chan struct{} {
+	if h == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return h.registered
+}
+
+func finishSubscribeHold(h *SubscribeHold) {
+	if h == nil {
+		return
+	}
+	h.regOnce.Do(func() { close(h.registered) })
 }
 
 func NewFakeMQTTClient() *FakeMQTTClient {
@@ -234,15 +274,76 @@ func (c *FakeMQTTClient) SetOnSubscribeMultiple(fn func()) {
 	c.onSubscribeMultiple = fn
 }
 
+// SetSuppressRetainedOnSubscribe skips the synchronous retained replay inside
+// SubscribeMultiple. Tests then Deliver to whatever callback is current, which
+// matches a broker that emits the historical dump after later SUBACKs.
+func (c *FakeMQTTClient) SetSuppressRetainedOnSubscribe(suppress bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.suppressRetainedOnSubscribe = suppress
+}
+
+// ArmSubscribeGate pauses subsequent SubscribeMultiple calls before they store
+// a callback, and returns the arrivals in call order. Default clients are ungated.
+func (c *FakeMQTTClient) ArmSubscribeGate() <-chan *SubscribeHold {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gate == nil {
+		c.gate = make(chan *SubscribeHold, 32)
+	}
+	c.gateArmed = true
+	return c.gate
+}
+
+// DisarmSubscribeGate lets later SubscribeMultiple calls proceed and releases
+// any call already waiting so a failed test cannot block the maintainer forever.
+func (c *FakeMQTTClient) DisarmSubscribeGate() {
+	c.mu.Lock()
+	c.gateArmed = false
+	waiting := c.gateWaiting
+	c.gateWaiting = nil
+	c.mu.Unlock()
+	for _, h := range waiting {
+		h.Release()
+	}
+}
+
+func (c *FakeMQTTClient) enqueueSubscribeHold() *SubscribeHold {
+	c.mu.Lock()
+	if !c.gateArmed || c.gate == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	h := &SubscribeHold{
+		release:    make(chan struct{}),
+		registered: make(chan struct{}),
+	}
+	c.gateWaiting = append(c.gateWaiting, h)
+	gate := c.gate
+	c.mu.Unlock()
+	gate <- h
+	return h
+}
+
 func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) paho.Token {
+	// Pause before reading SUBACK codes or storing the callback. A test can
+	// flip the ACL and let another SubscribeMultiple register first; the
+	// broker replay is then Delivered to whichever callback is current.
+	hold := c.enqueueSubscribeHold()
+	if hold != nil {
+		<-hold.release
+	}
+
 	c.mu.Lock()
 	if c.subscribeTimeout {
 		c.mu.Unlock()
+		finishSubscribeHold(hold)
 		return newTimeoutToken()
 	}
 	if c.subscribeErr != nil {
 		err := c.subscribeErr
 		c.mu.Unlock()
+		finishSubscribeHold(hold)
 		return newErrorToken(err)
 	}
 	results := make(map[string]byte)
@@ -261,19 +362,22 @@ func (c *FakeMQTTClient) SubscribeMultiple(filters map[string]byte, callback pah
 	}
 
 	var retainedToDeliver []fakeMessage
-	for _, msg := range c.retained {
-		for filter := range filters {
-			if results[filter] >= 0x80 {
-				continue
-			}
-			if matchTopic(filter, msg.topic) {
-				retainedToDeliver = append(retainedToDeliver, msg)
-				break
+	if !c.suppressRetainedOnSubscribe {
+		for _, msg := range c.retained {
+			for filter := range filters {
+				if results[filter] >= 0x80 {
+					continue
+				}
+				if matchTopic(filter, msg.topic) {
+					retainedToDeliver = append(retainedToDeliver, msg)
+					break
+				}
 			}
 		}
 	}
 	onSub := c.onSubscribeMultiple
 	c.mu.Unlock()
+	finishSubscribeHold(hold)
 
 	for _, msg := range retainedToDeliver {
 		m := msg
