@@ -823,21 +823,30 @@ func TestAttachManager_ExitUnknown_MarkedFailed(t *testing.T) {
 func TestAttachManager_PIDAllowlist_Isolation(t *testing.T) {
 	mockClient := newMockMQTTClient()
 
+	// StartTime and Cwd are supplied by the mock. Leaving them empty would
+	// fall through to host ps/lsof for these fictional PIDs.
+	mockStart := time.Unix(1700000000, 0).UTC()
 	mockProcs := []wrapper.ProcessInfo{
 		{
-			PID:  12345,
-			PPID: 1,
-			Args: []string{"agy", "-p", "Allowed test task"},
+			PID:       12345,
+			PPID:      1,
+			StartTime: mockStart,
+			Cwd:       "/isolation/allowed",
+			Args:      []string{"agy", "-p", "Allowed test task"},
 		},
 		{
-			PID:  3445,
-			PPID: 1,
-			Args: []string{"agy", "-p", "Real developer secret prompt sk-SECRET-1"},
+			PID:       3445,
+			PPID:      1,
+			StartTime: mockStart,
+			Cwd:       "/isolation/bypass-a",
+			Args:      []string{"agy", "-p", "Real developer secret prompt sk-SECRET-1"},
 		},
 		{
-			PID:  3456,
-			PPID: 1,
-			Args: []string{"agy", "-p", "Another developer session sk-SECRET-2"},
+			PID:       3456,
+			PPID:      1,
+			StartTime: mockStart,
+			Cwd:       "/isolation/bypass-b",
+			Args:      []string{"agy", "-p", "Another developer session sk-SECRET-2"},
 		},
 	}
 
