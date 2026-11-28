@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func TestUnscopedDiscoveryStillRequestsGlobalPS(t *testing.T) {
 	var calls []string
 	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
 		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
-			if name == "ps" || name == "lsof" {
+			if name == "ps" || name == "lsof" || name == "powershell" {
 				calls = append(calls, name+" "+strings.Join(args, " "))
 				// Refuse the real binary. This test only records the requested argv.
 				return exec.CommandContext(ctx, "/bin/true")
@@ -63,6 +64,22 @@ func TestUnscopedDiscoveryStillRequestsGlobalPS(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 	mgr.Stop()
 
+	if runtime.GOOS == "windows" {
+		// Windows has no ps; unscoped discovery must issue the global
+		// (unfiltered) Win32_Process CIM query instead (issue #66).
+		if len(calls) == 0 {
+			t.Fatal("expected the default lister to request a global CIM query when no allowlist is set")
+		}
+		for _, call := range calls {
+			if !strings.HasPrefix(call, "powershell -NoProfile -NonInteractive -Command Get-CimInstance Win32_Process |") {
+				t.Fatalf("unscoped discovery requested %q, want the global CIM form", call)
+			}
+			if strings.Contains(call, "-Filter") || strings.Contains(call, "ProcessId=") {
+				t.Fatalf("unscoped discovery must not filter PIDs: %q", call)
+			}
+		}
+		return
+	}
 	if len(calls) == 0 {
 		t.Fatal("expected the default lister to request ps when no allowlist is set")
 	}
