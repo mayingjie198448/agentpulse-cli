@@ -1,6 +1,7 @@
 package wrapper_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1050,4 +1051,87 @@ func TestHelperProcessLstart(t *testing.T) {
 	}
 	fmt.Fprint(os.Stdout, "Fri Nov 27 10:00:00 2026\n")
 	os.Exit(0)
+}
+
+// TestDefaultProcessListerPPIDSubstring pins issue #63: a PPID whose digits
+// occur inside the PID (e.g. PPID 1, PID 12345) must not truncate the args.
+func TestDefaultProcessListerPPIDSubstring(t *testing.T) {
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperPSLines$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	procs, err := wrapper.DefaultProcessLister(context.Background())
+	if err != nil {
+		t.Fatalf("DefaultProcessLister: %v", err)
+	}
+	if len(procs) != 2 {
+		t.Fatalf("expected 2 processes, got %d", len(procs))
+	}
+	if procs[0].PID != 12345 || procs[0].PPID != 1 {
+		t.Fatalf("first row pid/ppid = %d/%d, want 12345/1", procs[0].PID, procs[0].PPID)
+	}
+	if len(procs[0].Args) == 0 || procs[0].Args[0] != "/usr/local/bin/agy" {
+		t.Fatalf("PPID=1 inside PID=12345 truncated args: got %q, want /usr/local/bin/agy", procs[0].Args)
+	}
+	if len(procs[1].Args) == 0 || procs[1].Args[0] != "/usr/local/bin/opencode" {
+		t.Fatalf("second row args = %q, want /usr/local/bin/opencode", procs[1].Args)
+	}
+}
+
+func TestHelperPSLines(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stdout, "12345     1 /usr/local/bin/agy -p task\n23456     1 /usr/local/bin/opencode run\n")
+	os.Exit(0)
+}
+
+// TestAttachManagerPSErrorSurfaced pins issue #63: a targeted ps failure with
+// stderr output must not be silently swallowed as "no processes".
+func TestAttachManagerPSErrorSurfaced(t *testing.T) {
+	restore := wrapper.SetIsolationHooksForTest(wrapper.IsolationHooks{
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperPSFail$")
+			cmd.Env = append(os.Environ(), "AGENTPULSE_WANT_HELPER_PROCESS=1")
+			return cmd
+		},
+	})
+	t.Cleanup(restore)
+
+	stderr := new(bytes.Buffer)
+	mgr := wrapper.NewAttachManager(wrapper.AttachManagerConfig{
+		MachineID:      "psfail-node",
+		PIDAllowlist:   []int{424242},
+		ScanInterval:   30 * time.Millisecond,
+		Agents:         []config.AgentConfig{{ID: "agy", Alias: []string{"agy"}, Enabled: boolPtr(true)}},
+		IsProcessAlive: func(int) bool { return false },
+		Stderr:         stderr,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(stderr.String(), "process scan error") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	mgr.Stop()
+
+	if !strings.Contains(stderr.String(), "process scan error") {
+		t.Fatalf("ps failure with stderr was silently swallowed, stderr=%q", stderr.String())
+	}
+}
+
+func TestHelperPSFail(t *testing.T) {
+	if os.Getenv("AGENTPULSE_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprint(os.Stderr, "ps: simulated failure\n")
+	os.Exit(1)
 }

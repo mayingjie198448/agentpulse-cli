@@ -269,7 +269,9 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 	if err != nil {
 		if len(pids) > 0 && len(bytes.TrimSpace(out)) == 0 {
 			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
+			// Empty stdout and empty stderr means none of the requested PIDs
+			// exist; stderr content means ps itself failed and must surface.
+			if errors.As(err, &exitErr) && len(bytes.TrimSpace(exitErr.Stderr)) == 0 {
 				return nil, nil
 			}
 		}
@@ -298,12 +300,7 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 			continue
 		}
 
-		// Find the start of the args section
-		idx := strings.Index(line, fields[1])
-		if idx < 0 {
-			continue
-		}
-		cmdLine := strings.TrimSpace(line[idx+len(fields[1]):])
+		cmdLine := argsAfterPIDColumns(line)
 		args := TokenizeCommandLine(cmdLine)
 		if len(args) == 0 {
 			args = fields[2:]
@@ -316,6 +313,22 @@ func listWithPS(ctx context.Context, pids []int) ([]ProcessInfo, error) {
 		})
 	}
 	return procs, nil
+}
+
+// argsAfterPIDColumns returns the remainder of a ps row after the PID and
+// PPID columns. Searching for the PPID substring misfires when those digits
+// occur inside the PID (e.g. PPID 1, PID 12345), truncating the command line.
+func argsAfterPIDColumns(line string) string {
+	i := 0
+	for col := 0; col < 2; col++ {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
+	}
+	return strings.TrimSpace(line[i:])
 }
 
 // listLinuxPIDs reads only the allowlisted PIDs. It does not walk /proc and
