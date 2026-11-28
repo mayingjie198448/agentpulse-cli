@@ -56,7 +56,11 @@ func (o *darwinExitObserver) loop() {
 			pid := int(events[i].Ident)
 			code := decodeExitStatus(events[i].Data)
 			o.mu.Lock()
-			o.codes[pid] = code
+			// An event queued before unwatch must not resurrect a stale
+			// code for a later reused PID.
+			if o.watched[pid] {
+				o.codes[pid] = code
+			}
 			o.mu.Unlock()
 		}
 	}
@@ -83,6 +87,7 @@ func (o *darwinExitObserver) watch(pid int) {
 		// Already gone or not observable; stay conservative.
 		return
 	}
+	delete(o.codes, pid)
 	o.watched[pid] = true
 }
 
