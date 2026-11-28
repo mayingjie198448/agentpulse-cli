@@ -205,30 +205,36 @@ var candidateCustomBinaries = []string{
 // discovered custom CLIs, and IDE plugins (e.g. Continue).
 func ScanLocalAgents(opts ...ScanOptions) ScanResult {
 	var opt ScanOptions
-	if len(opts) > 0 {
+	hasOpts := len(opts) > 0
+	if hasOpts {
 		opt = opts[0]
 	}
 
+	overridePATHProvided := opt.OverridePATH != ""
+	homeProvided := opt.HomeDir != ""
+
 	home := opt.HomeDir
-	if home == "" {
+	if !homeProvided && !overridePATHProvided {
 		if h, err := os.UserHomeDir(); err == nil {
 			home = h
 		}
 	}
 
 	pathEnv := opt.OverridePATH
-	if pathEnv == "" && len(opts) == 0 {
+	if !overridePATHProvided && !hasOpts {
 		pathEnv = os.Getenv("PATH")
 	}
 
-	searchDirs := buildSearchDirs(pathEnv, home, opt.ExtraPaths)
+	includeSystemDirs := !overridePATHProvided
+	allowLookPath := !hasOpts && !overridePATHProvided
+	searchDirs := buildSearchDirs(pathEnv, home, opt.ExtraPaths, includeSystemDirs)
 
 	var res ScanResult
 
 	// 1. Scan Built-in Engines
 	discoveredMap := make(map[string]bool)
 	for _, def := range BuiltinEngineDefs() {
-		foundPath := findExecutableForEngine(def, searchDirs, pathEnv)
+		foundPath := findExecutableForEngine(def, searchDirs, allowLookPath)
 		if foundPath != "" {
 			discoveredMap[def.ID] = true
 			res.DiscoveredBuiltin = append(res.DiscoveredBuiltin, DiscoveredAgent{
@@ -252,7 +258,7 @@ func ScanLocalAgents(opts ...ScanOptions) ScanResult {
 		if IsBuiltinEngine(cand) {
 			continue
 		}
-		foundPath := findExecutable(cand, searchDirs, pathEnv)
+		foundPath := findExecutable(cand, searchDirs, allowLookPath)
 		if foundPath != "" {
 			res.DiscoveredCustom = append(res.DiscoveredCustom, DiscoveredAgent{
 				ID:           cand,
@@ -268,7 +274,7 @@ func ScanLocalAgents(opts ...ScanOptions) ScanResult {
 	return res
 }
 
-func buildSearchDirs(pathEnv string, home string, extraPaths []string) []string {
+func buildSearchDirs(pathEnv string, home string, extraPaths []string, includeSystemDirs bool) []string {
 	seen := make(map[string]bool)
 	var dirs []string
 
@@ -327,7 +333,7 @@ func buildSearchDirs(pathEnv string, home string, extraPaths []string) []string 
 		}
 	}
 
-	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+	if includeSystemDirs && (runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
 		addDir("/opt/homebrew/bin")
 		addDir("/opt/homebrew/sbin")
 		addDir("/usr/local/bin")
@@ -351,9 +357,9 @@ func expandHome(path string, home string) string {
 	return path
 }
 
-func findExecutableForEngine(def BuiltinEngineDef, searchDirs []string, pathEnv string) string {
+func findExecutableForEngine(def BuiltinEngineDef, searchDirs []string, allowLookPath bool) string {
 	for _, binName := range def.BinaryNames {
-		p := findExecutable(binName, searchDirs, pathEnv)
+		p := findExecutable(binName, searchDirs, allowLookPath)
 		if p != "" {
 			return p
 		}
@@ -361,23 +367,25 @@ func findExecutableForEngine(def BuiltinEngineDef, searchDirs []string, pathEnv 
 	return ""
 }
 
-func findExecutable(binName string, searchDirs []string, pathEnv string) string {
+func findExecutable(binName string, searchDirs []string, allowLookPath bool) string {
 	// Look up in search directories
 	for _, dir := range searchDirs {
 		candidate := filepath.Join(dir, binName)
 		if isExecutableFile(candidate) {
 			return candidate
 		}
-		if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(binName), ".exe") {
-			candidateExe := filepath.Join(dir, binName+".exe")
-			if isExecutableFile(candidateExe) {
-				return candidateExe
+		if runtime.GOOS == "windows" && filepath.Ext(binName) == "" {
+			for _, ext := range []string{".exe", ".cmd", ".bat"} {
+				candidateExt := filepath.Join(dir, binName+ext)
+				if isExecutableFile(candidateExt) {
+					return candidateExt
+				}
 			}
 		}
 	}
 
-	// Try exec.LookPath if PATH matches current environment
-	if pathEnv == os.Getenv("PATH") && pathEnv != "" {
+	// Try exec.LookPath only for unscoped default scans
+	if allowLookPath {
 		if resolved, err := exec.LookPath(binName); err == nil {
 			return resolved
 		}
@@ -411,7 +419,7 @@ func detectIDEPlugins(home string, searchDirs []string, res *ScanResult) {
 			Path:   continueConfig,
 			Detail: "发现 Continue 配置文件目录 (~/.continue)，暂不作为独立终端 CLI 引擎挂接",
 		})
-	} else if p := findExecutable("continue", searchDirs, ""); p != "" {
+	} else if p := findExecutable("continue", searchDirs, false); p != "" {
 		res.IDEPlugins = append(res.IDEPlugins, DiscoveredIDEPlugin{
 			Name:   "Continue",
 			Path:   p,

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
@@ -92,37 +93,37 @@ func TestAgentConfig_CustomAndBuiltin(t *testing.T) {
 	}
 }
 
+func createMockScanExec(t *testing.T, dir, name string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("failed to create bin dir %s: %v", dir, err)
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".bat"
+	}
+	path := filepath.Join(dir, name+ext)
+	content := "#!/bin/sh\necho mock\n"
+	if runtime.GOOS == "windows" {
+		content = "@echo off\r\necho mock\r\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatalf("failed to write mock binary %s: %v", path, err)
+	}
+	_ = os.Chmod(path, 0755)
+	return path
+}
+
 func TestScanLocalAgents_Hermetic(t *testing.T) {
 	fakeHome := t.TempDir()
 	fakeBinDir := filepath.Join(fakeHome, "fakebin")
-	if err := os.MkdirAll(fakeBinDir, 0755); err != nil {
-		t.Fatalf("failed to create fake bin dir: %v", err)
-	}
-
-	// Helper to create mock executable
-	createMockExec := func(dir, name string) string {
-		ext := ""
-		if runtime.GOOS == "windows" {
-			ext = ".bat"
-		}
-		path := filepath.Join(dir, name+ext)
-		content := "#!/bin/sh\necho mock\n"
-		if runtime.GOOS == "windows" {
-			content = "@echo off\r\necho mock\r\n"
-		}
-		if err := os.WriteFile(path, []byte(content), 0755); err != nil {
-			t.Fatalf("failed to write mock binary %s: %v", path, err)
-		}
-		_ = os.Chmod(path, 0755)
-		return path
-	}
 
 	// 1. Create mock executables for built-in engines: agy and claude
-	agyPath := createMockExec(fakeBinDir, "agy")
-	claudePath := createMockExec(fakeBinDir, "claude")
+	agyPath := createMockScanExec(t, fakeBinDir, "agy")
+	claudePath := createMockScanExec(t, fakeBinDir, "claude")
 
 	// 2. Create mock custom CLI: cursor
-	cursorPath := createMockExec(fakeBinDir, "cursor")
+	cursorPath := createMockScanExec(t, fakeBinDir, "cursor")
 
 	// 3. Create mock IDE plugin: .continue directory in fake home
 	continueDir := filepath.Join(fakeHome, ".continue")
@@ -196,5 +197,111 @@ func TestScanLocalAgents_Hermetic(t *testing.T) {
 	}
 	if !foundContinue {
 		t.Errorf("expected Continue to be detected as IDE plugin")
+	}
+}
+
+func TestScanLocalAgents_OverridePATHExcludesHostAndSystemDirs(t *testing.T) {
+	hostPATHDir := filepath.Join(t.TempDir(), "host-path")
+	createMockScanExec(t, hostPATHDir, "codex")
+	createMockScanExec(t, hostPATHDir, "cursor")
+	t.Setenv("PATH", hostPATHDir)
+
+	hostHome := filepath.Join(t.TempDir(), "host-home")
+	createMockScanExec(t, filepath.Join(hostHome, ".local", "bin"), "opencode")
+	if err := os.MkdirAll(filepath.Join(hostHome, ".continue"), 0755); err != nil {
+		t.Fatalf("failed to create host .continue: %v", err)
+	}
+	t.Setenv("HOME", hostHome)
+	t.Setenv("USERPROFILE", hostHome)
+
+	overrideDir := filepath.Join(t.TempDir(), "override-bin")
+	geminiPath := createMockScanExec(t, overrideDir, "gemini")
+
+	// OverridePATH alone must not fall back to host PATH, system dirs, or host HomeDir.
+	res := config.ScanLocalAgents(config.ScanOptions{
+		OverridePATH: overrideDir,
+	})
+
+	if len(res.DiscoveredBuiltin) != 1 || res.DiscoveredBuiltin[0].ID != "gemini" || res.DiscoveredBuiltin[0].Path != geminiPath {
+		t.Fatalf("expected only gemini at %q from OverridePATH, got %+v", geminiPath, res.DiscoveredBuiltin)
+	}
+	if len(res.DiscoveredCustom) != 0 {
+		t.Fatalf("expected no custom CLIs from host PATH or system dirs, got %+v", res.DiscoveredCustom)
+	}
+	if len(res.IDEPlugins) != 0 {
+		t.Fatalf("expected no IDE plugins from host HomeDir, got %+v", res.IDEPlugins)
+	}
+
+	// Verify OverridePATH + HomeDir stays strictly scoped to those two directories.
+	fakeHome := filepath.Join(t.TempDir(), "fake-home")
+	if err := os.MkdirAll(fakeHome, 0755); err != nil {
+		t.Fatalf("failed to create fakeHome: %v", err)
+	}
+	resWithFakeHome := config.ScanLocalAgents(config.ScanOptions{
+		OverridePATH: overrideDir,
+		HomeDir:      fakeHome,
+	})
+	for _, b := range resWithFakeHome.DiscoveredBuiltin {
+		if !strings.HasPrefix(b.Path, overrideDir) && !strings.HasPrefix(b.Path, fakeHome) {
+			t.Errorf("discovered builtin %q leaked outside OverridePATH/HomeDir: %q", b.ID, b.Path)
+		}
+	}
+	for _, c := range resWithFakeHome.DiscoveredCustom {
+		if !strings.HasPrefix(c.Path, overrideDir) && !strings.HasPrefix(c.Path, fakeHome) {
+			t.Errorf("discovered custom %q leaked outside OverridePATH/HomeDir: %q", c.ID, c.Path)
+		}
+	}
+}
+
+func TestScanLocalAgents_HomeDirOverrideDoesNotTouchHostHome(t *testing.T) {
+	hostHome := filepath.Join(t.TempDir(), "real-host-home")
+	createMockScanExec(t, filepath.Join(hostHome, ".local", "bin"), "opencode")
+	createMockScanExec(t, filepath.Join(hostHome, ".antigravity", "bin"), "agy")
+	if err := os.MkdirAll(filepath.Join(hostHome, ".continue"), 0755); err != nil {
+		t.Fatalf("failed to create host .continue: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(hostHome, ".vscode", "extensions", "continue.continue-1.0.0"), 0755); err != nil {
+		t.Fatalf("failed to create host vscode extension: %v", err)
+	}
+	t.Setenv("HOME", hostHome)
+	t.Setenv("USERPROFILE", hostHome)
+
+	overrideHome := filepath.Join(t.TempDir(), "override-home")
+	claudePath := createMockScanExec(t, filepath.Join(overrideHome, ".local", "bin"), "claude")
+	overrideBin := filepath.Join(t.TempDir(), "empty-bin")
+	if err := os.MkdirAll(overrideBin, 0755); err != nil {
+		t.Fatalf("failed to create overrideBin: %v", err)
+	}
+
+	res := config.ScanLocalAgents(config.ScanOptions{
+		OverridePATH: overrideBin,
+		HomeDir:      overrideHome,
+	})
+
+	if len(res.DiscoveredBuiltin) != 1 || res.DiscoveredBuiltin[0].ID != "claude" || res.DiscoveredBuiltin[0].Path != claudePath {
+		t.Fatalf("expected only claude from overrideHome (%q), got %+v", claudePath, res.DiscoveredBuiltin)
+	}
+	if len(res.IDEPlugins) != 0 {
+		t.Fatalf("expected no IDE plugins from host home, got %+v", res.IDEPlugins)
+	}
+
+	// Also verify HomeDir override without OverridePATH still never touches host home.
+	resHomeOnly := config.ScanLocalAgents(config.ScanOptions{
+		HomeDir: overrideHome,
+	})
+	for _, b := range resHomeOnly.DiscoveredBuiltin {
+		if strings.HasPrefix(b.Path, hostHome) {
+			t.Errorf("HomeDir override leaked host home builtin %q: %q", b.ID, b.Path)
+		}
+	}
+	for _, c := range resHomeOnly.DiscoveredCustom {
+		if strings.HasPrefix(c.Path, hostHome) {
+			t.Errorf("HomeDir override leaked host home custom %q: %q", c.ID, c.Path)
+		}
+	}
+	for _, p := range resHomeOnly.IDEPlugins {
+		if strings.HasPrefix(p.Path, hostHome) {
+			t.Errorf("HomeDir override leaked host home IDE plugin %q: %q", p.Name, p.Path)
+		}
 	}
 }
