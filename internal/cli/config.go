@@ -355,7 +355,12 @@ func configureBrokerSection(reader *bufio.Reader, out io.Writer, current config.
 	password := promptLine(reader, out, "密码 (无密码请留空)", defaultPass)
 
 	defaultTLS := current.TLS
-	if strings.HasPrefix(brokerURL, "tls://") || strings.HasPrefix(brokerURL, "mqtts://") || strings.Contains(brokerURL, ":8883") {
+	switch {
+	case strings.HasPrefix(brokerURL, "tls://") || strings.HasPrefix(brokerURL, "mqtts://"):
+		defaultTLS = true
+	case strings.HasPrefix(brokerURL, "tcp://"):
+		defaultTLS = false
+	case strings.Contains(brokerURL, ":8883"):
 		defaultTLS = true
 	}
 	useTLS := promptBool(reader, out, "启用 TLS 加密连接", defaultTLS)
