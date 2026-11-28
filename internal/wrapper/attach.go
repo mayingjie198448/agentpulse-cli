@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -24,6 +23,7 @@ import (
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mayingjie198448/agentpulse-cli/internal/config"
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 	"github.com/mayingjie198448/agentpulse-cli/internal/store/mqtt"
 )
 
@@ -203,10 +203,19 @@ func GenerateAttachJobID(engine string, pid int, startTime time.Time) string {
 	return fmt.Sprintf("job-attach-%s-%d", engine, pid)
 }
 
+func runProbeOutput(ctx context.Context, argv ...string) ([]byte, error) {
+	prepared, err := safety.Prepare(ctx, safety.Request{
+		Argv: argv,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return prepared.Cmd.Output()
+}
+
 // DefaultProcessLister lists processes using standard POSIX ps.
 func DefaultProcessLister(ctx context.Context) ([]ProcessInfo, error) {
-	cmd := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=,ppid=,args=")
-	out, err := cmd.Output()
+	out, err := runProbeOutput(ctx, "ps", "-A", "-o", "pid=,ppid=,args=")
 	if err != nil {
 		return nil, fmt.Errorf("failed to run ps: %w", err)
 	}
@@ -269,8 +278,7 @@ func ResolveProcessCwd(pid int) string {
 	if runtime.GOOS == "darwin" {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
-		out, err := cmd.Output()
+		out, err := runProbeOutput(ctx, "lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn")
 		if err == nil {
 			lines := strings.Split(string(out), "\n")
 			for _, l := range lines {
@@ -296,8 +304,7 @@ func ResolveProcessStartTime(pid int) time.Time {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
-	out, err := cmd.Output()
+	out, err := runProbeOutput(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
 	if err == nil {
 		str := strings.TrimSpace(string(out))
 		layouts := []string{
