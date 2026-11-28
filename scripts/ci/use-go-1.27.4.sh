@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 把官方 go1.27.4 解到本作业的临时目录，并在标准输出打印本进程要用的导出语句。
 # 官方归档放在 runner 跨作业仍保留的目录里；GOROOT 每次从校验过的归档重新解压。
-# 下载先试 https://golang.google.cn/dl/ （Google 官方中国镜像），失败再试 https://go.dev/dl/ 。
-# 校验值来自 https://go.dev/dl/?mode=json 的 go1.27.4 档案，两个源共用同一组 sha256。不写入 /usr/local/go。
+# 下载顺序：阿里云、中科大、golang.google.cn、go.dev。golang.google.cn 会跳到 dl.google.com，只作后备。
+# 校验值来自 https://go.dev/dl/?mode=json 的 go1.27.4 档案，所有源共用同一组 sha256。不写入 /usr/local/go。
 # 下载或校验失败时直接以非零退出，不回退到系统已安装的 Go。
 
 set -u
@@ -255,8 +255,10 @@ fi
 
 if [[ "$cache_ok" != "1" ]]; then
   downloaded=0
-  # 大陆网络先走 Google 官方中国镜像，失败再走 go.dev。校验值不随源改变。
+  # 校验值不随源改变。前一个源失败或校验不符，才试下一个。
   for source_url in \
+    "https://mirrors.aliyun.com/golang/${name}" \
+    "https://mirrors.ustc.edu.cn/golang/${name}" \
     "https://golang.google.cn/dl/${name}" \
     "https://go.dev/dl/${name}"
   do
