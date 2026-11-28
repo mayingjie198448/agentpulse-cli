@@ -1300,3 +1300,58 @@ func TestTUIModel_CJKAndEmojiTruncationAndNarrowWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestTUIModel_RefreshPreservesGroupingAndSelection(t *testing.T) {
+	st := &fakeStore{
+		machines: []model.Machine{
+			{ID: "node-1", Name: "node-1", Online: true},
+		},
+		jobs: []model.Job{
+			{ID: "job-b", MachineID: "node-1", Status: model.StatusRunning, Repo: "org/beta", Title: "Job B"},
+			{ID: "job-a", MachineID: "node-1", Status: model.StatusRunning, Repo: "org/alpha", Title: "Job A"},
+		},
+	}
+	defer st.Close()
+
+	m := tui.NewModel(st)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Switch to GroupRepo ('g') so job-a (org/alpha) sorts before job-b (org/beta)
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	if m.GroupingForTest() != tui.GroupRepo {
+		t.Fatalf("expected GroupRepo, got %v", m.GroupingForTest())
+	}
+
+	// Select job-b
+	for i := 0; i < len(m.JobsForTest()); i++ {
+		if m.JobsForTest()[m.SelectedJobIdxForTest()].ID == "job-b" {
+			break
+		}
+		tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-b" {
+		t.Fatalf("failed to select job-b")
+	}
+
+	// Store returns refreshed jobs in ungrouped order with a new job-0 sorting first under GroupRepo
+	st.jobs = []model.Job{
+		{ID: "job-b", MachineID: "node-1", Status: model.StatusRunning, Repo: "org/beta", Title: "Job B"},
+		{ID: "job-a", MachineID: "node-1", Status: model.StatusRunning, Repo: "org/alpha", Title: "Job A"},
+		{ID: "job-0", MachineID: "node-1", Status: model.StatusRunning, Repo: "org/00-first", Title: "Job 0"},
+	}
+
+	var cmd tea.Cmd
+	tm, cmd = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatalf("expected 'r' to return refresh cmd")
+	}
+	tm, _ = tm.Update(cmd())
+
+	if m.JobsForTest()[0].ID != "job-0" {
+		t.Fatalf("expected refreshed jobs to keep GroupRepo ordering with job-0 first, got %s", m.JobsForTest()[0].ID)
+	}
+	if m.JobsForTest()[m.SelectedJobIdxForTest()].ID != "job-b" {
+		t.Fatalf("expected selection preserved on job-b after refresh, got %s", m.JobsForTest()[m.SelectedJobIdxForTest()].ID)
+	}
+}

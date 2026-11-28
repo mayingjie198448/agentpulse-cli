@@ -394,10 +394,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case model.EventJobUpdated:
 				if msg.Job != nil && msg.Job.ID != "" {
-					var selectedID string
-					if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
-						selectedID = m.jobs[m.selectedJobIdx].ID
-					}
+					selectedID := m.currentSelectedJobID()
 
 					found := false
 					for i, existing := range m.jobs {
@@ -414,22 +411,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.grouping != GroupDefault {
 						m.applyGrouping()
 					}
-
-					if selectedID != "" {
-						for i, j := range m.jobs {
-							if j.ID == selectedID {
-								m.selectedJobIdx = i
-								break
-							}
-						}
-					} else if len(m.jobs) > 0 {
-						if m.selectedJobIdx >= len(m.jobs) {
-							m.selectedJobIdx = len(m.jobs) - 1
-						}
-						if m.selectedJobIdx < 0 {
-							m.selectedJobIdx = 0
-						}
-					}
+					m.restoreSelectedJob(selectedID)
 
 					if len(m.jobs) > 0 && m.selectedJobIdx < len(m.jobs) && m.jobs[m.selectedJobIdx].ID == msg.Job.ID {
 						m.updateViewportContent()
@@ -465,6 +447,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.refreshError = ""
+		selectedID := m.currentSelectedJobID()
 		m.machines = msg.machines
 		m.jobs = msg.jobs
 
@@ -479,12 +462,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if len(m.jobs) == 0 {
-			m.selectedJobIdx = 0
-			m.jobsScrollOffset = 0
-		} else if m.selectedJobIdx >= len(m.jobs) {
-			m.selectedJobIdx = len(m.jobs) - 1
+		if m.grouping != GroupDefault {
+			m.applyGrouping()
 		}
+		m.restoreSelectedJob(selectedID)
 
 		m.ensureLogsLoadedForSelectedJob()
 		m.updateViewportContent()
@@ -648,44 +629,52 @@ func (m *Model) applyGrouping() {
 	})
 }
 
-func (m *Model) nextGrouping() {
-	var selectedID string
+func (m *Model) currentSelectedJobID() string {
 	if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
-		selectedID = m.jobs[m.selectedJobIdx].ID
+		return m.jobs[m.selectedJobIdx].ID
 	}
+	return ""
+}
 
-	m.grouping = (m.grouping + 1) % JobGrouping(len(AllGroupings))
-	m.applyGrouping()
-
+func (m *Model) restoreSelectedJob(selectedID string) {
+	if len(m.jobs) == 0 {
+		m.selectedJobIdx = 0
+		m.jobsScrollOffset = 0
+		return
+	}
 	if selectedID != "" {
 		for i, j := range m.jobs {
 			if j.ID == selectedID {
 				m.selectedJobIdx = i
-				break
+				return
 			}
 		}
 	}
+	if m.selectedJobIdx >= len(m.jobs) {
+		m.selectedJobIdx = len(m.jobs) - 1
+	} else if m.selectedJobIdx < 0 {
+		m.selectedJobIdx = 0
+	}
+}
+
+func (m *Model) nextGrouping() {
+	selectedID := m.currentSelectedJobID()
+
+	m.grouping = (m.grouping + 1) % JobGrouping(len(AllGroupings))
+	m.applyGrouping()
+	m.restoreSelectedJob(selectedID)
+
 	m.ensureLogsLoadedForSelectedJob()
 	m.updateViewportContent()
 }
 
 func (m *Model) prevGrouping() {
-	var selectedID string
-	if len(m.jobs) > 0 && m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.jobs) {
-		selectedID = m.jobs[m.selectedJobIdx].ID
-	}
+	selectedID := m.currentSelectedJobID()
 
 	m.grouping = (m.grouping + JobGrouping(len(AllGroupings)) - 1) % JobGrouping(len(AllGroupings))
 	m.applyGrouping()
+	m.restoreSelectedJob(selectedID)
 
-	if selectedID != "" {
-		for i, j := range m.jobs {
-			if j.ID == selectedID {
-				m.selectedJobIdx = i
-				break
-			}
-		}
-	}
 	m.ensureLogsLoadedForSelectedJob()
 	m.updateViewportContent()
 }
