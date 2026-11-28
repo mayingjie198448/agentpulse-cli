@@ -817,11 +817,12 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "worker-fields-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "worker-fields-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -918,10 +919,11 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 func TestListener_PublishJobFailed_RetainsMetadataAndRedactsSecrets(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "fail-meta-node",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "fail-meta-node",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 	})
 	if err != nil {
 		t.Fatalf("wrapper.NewListener failed: %v", err)
@@ -1028,6 +1030,7 @@ func TestListener_ConcurrentExecution(t *testing.T) {
 		StatusFile:        statusFile,
 		MQTTClient:        mockClient,
 		Stub:              true,
+		DisableBareAttach: true,
 		MaxConcurrentJobs: 3,
 		OnListening: func(_ string) {
 			close(listeningCh)
