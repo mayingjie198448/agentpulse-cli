@@ -699,6 +699,7 @@ type AttachManager struct {
 	knownPIDs         map[int]time.Time
 	pidAllowlist      map[int]bool
 	usesDefaultLister bool
+	exitObs           exitObserver
 	stopCh            chan struct{}
 	doneCh            chan struct{}
 	started           atomic.Bool
@@ -760,6 +761,7 @@ func NewAttachManager(cfg AttachManagerConfig) *AttachManager {
 		knownPIDs:         make(map[int]time.Time),
 		pidAllowlist:      allowlistMap,
 		usesDefaultLister: usesDefaultLister,
+		exitObs:           newExitObserver(),
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 	}
@@ -828,6 +830,10 @@ func (m *AttachManager) Stop() {
 	select {
 	case <-m.doneCh:
 	case <-time.After(2 * time.Second):
+	}
+
+	if m.exitObs != nil {
+		m.exitObs.close()
 	}
 }
 
@@ -989,6 +995,10 @@ func (m *AttachManager) attachProcess(ctx context.Context, p ProcessInfo, ag con
 	m.knownPIDs[p.PID] = time.Now()
 	m.mu.Unlock()
 
+	if m.exitObs != nil {
+		m.exitObs.watch(p.PID)
+	}
+
 	if m.cfg.OnJobCountChange != nil {
 		m.cfg.OnJobCountChange()
 	}
@@ -1006,6 +1016,10 @@ func (m *AttachManager) monitorAttachedJob(ctx context.Context, aj *AttachedJob)
 		m.mu.Lock()
 		delete(m.activeJobs, aj.pid)
 		m.mu.Unlock()
+
+		if m.exitObs != nil {
+			m.exitObs.unwatch(aj.pid)
+		}
 
 		if m.cfg.OnJobCountChange != nil {
 			m.cfg.OnJobCountChange()
@@ -1061,6 +1075,8 @@ func (m *AttachManager) finalizeJob(aj *AttachedJob, interrupted bool) {
 	var exitCodeKnown bool
 	if !interrupted && exitChecker != nil {
 		exitCode, exitCodeKnown = exitChecker(aj.pid)
+	} else if !interrupted && m.exitObs != nil {
+		exitCode, exitCodeKnown = m.exitObs.exitCode(aj.pid)
 	}
 
 	hasReliableSuccess := false
