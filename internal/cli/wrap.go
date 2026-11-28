@@ -70,7 +70,7 @@ Examples:
 			}
 
 			if listen {
-				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, maxConcurrentJobs)
+				return runListen(cmd, machineID, machineName, statusFile, heartbeatInterval, stub, dangerouslySkipPermissions, quiet, maxConcurrentJobs, false)
 			}
 
 			// 状态文件只来自 --status-file，否则使用默认路径。

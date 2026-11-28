@@ -78,6 +78,7 @@ type Config struct {
 	StartedAt         time.Time
 	OnMQTTConnected   func()
 	OnExecute         func(cmdStr string)
+	OnProcessStart    func(pid int)
 }
 
 // Wrapper is the thin local process managing local agent execution, local status writing,
@@ -227,6 +228,13 @@ func (w *Wrapper) Job() model.Job {
 // Config returns a copy of the wrapper's configuration.
 func (w *Wrapper) Config() Config {
 	return w.cfg
+}
+
+// PID returns the OS process ID of the running child process, or 0 if not running.
+func (w *Wrapper) PID() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pid
 }
 
 // Run executes the wrapped process or stub, writes local status, and publishes MQTT telemetry.
@@ -484,6 +492,9 @@ func (w *Wrapper) runProcess(ctx context.Context) error {
 
 	w.mu.Lock()
 	w.pid = prepared.Pid()
+	if w.pid > 0 && w.cfg.OnProcessStart != nil {
+		w.cfg.OnProcessStart(w.pid)
+	}
 	w.mu.Unlock()
 	_ = w.writeStatusFile()
 

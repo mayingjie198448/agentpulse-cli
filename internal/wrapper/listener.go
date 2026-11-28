@@ -42,6 +42,22 @@ type ListenerConfig struct {
 	OnListening                func(topic string)
 	OnJobStart                 func(job model.Job)
 	OnJobComplete              func(job model.Job, err error)
+
+	// Bare agent process attach options
+	DisableBareAttach      bool
+	AttachScanInterval     time.Duration
+	Agents                 []config.AgentConfig
+	ProcessLister          ProcessLister
+	IsProcessAlive         func(pid int) bool
+	ProcessExitChecker     func(pid int) (exitCode int, ok bool)
+	ReliableSuccessChecker func(pid int) bool
+	PIDAllowlist           []int
+	PIDFilter              func(pid int) bool
+	AgyLogDir              string
+	AgyBrainDir            string
+	OpenCodeLogDir         string
+	StartTimeResolver      func(pid int) time.Time
+	CwdResolver            func(pid int) string
 }
 
 var jobIDRegex = regexp.MustCompile(`"job_id"\s*:\s*"([^"]+)"`)
@@ -117,6 +133,10 @@ type Listener struct {
 	heartbeatRunning bool
 	stopHeartbeat    chan struct{}
 	heartbeatDone    chan struct{}
+
+	attachMgr    *AttachManager
+	pidsMu       sync.Mutex
+	dispatchPIDs map[int]bool
 }
 
 // NewListener initializes a new Listener instance.
@@ -156,7 +176,7 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		JobCount:      0,
 	}
 
-	return &Listener{
+	l := &Listener{
 		cfg:           cfg,
 		machine:       machine,
 		dispatchCh:    make(chan model.DispatchCommand, 64),
@@ -164,12 +184,68 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		stopHeartbeat: make(chan struct{}),
 		heartbeatDone: make(chan struct{}),
 		dedup:         newCommandDeduplicator(15 * time.Minute),
-	}, nil
+		dispatchPIDs:  make(map[int]bool),
+	}
+
+	if !cfg.DisableBareAttach {
+		agents := cfg.Agents
+		if len(agents) == 0 {
+			if fileCfg, err := config.LoadConfig(""); err == nil && len(fileCfg.Agents) > 0 {
+				agents = fileCfg.Agents
+			} else {
+				agents = config.DefaultAgents()
+			}
+		}
+
+		attachCfg := AttachManagerConfig{
+			MachineID:              cfg.MachineID,
+			Agents:                 agents,
+			ScanInterval:           cfg.AttachScanInterval,
+			ProcessLister:          cfg.ProcessLister,
+			IsProcessAlive:         cfg.IsProcessAlive,
+			ProcessExitChecker:     cfg.ProcessExitChecker,
+			ReliableSuccessChecker: cfg.ReliableSuccessChecker,
+			PIDAllowlist:           cfg.PIDAllowlist,
+			PIDFilter:              cfg.PIDFilter,
+			AgyLogDir:              cfg.AgyLogDir,
+			AgyBrainDir:            cfg.AgyBrainDir,
+			OpenCodeLogDir:         cfg.OpenCodeLogDir,
+			StatusFile:             cfg.StatusFile,
+			Quiet:                  cfg.Quiet,
+			Stdout:                 cfg.Stdout,
+			Stderr:                 cfg.Stderr,
+			StartTimeResolver:      cfg.StartTimeResolver,
+			CwdResolver:            cfg.CwdResolver,
+			IsDispatchPID: func(pid int) bool {
+				l.pidsMu.Lock()
+				defer l.pidsMu.Unlock()
+				return l.dispatchPIDs[pid]
+			},
+			OnJobCountChange: func() {
+				l.mu.Lock()
+				l.machine.JobCount = l.currentJobCount()
+				l.mu.Unlock()
+				l.publishMachineStatus()
+			},
+		}
+		l.attachMgr = NewAttachManager(attachCfg)
+	}
+
+	return l, nil
 }
 
-// currentJobCount returns the number of currently running jobs + jobs queued in dispatchCh.
+// AttachManager returns the listener's bare process attach manager instance, if enabled.
+func (l *Listener) AttachManager() *AttachManager {
+	return l.attachMgr
+}
+
+// currentJobCount returns the number of currently running jobs + jobs queued in dispatchCh + bare attached jobs.
 func (l *Listener) currentJobCount() int {
-	return len(l.dispatchCh) + int(l.runningJobs.Load())
+	count := len(l.dispatchCh) + int(l.runningJobs.Load())
+	if l.attachMgr != nil {
+		count += l.attachMgr.ActiveCount()
+	}
+	return count
 }
 
 func (l *Listener) publishJobQueued(cmd model.DispatchCommand) {
@@ -327,6 +403,10 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 	}
 
 	defer func() {
+		if l.attachMgr != nil {
+			l.attachMgr.Stop()
+		}
+
 		l.stopHeartbeatLoop()
 
 		// Publish final offline status
@@ -346,6 +426,11 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 
 	// Publish initial online status
 	l.publishMachineStatus()
+
+	if l.attachMgr != nil {
+		l.attachMgr.SetMQTTClient(l.mqttClient)
+		l.attachMgr.Start(ctx)
+	}
 
 	// Start periodic heartbeat loop
 	l.startHeartbeatLoop()
@@ -408,6 +493,9 @@ func (l *Listener) Run(ctx context.Context) (runErr error) {
 func (l *Listener) Stop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.attachMgr != nil {
+		l.attachMgr.Stop()
+	}
 	select {
 	case <-l.stopCh:
 	default:
@@ -619,6 +707,11 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 				l.log(fmt.Sprintf("[agentpulse listener] executing: %s", cmdStr))
 			}
 		},
+		OnProcessStart: func(pid int) {
+			l.pidsMu.Lock()
+			l.dispatchPIDs[pid] = true
+			l.pidsMu.Unlock()
+		},
 	})
 	if err != nil {
 		l.logError(fmt.Sprintf("[agentpulse listener] failed to initialize wrapper for job %s: %v", cmd.JobID, err))
@@ -637,6 +730,12 @@ func (l *Listener) executeJob(ctx context.Context, cmd model.DispatchCommand) {
 	}
 
 	runErr := w.Run(jobCtx)
+
+	if pid := w.PID(); pid > 0 {
+		l.pidsMu.Lock()
+		delete(l.dispatchPIDs, pid)
+		l.pidsMu.Unlock()
+	}
 
 	l.runningJobs.Add(-1)
 	l.mu.Lock()

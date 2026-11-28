@@ -146,6 +146,8 @@ flowchart TD
 
 ### 4.2 作业生命周期与状态 (Job State & Lifecycle)
 
+> **裸进程自动挂接**：自 v0.8.0 起，除 dispatch 派发的任务外，本机直接启动的裸 Agent CLI 进程亦由守护进程自动发现并按本协议上报状态与日志。详见 [本机裸 Agent CLI 进程自动挂接机制 (Bare CLI Attach)](bare-cli-attach.md)。
+
 - **主题**：`agentpulse/v1/machines/{machine_id}/jobs/{job_id}/status`
 - **发布者**：Thin Wrapper
 - **触发时机**：Job 状态跃迁（排队、开始运行、进度刷新、正常完成、异常失败）时实时发布。

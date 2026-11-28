@@ -30,6 +30,7 @@ func TestListener_ConnectAndHeartbeat(t *testing.T) {
 		HeartbeatInterval: 100 * time.Millisecond,
 		StatusFile:        statusFile,
 		MQTTClient:        mockClient,
+		DisableBareAttach: true,
 		Quiet:             true,
 		OnMQTTConnected: func() {
 			close(connectedCh)
@@ -133,11 +134,12 @@ func TestListener_ReceiveDispatch_RunsStub(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "worker-node-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "worker-node-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -225,11 +227,12 @@ func TestListener_MissingBinary_FailsWithoutStub(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "strict-node-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       false, // do NOT stub missing binary
-		Quiet:      true,
+		MachineID:         "strict-node-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              false, // do NOT stub missing binary
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -297,10 +300,11 @@ func TestListener_RejectMalformedPayload(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "robust-node-1",
-		MQTTClient: mockClient,
-		Quiet:      true,
-		Stderr:     stderrBuf,
+		MachineID:         "robust-node-1",
+		MQTTClient:        mockClient,
+		DisableBareAttach: true,
+		Quiet:             true,
+		Stderr:            stderrBuf,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -361,10 +365,11 @@ func TestListener_SerialExecution(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "serial-node-1",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "serial-node-1",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -441,11 +446,12 @@ func TestListener_AutoReconnect_Resubscribes(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "reconnect-node-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "reconnect-node-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			select {
 			case <-listeningCh:
@@ -522,11 +528,12 @@ func TestListener_CancelRunningJob_PublishesOffline(t *testing.T) {
 	jobStartedCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "cancel-node-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "cancel-node-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnJobStart: func(j model.Job) {
 			close(jobStartedCh)
 		},
@@ -608,10 +615,11 @@ func TestListener_Deduplication_QoS1_Redelivery(t *testing.T) {
 	wg.Add(1)
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "dedup-node-1",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "dedup-node-1",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnJobComplete: func(j model.Job, err error) {
 			mu.Lock()
 			executionCount++
@@ -663,10 +671,11 @@ func TestListener_Deduplication_QoS1_Redelivery(t *testing.T) {
 func TestListener_ErrorPublishJobFailed(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "err-node-1",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "err-node-1",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 	})
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
@@ -744,10 +753,11 @@ func TestListener_ErrorPublishJobFailed(t *testing.T) {
 func TestListener_QueuedStatusAndJobCount(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "queue-node-1",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "queue-node-1",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 	})
 	if err != nil {
 		t.Fatalf("failed to create listener: %v", err)
@@ -807,11 +817,12 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 	listeningCh := make(chan struct{})
 
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "worker-fields-1",
-		StatusFile: statusFile,
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "worker-fields-1",
+		StatusFile:        statusFile,
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 		OnListening: func(_ string) {
 			close(listeningCh)
 		},
@@ -908,10 +919,11 @@ func TestListener_ReceiveDispatch_WithExtendedFields(t *testing.T) {
 func TestListener_PublishJobFailed_RetainsMetadataAndRedactsSecrets(t *testing.T) {
 	mockClient := newMockMQTTClient()
 	l, err := wrapper.NewListener(wrapper.ListenerConfig{
-		MachineID:  "fail-meta-node",
-		MQTTClient: mockClient,
-		Stub:       true,
-		Quiet:      true,
+		MachineID:         "fail-meta-node",
+		MQTTClient:        mockClient,
+		Stub:              true,
+		DisableBareAttach: true,
+		Quiet:             true,
 	})
 	if err != nil {
 		t.Fatalf("wrapper.NewListener failed: %v", err)
@@ -1018,6 +1030,7 @@ func TestListener_ConcurrentExecution(t *testing.T) {
 		StatusFile:        statusFile,
 		MQTTClient:        mockClient,
 		Stub:              true,
+		DisableBareAttach: true,
 		MaxConcurrentJobs: 3,
 		OnListening: func(_ string) {
 			close(listeningCh)
