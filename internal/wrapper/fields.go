@@ -3,13 +3,13 @@ package wrapper
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/mayingjie198448/agentpulse-cli/internal/model"
+	"github.com/mayingjie198448/agentpulse-cli/internal/safety"
 )
 
 const (
@@ -189,28 +189,17 @@ func InferRepoAndProject(cwd string) (repo, project string) {
 	defer cancel()
 
 	// 1. Check if git repository
-	cmdGitRoot := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
-	cmdGitRoot.Dir = cleanCwd
-	outGitRoot, errGitRoot := cmdGitRoot.Output()
-	if errGitRoot == nil {
-		gitRoot := strings.TrimSpace(string(outGitRoot))
-		if gitRoot != "" {
-			project = filepath.Base(gitRoot)
-			repo = project
+	if gitRoot, errGitRoot := runGitOutput(ctx, cleanCwd, "rev-parse", "--show-toplevel"); errGitRoot == nil && gitRoot != "" {
+		project = filepath.Base(gitRoot)
+		repo = project
 
-			// Try to extract remote origin url
-			cmdRemote := exec.CommandContext(ctx, "git", "config", "--get", "remote.origin.url")
-			cmdRemote.Dir = cleanCwd
-			outRemote, errRemote := cmdRemote.Output()
-			if errRemote == nil {
-				remoteURL := strings.TrimSpace(string(outRemote))
-				slug := extractGitRepoSlug(remoteURL)
-				if slug != "" {
-					repo = slug
-				}
+		// Try to extract remote origin url
+		if remoteURL, errRemote := runGitOutput(ctx, cleanCwd, "config", "--get", "remote.origin.url"); errRemote == nil {
+			if slug := extractGitRepoSlug(remoteURL); slug != "" {
+				repo = slug
 			}
-			return repo, project
 		}
+		return repo, project
 	}
 
 	// 2. Fallback to folder name
@@ -221,6 +210,21 @@ func InferRepoAndProject(cwd string) (repo, project string) {
 	}
 
 	return repo, project
+}
+
+func runGitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	prepared, err := safety.Prepare(ctx, safety.Request{
+		Argv: append([]string{"git"}, args...),
+		Dir:  dir,
+	})
+	if err != nil {
+		return "", err
+	}
+	out, err := prepared.Cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // extractGitRepoSlug extracts the repository path / slug from git remote URLs.
